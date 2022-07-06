@@ -54,6 +54,14 @@ static Value lookupAllocatorFor(Operation *op, OpBuilder &builder) {
   return allocatorOp.result();
 }
 
+// Returns the |timepointFence| or a util.null.
+static Value getOrCreateWaitFence(Location loc, Value timepointFence,
+                                  OpBuilder &builder) {
+  if (timepointFence) return timepointFence;
+  return builder.create<IREE::Util::NullOp>(
+      loc, builder.getType<IREE::HAL::FenceType>());
+}
+
 // Scans all of the stream.cmd.* ops in the region to derive a command category.
 static IREE::HAL::CommandCategoryBitfield deriveCommandCategories(
     Region &region) {
@@ -247,7 +255,8 @@ struct ResourceAllocaOpPattern
   LogicalResult matchAndRewrite(
       IREE::Stream::ResourceAllocaOp allocaOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
-    auto allocator = lookupAllocatorFor(allocaOp, rewriter);
+    auto loc = allocaOp.getLoc();
+    auto device = lookupDeviceFor(allocaOp, rewriter);
     auto bufferType = rewriter.getType<IREE::HAL::BufferType>();
 
     // Transient allocations are device-local. Copies are required to get their
@@ -261,16 +270,20 @@ struct ResourceAllocaOpPattern
     auto bufferUsage = IREE::HAL::BufferUsageBitfield::Transfer |
                        IREE::HAL::BufferUsageBitfield::DispatchStorage;
 
-    auto allocateOp = rewriter.create<IREE::HAL::AllocatorAllocateOp>(
-        allocaOp.getLoc(), bufferType, allocator, memoryTypes, bufferUsage,
-        adaptor.storage_size());
+    // Gather wait/signal fence, which are optional.
+    Value waitFence =
+        getOrCreateWaitFence(loc, adaptor.await_timepoint(), rewriter);
+    Value signalFence = rewriter.create<IREE::HAL::TimelineAdvanceOp>(
+        loc, rewriter.getType<IREE::HAL::FenceType>());
 
-    // TODO(benvanik): stream ordered allocations.
-    auto resolvedTimepoint =
-        rewriter.create<arith::ConstantIntOp>(allocaOp.getLoc(), 0, 64)
-            .getResult();
+    // Queue allocation.
+    auto queueAffinity = rewriter.create<arith::ConstantIntOp>(loc, -1, 64);
+    auto pool = rewriter.create<arith::ConstantIntOp>(loc, 0, 64);
+    auto allocateOp = rewriter.create<IREE::HAL::DeviceQueueAllocaOp>(
+        loc, bufferType, device, queueAffinity, waitFence, signalFence, pool,
+        memoryTypes, bufferUsage, adaptor.storage_size());
 
-    rewriter.replaceOp(allocaOp, {allocateOp.result(), resolvedTimepoint});
+    rewriter.replaceOp(allocaOp, {allocateOp.result(), signalFence});
     return success();
   }
 };
@@ -281,11 +294,21 @@ struct ResourceDeallocaOpPattern
   LogicalResult matchAndRewrite(
       IREE::Stream::ResourceDeallocaOp deallocaOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
-    // TODO(benvanik): stream ordered allocations.
-    auto resolvedTimepoint =
-        rewriter.create<arith::ConstantIntOp>(deallocaOp.getLoc(), 0, 64)
-            .getResult();
-    rewriter.replaceOp(deallocaOp, {resolvedTimepoint});
+    auto loc = deallocaOp.getLoc();
+    auto device = lookupDeviceFor(deallocaOp, rewriter);
+
+    // Gather wait/signal fence, which are optional.
+    Value waitFence =
+        getOrCreateWaitFence(loc, adaptor.await_timepoint(), rewriter);
+    Value signalFence = rewriter.create<IREE::HAL::TimelineAdvanceOp>(
+        loc, rewriter.getType<IREE::HAL::FenceType>());
+
+    // Queue allocation.
+    auto queueAffinity = rewriter.create<arith::ConstantIntOp>(loc, -1, 64);
+    rewriter.create<IREE::HAL::DeviceQueueDeallocaOp>(
+        loc, device, queueAffinity, waitFence, signalFence, adaptor.operand());
+
+    rewriter.replaceOp(deallocaOp, {signalFence});
     return success();
   }
 };
@@ -818,7 +841,7 @@ struct CmdExecuteOpPattern
     // (like dedicated DMA controllers).
     auto commandCategories = deriveCommandCategories(executeOp.body());
 
-    // Create a new command buffer for recording. If we were
+    // Create a new command buffer for recording.
     auto commandBuffer =
         rewriter
             .create<IREE::HAL::CommandBufferCreateOp>(
@@ -839,14 +862,19 @@ struct CmdExecuteOpPattern
     rewriter.mergeBlockBefore(&executeOp.body().front(), endOp,
                               adaptor.operands());
 
-    // TODO(benvanik): we should queue a submit here with the semaphore instead.
-    rewriter.create<IREE::HAL::ExSubmitAndWaitOp>(loc, device, commandBuffer);
+    // Gather wait/signal fence, which are optional.
+    Value waitFence =
+        getOrCreateWaitFence(loc, adaptor.await_timepoint(), rewriter);
+    Value signalFence = rewriter.create<IREE::HAL::TimelineAdvanceOp>(
+        loc, rewriter.getType<IREE::HAL::FenceType>());
 
-    // TODO(benvanik): propagate semaphore information.
-    auto resolvedTimepoint =
-        rewriter.create<arith::ConstantIntOp>(loc, 0, 64).getResult();
+    // Queue execution.
+    auto queueAffinity = rewriter.create<arith::ConstantIntOp>(loc, -1, 64);
+    rewriter.create<IREE::HAL::DeviceQueueExecuteOp>(loc, device, queueAffinity,
+                                                     waitFence, signalFence,
+                                                     ValueRange{commandBuffer});
 
-    rewriter.replaceOp(executeOp, resolvedTimepoint);
+    rewriter.replaceOp(executeOp, signalFence);
     return success();
   }
 };
@@ -892,8 +920,8 @@ struct TimepointImmediateOpPattern
   LogicalResult matchAndRewrite(
       IREE::Stream::TimepointImmediateOp immediateOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
-    // TODO(benvanik): model timepoints as semaphores.
-    rewriter.replaceOpWithNewOp<arith::ConstantIntOp>(immediateOp, 0, 64);
+    rewriter.replaceOpWithNewOp<IREE::Util::NullOp>(
+        immediateOp, rewriter.getType<IREE::HAL::FenceType>());
     return success();
   }
 };
@@ -904,25 +932,24 @@ struct TimepointImportOpPattern
   LogicalResult matchAndRewrite(
       IREE::Stream::TimepointImportOp importOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
-    // Only handle imports from HAL semaphores.
+    // Only handle imports from HAL semaphores _or_ fences.
     auto operands = adaptor.operands();
-    if (operands.size() != 2 ||
-        !operands[0].getType().isa<IREE::HAL::SemaphoreType>() ||
-        !operands[1].getType().isIntOrIndex()) {
+    if (operands.size() == 1 &&
+        operands[0].getType().isa<IREE::HAL::FenceType>()) {
+      rewriter.replaceOp(importOp, operands[0]);
+      return success();
+    } else if (operands.size() == 2 &&
+               operands[0].getType().isa<IREE::HAL::SemaphoreType>() &&
+               operands[1].getType().isIntOrIndex()) {
+      rewriter.replaceOpWithNewOp<IREE::HAL::FenceCreateOp>(
+          importOp, rewriter.getType<IREE::HAL::FenceType>(),
+          ValueRange{operands[0]}, ValueRange{operands[1]});
+      return success();
+    } else {
       return rewriter.notifyMatchFailure(importOp,
                                          "only imports from HAL semaphore + "
                                          "sequence value tuples are supported");
     }
-
-    // TODO(benvanik): model timepoints as semaphores.
-    // For now we just block on the semaphore.
-    auto awaitOp = rewriter.create<IREE::HAL::SemaphoreAwaitOp>(
-        importOp.getLoc(), rewriter.getI32Type(), operands[0], operands[1]);
-    rewriter.create<IREE::Util::StatusCheckOkOp>(
-        importOp.getLoc(), awaitOp.status(),
-        "failed to wait on imported semaphore");
-    rewriter.replaceOpWithNewOp<arith::ConstantIntOp>(importOp, 0, 64);
-    return success();
   }
 };
 
@@ -932,24 +959,13 @@ struct TimepointExportOpPattern
   LogicalResult matchAndRewrite(
       IREE::Stream::TimepointExportOp exportOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
-    // Only handle exports into HAL semaphores.
-    if (exportOp.getNumResults() != 2 ||
-        !exportOp.getResult(0).getType().isa<IREE::HAL::SemaphoreType>() ||
-        !exportOp.getResult(1).getType().isIntOrIndex()) {
-      return rewriter.notifyMatchFailure(exportOp,
-                                         "only exports to HAL semaphore + "
-                                         "sequence value tuples are supported");
+    // Only handle exports into HAL fences.
+    if (exportOp.getNumResults() != 1 ||
+        !exportOp.getResult(0).getType().isa<IREE::HAL::FenceType>()) {
+      return rewriter.notifyMatchFailure(
+          exportOp, "only exports to HAL fences are supported");
     }
-
-    auto loc = exportOp.getLoc();
-    auto device = lookupDeviceFor(exportOp, rewriter);
-
-    // TODO(benvanik): model timepoints as semaphores.
-    // For now we just create a signaled semaphore.
-    auto exportValue = rewriter.create<arith::ConstantIntOp>(loc, 0, 64);
-    auto exportSemaphore = rewriter.create<IREE::HAL::SemaphoreCreateOp>(
-        loc, rewriter.getType<IREE::HAL::SemaphoreType>(), device, exportValue);
-    rewriter.replaceOp(exportOp, {exportSemaphore, exportValue});
+    rewriter.replaceOp(exportOp, adaptor.await_timepoint());
     return success();
   }
 };
@@ -960,11 +976,9 @@ struct TimepointJoinOpPattern
   LogicalResult matchAndRewrite(
       IREE::Stream::TimepointJoinOp joinOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
-    // TODO(benvanik): model timepoints as semaphores.
-    // This should be a max() of the operand timepoints. Could be done with
-    // affine expressions, but since everything is always 0 we just max(0,0)=0
-    // here :)
-    rewriter.replaceOpWithNewOp<arith::ConstantIntOp>(joinOp, 0, 64);
+    rewriter.replaceOpWithNewOp<IREE::HAL::FenceJoinOp>(
+        joinOp, rewriter.getType<IREE::HAL::FenceType>(),
+        adaptor.await_timepoints());
     return success();
   }
 };
@@ -975,7 +989,16 @@ struct TimepointAwaitOpPattern
   LogicalResult matchAndRewrite(
       IREE::Stream::TimepointAwaitOp awaitOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
-    // TODO(benvanik): model timepoints as semaphores.
+    auto loc = awaitOp.getLoc();
+
+    // Perform the blocking wait.
+    Value timeoutMillis = rewriter.create<arith::ConstantIntOp>(loc, -1, 32);
+    auto fenceOp = rewriter.create<IREE::HAL::FenceAwaitOp>(
+        loc, rewriter.getI32Type(), timeoutMillis, adaptor.await_timepoint());
+    rewriter.create<IREE::Util::StatusCheckOkOp>(loc, fenceOp.status(),
+                                                 "failed to wait on timepoint");
+
+    // Pass along operands.
     rewriter.replaceOp(awaitOp, adaptor.operands());
     return success();
   }
@@ -1003,8 +1026,7 @@ struct GlobalTimepointConversionPattern
     auto initialValue = op.initial_value();
     if (!initialValue.hasValue()) return failure();
     if (!initialValue->isa<IREE::Stream::TimepointAttr>()) return failure();
-    rewriter.updateRootInPlace(
-        op, [&]() { op.initial_valueAttr(rewriter.getI64IntegerAttr(0)); });
+    rewriter.updateRootInPlace(op, [&]() { op.removeInitial_valueAttr(); });
     return success();
   }
 };
@@ -1026,11 +1048,7 @@ void populateStreamToHALPatterns(MLIRContext *context,
 
   typeConverter.addConversion(
       [=](IREE::Stream::TimepointType type, SmallVectorImpl<Type> &results) {
-        // TODO(benvanik): model timepoints as semaphores.
-        // This may become a !hal.semaphore + index, or some !hal.timepoint that
-        // we then do more analysis on once we know what devices are in use
-        // where.
-        results.push_back(IntegerType::get(context, 64));
+        results.push_back(IREE::HAL::FenceType::get(context));
         return success();
       });
 

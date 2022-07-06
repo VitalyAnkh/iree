@@ -707,6 +707,19 @@ LogicalResult DeviceSwitchOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// hal.device.queue.*
+//===----------------------------------------------------------------------===//
+
+void DeviceQueueAllocaOp::getAsmResultNames(
+    function_ref<void(Value, StringRef)> setNameFn) {
+  setNameFn(result(), "transient_buffer");
+}
+
+Value DeviceQueueAllocaOp::getOperandSize(unsigned idx) { return {}; }
+
+Value DeviceQueueAllocaOp::getResultSize(unsigned idx) { return result_size(); }
+
+//===----------------------------------------------------------------------===//
 // hal.executable
 //===----------------------------------------------------------------------===//
 
