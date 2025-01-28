@@ -7,7 +7,6 @@
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
-#include "iree/compiler/InputConversion/Common/PassDetail.h"
 #include "iree/compiler/InputConversion/Common/Passes.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -23,13 +22,18 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/DialectConversion.h"
 
-namespace mlir::iree_compiler {
+namespace mlir::iree_compiler::InputConversion {
+
+#define GEN_PASS_DEF_IMPORTMLPROGRAMPASS
+#include "iree/compiler/InputConversion/Common/Passes.h.inc"
 
 namespace {
 
-struct ImportMLProgramPass : public ImportMLProgramBase<ImportMLProgramPass> {
+class ImportMLProgramPass final
+    : public impl::ImportMLProgramPassBase<ImportMLProgramPass> {
+public:
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<IREE::Util::UtilDialect, func::FuncDialect>();
+    registry.insert<arith::ArithDialect, IREE::Util::UtilDialect>();
   }
   void runOnOperation() override;
 };
@@ -109,6 +113,7 @@ public:
     auto globalOp = rewriter.replaceOpWithNewOp<IREE::Util::GlobalOp>(
         srcOp, srcOp.getName(), isMutable | isExtern, newType, srcOpTypedAttr);
     globalOp.setVisibility(SymbolTable::Visibility::Private);
+    globalOp->setDialectAttrs(srcOp->getDialectAttrs());
 
     if (isExtern)
       externGlobals.emplace_back(srcOp.getName(), newType);
@@ -170,12 +175,11 @@ public:
       FunctionType funcType =
           rewriter.getFunctionType(/*input=*/TypeRange{}, /*outputs=*/newType);
       ImplicitLocOpBuilder b(globalOp.getLoc(), rewriter);
-      auto funcOp = b.create<func::FuncOp>(getterName, funcType);
+      auto funcOp = b.create<IREE::Util::FuncOp>(getterName, funcType);
       funcOp.setPublic();
       b.setInsertionPointToStart(funcOp.addEntryBlock());
-      auto val = b.create<IREE::Util::GlobalLoadOp>(
-          newType, SymbolRefAttr::get(globalOp.getSymNameAttr()));
-      b.create<func::ReturnOp>(val.getResult());
+      auto val = globalOp.createLoadOp(globalOp.getLoc(), b);
+      b.create<IREE::Util::ReturnOp>(val.getLoadedGlobalValue());
     }
 
     if (!setterName.empty() && isMutable) {
@@ -183,12 +187,11 @@ public:
       FunctionType funcType =
           rewriter.getFunctionType(/*input=*/newType, /*outputs=*/TypeRange{});
       ImplicitLocOpBuilder b(globalOp.getLoc(), rewriter);
-      auto funcOp = b.create<func::FuncOp>(setterName, funcType);
+      auto funcOp = b.create<IREE::Util::FuncOp>(setterName, funcType);
       funcOp.setPublic();
       b.setInsertionPointToStart(funcOp.addEntryBlock());
-      b.create<IREE::Util::GlobalStoreOp>(funcOp.getArgument(0),
-                                          globalOp.getSymNameAttr());
-      b.create<func::ReturnOp>();
+      globalOp.createStoreOp(globalOp.getLoc(), funcOp.getArgument(0), b);
+      b.create<IREE::Util::ReturnOp>();
     }
 
     return success();
@@ -211,7 +214,8 @@ createExternInitFunction(ModuleOp module,
       /*input=*/TypeRange{IREE::Util::ListType::get(
           IREE::Util::VariantType::get(context))},
       /*outputs=*/{});
-  auto funcOp = b.create<func::FuncOp>("ireeMlProgramGlobalsInit", funcType);
+  auto funcOp =
+      b.create<IREE::Util::FuncOp>("ireeMlProgramGlobalsInit", funcType);
   funcOp.setPublic();
   b.setInsertionPointToStart(funcOp.addEntryBlock());
 
@@ -222,7 +226,7 @@ createExternInitFunction(ModuleOp module,
     b.create<IREE::Util::GlobalStoreOp>(val, it.value().name);
   }
 
-  b.create<func::ReturnOp>();
+  b.create<IREE::Util::ReturnOp>();
 
   return success();
 }
@@ -264,8 +268,4 @@ void ImportMLProgramPass::runOnOperation() {
     signalPassFailure();
 }
 
-std::unique_ptr<OperationPass<ModuleOp>> createImportMLProgramPass() {
-  return std::make_unique<ImportMLProgramPass>();
-}
-
-} // namespace mlir::iree_compiler
+} // namespace mlir::iree_compiler::InputConversion

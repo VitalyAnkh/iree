@@ -4,6 +4,18 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+# Yes, global compile options are evil, but this is temporary,
+# TODO(#3299): migrate to from member x.cast<T>() to mlir::cast<T>(x)
+# And this is just a copy of what we currently have in torch-mlir upstream.
+if(MSVC)
+  add_compile_options(/wd4996)
+else()
+  if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+    add_compile_options(-Wno-error=parentheses)
+  endif()
+  add_compile_options(-Wno-deprecated-declarations)
+endif()
+
 list(APPEND IREE_COMPILER_TABLEGEN_INCLUDE_DIRS
     "${TORCH_MLIR_ROOT_DIR}/include")
 
@@ -76,8 +88,8 @@ iree_tablegen_library(
   TD_FILE
     "${TORCH_MLIR_ROOT_DIR}/include/torch-mlir/Dialect/Torch/IR/TorchOps.td"
   OUTS
-    -gen-dialect-decls Dialect/Torch/IR/TorchDialect.h.inc
-    -gen-dialect-defs Dialect/Torch/IR/TorchDialect.cpp.inc
+    -gen-dialect-decls -dialect=torch Dialect/Torch/IR/TorchDialect.h.inc
+    -gen-dialect-defs -dialect=torch Dialect/Torch/IR/TorchDialect.cpp.inc
     -gen-op-decls Dialect/Torch/IR/TorchOps.h.inc
     -gen-op-defs Dialect/Torch/IR/TorchOps.cpp.inc
 )
@@ -116,10 +128,15 @@ iree_cc_library(
   DEPS
     ::defs
     ::TorchConversionDialectGen
+    ::TorchDialectTransformsGen
     ::TorchDialectIR
     MLIRIR
+    MLIRFuncTransforms
+    MLIRGPUDialect
+    MLIRLinalgTransforms
     MLIRSupport
     MLIRSideEffectInterfaces
+    MLIRVectorTransforms
 )
 
 iree_tablegen_library(
@@ -158,6 +175,7 @@ file(GLOB _ConversionPasses_SRCS
   "${TORCH_MLIR_ROOT_DIR}/lib/Conversion/TorchToLinalg/*.cpp"
   "${TORCH_MLIR_ROOT_DIR}/lib/Conversion/TorchConversionToMLProgram/*.cpp"
   "${TORCH_MLIR_ROOT_DIR}/lib/Conversion/TorchToSCF/*.cpp"
+  "${TORCH_MLIR_ROOT_DIR}/lib/Conversion/TorchToTensor/*.cpp"
   "${TORCH_MLIR_ROOT_DIR}/lib/Conversion/TorchToTosa/*.cpp"
   "${TORCH_MLIR_ROOT_DIR}/lib/Conversion/TorchToTMTensor/*.cpp"
   "${TORCH_MLIR_ROOT_DIR}/lib/Conversion/Utils/*.cpp"
@@ -175,7 +193,7 @@ iree_cc_library(
     ::TorchConversionDialectTransformsGen
     ::TorchDialectIR
     ::ConversionPassesGen
-    torch-mlir-dialects::TMTensorDialectIR
+    iree::compiler::plugins::input::Torch::torch-mlir-dialects::TMTensorDialectIR
     MLIRArithDialect
     MLIRFuncDialect
     MLIRIR
@@ -196,6 +214,41 @@ iree_tablegen_library(
     -gen-pass-decls Conversion/Passes.h.inc
     -gen-pass-capi-header Conversion/Passes.capi.h.inc
     -gen-pass-capi-impl Conversion/Passes.capi.cpp.inc
+)
+
+###############################################################################
+# TorchOnnxToTorch
+###############################################################################
+
+file(GLOB _TorchOnnxToTorchPasses_SRCS
+  "${TORCH_MLIR_ROOT_DIR}/lib/Conversion/TorchOnnxToTorch/*.cpp"
+)
+iree_cc_library(
+  NAME
+    TorchOnnxToTorchPasses
+  SRCS
+    "${TORCH_MLIR_ROOT_DIR}/lib/Conversion/TorchOnnxToTorch/Passes.cpp"
+    ${_TorchOnnxToTorchPasses_SRCS}
+  DEPS
+    ::defs
+    ::TorchConversionDialectIR
+    ::TorchDialectIR
+    ::TorchOnnxToTorchPassesGen
+    MLIRArithDialect
+    MLIRFuncDialect
+    MLIRIR
+    MLIRPass
+)
+
+iree_tablegen_library(
+  NAME
+    TorchOnnxToTorchPassesGen
+  TD_FILE
+    "${TORCH_MLIR_ROOT_DIR}/include/torch-mlir/Conversion/TorchOnnxToTorch/Passes.td"
+  OUTS
+    -gen-pass-decls Conversion/TorchOnnxToTorch/Passes.h.inc
+    -gen-pass-capi-header Conversion/TorchOnnxToTorch/Passes.capi.h.inc
+    -gen-pass-capi-impl Conversion/TorchOnnxToTorch/Passes.capi.cpp.inc
 )
 
 ###############################################################################

@@ -8,6 +8,7 @@
 #define IREE_COMPILER_MODULES_HAL_INLINE_TRANSFORMS_PASSES_H_
 
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
+#include "iree/compiler/Dialect/HAL/Target/TargetOptions.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "iree/compiler/Modules/HAL/Inline/IR/HALInlineOps.h"
 #include "llvm/ADT/StringMap.h"
@@ -16,8 +17,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LLVM.h"
 
-namespace mlir::iree_compiler::IREE::HAL {
-namespace Inline {
+namespace mlir::iree_compiler::IREE::HAL::Inline {
 
 //===----------------------------------------------------------------------===//
 // Helpers
@@ -34,26 +34,18 @@ namespace Inline {
 //   buildHALInlineTransformPassPipeline & run
 //   <serialize VM module>
 void buildHALInlineStaticTransformPassPipeline(
-    OpPassManager &passManager, const TargetBackendRegistry &targetRegistry,
+    OpPassManager &passManager, const TargetRegistry &targetRegistry,
     const TargetOptions &targetOptions);
-
-//===----------------------------------------------------------------------===//
-// Passes
-//===----------------------------------------------------------------------===//
-
-// Inlines translated executable functions into the host program.
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createInlineExecutablesPass();
-
-// Converts from the stream dialect into the hal_inline dialect.
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createConversionPass();
 
 //===----------------------------------------------------------------------===//
 // Register all Passes
 //===----------------------------------------------------------------------===//
 
+#define GEN_PASS_DECL
+#include "iree/compiler/Modules/HAL/Inline/Transforms/Passes.h.inc"
+
 void registerHALInlinePasses();
 
-} // namespace Inline
-} // namespace mlir::iree_compiler::IREE::HAL
+} // namespace mlir::iree_compiler::IREE::HAL::Inline
 
 #endif // IREE_COMPILER_MODULES_HAL_INLINE_TRANSFORMS_PASSES_H_

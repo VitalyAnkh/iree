@@ -68,8 +68,7 @@ iree_status_t iree_hal_vulkan_native_semaphore_create(
                                   &semaphore->base);
     semaphore->logical_device = logical_device;
     semaphore->handle = handle;
-    iree_atomic_store_intptr(&semaphore->failure_status, 0,
-                             iree_memory_order_release);
+    iree_atomic_store(&semaphore->failure_status, 0, iree_memory_order_release);
     *out_semaphore = &semaphore->base;
   } else {
     logical_device->syms()->vkDestroySemaphore(*logical_device, handle,
@@ -87,7 +86,7 @@ static void iree_hal_vulkan_native_semaphore_destroy(
   iree_allocator_t host_allocator = semaphore->logical_device->host_allocator();
   IREE_TRACE_ZONE_BEGIN(z0);
 
-  iree_status_ignore((iree_status_t)iree_atomic_load_intptr(
+  iree_status_ignore((iree_status_t)iree_atomic_load(
       &semaphore->failure_status, iree_memory_order_acquire));
 
   semaphore->logical_device->syms()->vkDestroySemaphore(
@@ -127,7 +126,7 @@ static iree_status_t iree_hal_vulkan_native_semaphore_query(
 
   // If the semaphore failed then clone the status so we can report it.
   if (value >= IREE_HAL_SEMAPHORE_FAILURE_VALUE) {
-    iree_status_t failure_status = (iree_status_t)iree_atomic_load_intptr(
+    iree_status_t failure_status = (iree_status_t)iree_atomic_load(
         &semaphore->failure_status, iree_memory_order_acquire);
     if (iree_status_is_ok(failure_status)) {
       return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
@@ -178,7 +177,7 @@ static void iree_hal_vulkan_native_semaphore_fail(
   // Try to set our local status - we only preserve the first failure so only
   // do this if we are going from a valid semaphore to a failed one.
   iree_status_t old_status = iree_ok_status();
-  if (!iree_atomic_compare_exchange_strong_intptr(
+  if (!iree_atomic_compare_exchange_strong(
           &semaphore->failure_status, (intptr_t*)&old_status, (intptr_t)status,
           iree_memory_order_acq_rel,
           iree_memory_order_relaxed /* old_status is unused */)) {
@@ -216,10 +215,7 @@ iree_status_t iree_hal_vulkan_native_semaphore_multi_wait(
     timeout_ns = 0;
   } else {
     iree_time_t now_ns = iree_time_now();
-    if (deadline_ns < now_ns) {
-      return iree_status_from_code(IREE_STATUS_DEADLINE_EXCEEDED);
-    }
-    timeout_ns = (uint64_t)(deadline_ns - now_ns);
+    timeout_ns = deadline_ns < now_ns ? 0 : (uint64_t)(deadline_ns - now_ns);
   }
 
   IREE_TRACE_ZONE_BEGIN(z0);

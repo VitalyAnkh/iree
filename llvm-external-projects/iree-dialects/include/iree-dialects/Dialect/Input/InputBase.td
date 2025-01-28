@@ -44,7 +44,7 @@ class IREEInput_Type<string name> : TypeDef<IREEInput_Dialect, name>;
 // Predicates
 //===----------------------------------------------------------------------===//
 
-class IREEInput_AliasedSymbolRefAttr : Attr<CPred<"$_self.isa<FlatSymbolRefAttr>()">,
+class IREEInput_AliasedSymbolRefAttr : Attr<CPred<"isa<FlatSymbolRefAttr>($_self)">,
                                                   "symbol reference attribute"> {
   let storageType = [{ FlatSymbolRefAttr }];
   let returnType = [{ StringRef }];
@@ -53,11 +53,11 @@ class IREEInput_AliasedSymbolRefAttr : Attr<CPred<"$_self.isa<FlatSymbolRefAttr>
 }
 class IREEInput_AnyPtrOf<list<Type> types> :
     Type<And<[
-      CPred<"$_self.isa<::mlir::iree_compiler::IREE::Input::PtrType>()">,
+      CPred<"isa<::mlir::iree_compiler::IREE::Input::PtrType>($_self)">,
       Or<!foreach(type, types,
           SubstLeaves<
               "$_self",
-              "$_self.cast<::mlir::iree_compiler::IREE::Input::PtrType>().getTargetType()",
+              "cast<::mlir::iree_compiler::IREE::Input::PtrType>($_self).getTargetType()",
               type.predicate>)>,
     ]>, !interleave(!foreach(type, types, type.summary), " or ")> {
   string builderCall = "";
@@ -68,7 +68,7 @@ def IREEInput_Tensor : TypeAlias<AnyRankedTensor>;
 
 def IREEInput_AnyList : DialectType<
     IREEInput_Dialect,
-    CPred<"$_self.isa<::mlir::iree_compiler::IREE::Input::ListType>()">,
+    CPred<"isa<::mlir::iree_compiler::IREE::Input::ListType>($_self)">,
       "list"> {
   let description = [{
     A mutable, resizable list of some type.
@@ -77,9 +77,9 @@ def IREEInput_AnyList : DialectType<
 
 class IREEInput_ListOf<Type type> :
     Type<And<[
-      CPred<"$_self.isa<::mlir::iree_compiler::IREE::Input::ListType>()">,
+      CPred<"isa<::mlir::iree_compiler::IREE::Input::ListType>($_self)">,
       SubstLeaves<"$_self",
-                  "$_self.cast<::mlir::iree_compiler::IREE::Input::ListType>().getElementType()",
+                  "cast<::mlir::iree_compiler::IREE::Input::ListType>($_self).getElementType()",
                   type.predicate>
     ]>, "list<" # type.summary # ">"> {
   // Set the builder call if the base type has a builder call.
@@ -99,8 +99,8 @@ class IREEInput_IndexAttrBase<string descr> :
     TypedAttrBase<
       Index, "IntegerAttr",
       And<[
-        CPred<"$_self.isa<IntegerAttr>()">,
-        CPred<"$_self.cast<IntegerAttr>().getType().isIndex()">,
+        CPred<"isa<IntegerAttr>($_self)">,
+        CPred<"cast<IntegerAttr>($_self).getType().isIndex()">,
       ]>,
       descr> {
   let returnType = [{ APInt }];
@@ -265,52 +265,31 @@ def IREEInput_DescriptorFlagsAttr :
   let cppNamespace = "::mlir::iree_compiler::IREE::Input";
 }
 
-def IREEInput_DescriptorSetBindingAttr :
-    AttrDef<IREEInput_Dialect, "DescriptorSetBinding", []> {
-  let mnemonic = "descriptor_set.binding";
+def IREEInput_PipelineBindingAttr :
+    AttrDef<IREEInput_Dialect, "PipelineBinding", []> {
+  let mnemonic = "pipeline.binding";
   let summary = [{descriptor set binding specification}];
 
   let parameters = (ins
-    AttrParameter<"int64_t", "">:$ordinal,
     AttrParameter<"DescriptorType", "">:$type,
     OptionalParameter<"std::optional<DescriptorFlags>">:$flags
   );
 
   let assemblyFormat = [{
-    `<` $ordinal `,` $type (`,` $flags^)? `>`
+    `<` $type (`,` $flags^)? `>`
   }];
 }
 
-def IREEInput_DescriptorSetLayoutFlags_None :
+def IREEInput_PipelineLayoutFlags_None :
     I32BitEnumAttrCase<"None", 0x0000>;
-def IREEInput_DescriptorSetLayoutFlags_Indirect :
+def IREEInput_PipelineLayoutFlags_Indirect :
     I32BitEnumAttrCase<"Indirect", 0x0001>;
-def IREEInput_DescriptorSetLayoutFlagsAttr :
-    I32BitEnumAttr<"DescriptorSetLayoutFlags", "valid DescriptorSetLayout flags", [
-      IREEInput_DescriptorSetLayoutFlags_None,
-      IREEInput_DescriptorSetLayoutFlags_Indirect,
+def IREEInput_PipelineLayoutFlagsAttr :
+    I32BitEnumAttr<"PipelineLayoutFlags", "valid PipelineLayout flags", [
+      IREEInput_PipelineLayoutFlags_None,
+      IREEInput_PipelineLayoutFlags_Indirect,
     ]> {
   let cppNamespace = "::mlir::iree_compiler::IREE::Input";
-}
-
-def IREEInput_DescriptorSetLayoutAttr :
-    AttrDef<IREEInput_Dialect, "DescriptorSetLayout", []> {
-  let mnemonic = "descriptor_set.layout";
-  let summary = [{descriptor set layout specification}];
-
-  let parameters = (ins
-    AttrParameter<"int64_t", "">:$ordinal,
-    ArrayRefParameter<"DescriptorSetBindingAttr", "">:$bindings,
-    OptionalParameter<"std::optional<DescriptorSetLayoutFlags>">:$flags
-  );
-
-  let assemblyFormat = [{
-    `<`
-    $ordinal `,`
-    `bindings` `=` `[` $bindings `]`
-    (`,` `flags` `=` $flags^)?
-    `>`
-  }];
 }
 
 def IREEInput_PipelineLayoutAttr :
@@ -319,14 +298,16 @@ def IREEInput_PipelineLayoutAttr :
   let summary = [{executable entry point layout specification}];
 
   let parameters = (ins
-    AttrParameter<"int64_t", "">:$pushConstants,
-    ArrayRefParameter<"DescriptorSetLayoutAttr", "">:$setLayouts
+    ArrayRefParameter<"PipelineBindingAttr", "">:$bindings,
+    OptionalParameter<"int64_t", "0">:$constants,
+    OptionalParameter<"std::optional<PipelineLayoutFlags>">:$flags
   );
 
   let assemblyFormat = [{
     `<`
-    `push_constants` `=` $pushConstants `,`
-    `sets` `=` `[` $setLayouts `]`
+    (`constants` `=` $constants^ `,`)?
+    `bindings` `=` `[` qualified($bindings) `]`
+    (`,` `flags` `=` $flags^)?
     `>`
   }];
 }

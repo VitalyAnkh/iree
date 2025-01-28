@@ -8,16 +8,19 @@
 
 #include <memory>
 
-#include "iree-dialects/Dialect/LinalgExt/Passes/Passes.h"
 #include "iree/compiler/Codegen/Common/CPU/Passes.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/VMVX/Passes.h"
 #include "iree/compiler/Dialect/HAL/Transforms/Passes.h"
+#include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
+#include "iree/compiler/Dialect/Util/Transforms/Passes.h"
+#include "iree/compiler/Utils/PassUtils.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
@@ -30,114 +33,117 @@ namespace mlir::iree_compiler::IREE::VMVX {
 // Variant configuration
 // ---------------------------------------------------------------------------
 
-void buildVMVXConfigurationPassPipeline(OpPassManager &passManager) {
-  // ---------------------------------------------------------------------------
-  // Tensor-level optimization, kernel dispatch and lower to buffers.
-  // ---------------------------------------------------------------------------
-  addCommonTargetExecutablePreprocessingPasses(passManager);
-  passManager.nest<ModuleOp>().addNestedPass<func::FuncOp>(
-      createCPUMaterializeEncodingPass());
-  // TODO: Remove the following pass the plumb support for #hal.descriptor_type
-  // memory space through the stack.
-  passManager.addPass(createEraseHALDescriptorTypeFromMemRefPass());
-  passManager.addPass(createVMVXSelectLoweringStrategyPass());
+void buildVMVXConfigurationPassPipeline(OpPassManager &variantPassManager) {
+  OpPassManager &modulePassManager = variantPassManager.nest<ModuleOp>();
+  {
+    FunctionLikeNest funcPassManager(modulePassManager);
+    // ---------------------------------------------------------------------------
+    // Tensor-level optimization, kernel dispatch and lower to buffers.
+    // ---------------------------------------------------------------------------
+    addCommonTargetExecutablePreprocessingPasses(funcPassManager);
+  }
+  modulePassManager.addPass(createMaterializeUserConfigsPass());
+  FunctionLikeNest(modulePassManager)
+      .addPass(createMaterializeDeviceEncodingPass)
+      // TODO: Remove the following pass the plumb support for
+      // #hal.descriptor_type memory space through the stack.
+      .addPass(createEraseHALDescriptorTypeFromMemRefPass);
+  modulePassManager.addPass(createVMVXSelectLoweringStrategyPass());
 }
 
 // ---------------------------------------------------------------------------
 // Variant Translation
 // ---------------------------------------------------------------------------
 
-static void buildVectorVMVXTransformPassPipeline(OpPassManager &passManager) {
+static void
+buildVectorVMVXTransformPassPipeline(OpPassManager &variantPassManager) {
+  OpPassManager &modulePassManager = variantPassManager.nest<ModuleOp>();
   // ---------------------------------------------------------------------------
   // Tensor-level optimization, kernel dispatch and lower to buffers.
   // ---------------------------------------------------------------------------
-  passManager.addPass(createVMVXLowerExecutableTargetPass());
-
-  OpPassManager &nestedModulePM = passManager.nest<ModuleOp>();
+  {
+    FunctionLikeNest(modulePassManager)
+        .addPass(createVMVXLowerExecutableTargetPass);
+  }
+  modulePassManager.addPass(createLowerUKernelOpsToCallsPass());
 
   // ---------------------------------------------------------------------------
   // Linalg -> Vectors
   // ---------------------------------------------------------------------------
 
-  // Tiling and distribution.
-  nestedModulePM.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-  // TODO(#5925): This can also be modified to just use the dynamic pass
-  // pipeline like the CPU side.
-  // nestedModulePM.addNestedPass<func::FuncOp>(
-  //     createLinalgTileAndVectorizeWorkgroupsPass());
+  FunctionLikeNest(modulePassManager)
+      .addPass(createCanonicalizerPass)
 
-  // Linalg -> SCF.
-  nestedModulePM.addNestedPass<func::FuncOp>(
-      IREE::LinalgExt::createLinalgExtToLoopsPass());
-  nestedModulePM.addNestedPass<func::FuncOp>(createMemrefCopyToLinalgPass());
-  nestedModulePM.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
-  nestedModulePM.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-  nestedModulePM.addNestedPass<func::FuncOp>(createCSEPass());
-  nestedModulePM.addNestedPass<func::FuncOp>(createConvertVectorToSCFPass());
-  nestedModulePM.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-  nestedModulePM.addNestedPass<func::FuncOp>(memref::createExpandOpsPass());
+      // Linalg -> SCF.
+      .addPass(IREE::LinalgExt::createLinalgExtToLoopsPass)
+      .addPass(createMemrefCopyToLinalgPass)
+      .addPass(createConvertLinalgToLoopsPass)
+      .addPass(createCanonicalizerPass)
+      .addPass(createCSEPass)
+      .addPass([]() { return createConvertVectorToSCFPass(); })
+      .addPass(createCanonicalizerPass)
+      .addPass(arith::createArithExpandOpsPass)
+      .addPass(memref::createExpandOpsPass);
 
   // Handle tensor-type constants.
-  nestedModulePM.addPass(arith::createConstantBufferizePass());
-  nestedModulePM.addPass(createFoldTensorExtractOpPass());
+  addConstantBufferizePasses(modulePassManager);
+  FunctionLikeNest(modulePassManager)
+      .addPass(createFoldTensorExtractOpPass)
 
-  // Resolve get_buffer_descriptor ops. All structural buffer manipulations
-  // must conclude before this point.
-  nestedModulePM.addNestedPass<func::FuncOp>(
-      createIREEExpandStridedMetadataPass());
-  nestedModulePM.addNestedPass<func::FuncOp>(
-      createResolveBufferDescriptorsPass());
-  nestedModulePM.addNestedPass<func::FuncOp>(
-      createCleanupBufferAllocViewPass());
+      // Resolve get_buffer_descriptor ops. All structural buffer manipulations
+      // must conclude before this point.
+      .addPass(memref::createFoldMemRefAliasOpsPass)
+      .addPass(createIREEExpandStridedMetadataPass)
+      .addPass(createResolveBufferDescriptorsPass)
+      .addPass(createCleanupBufferAllocViewPass)
 
-  // Flatten and cleanup memrefs.
-  nestedModulePM.addNestedPass<func::FuncOp>(
-      memref::createFoldMemRefAliasOpsPass());
-  nestedModulePM.addPass(createCanonicalizerPass());
-  nestedModulePM.addPass(createCSEPass());
-  nestedModulePM.addPass(createFlattenMemRefSubspanPass());
-  nestedModulePM.addPass(memref::createNormalizeMemRefsPass());
-  nestedModulePM.addNestedPass<func::FuncOp>(
-      affine::createAffineScalarReplacementPass());
-  nestedModulePM.addPass(createCanonicalizerPass());
+      // Flatten and cleanup memrefs.
+      .addPass(memref::createFoldMemRefAliasOpsPass)
+      .addPass(createCanonicalizerPass)
+      .addPass(createCSEPass);
+
+  modulePassManager.addPass(createFlattenMemRefSubspanPass());
+  modulePassManager.addPass(memref::createNormalizeMemRefsPass());
+
+  FunctionLikeNest(modulePassManager)
+      .addPass(affine::createAffineScalarReplacementPass)
+      .addPass(createCanonicalizerPass)
+      .addPass(createCSEPass);
 }
 
-static void
-buildLoopOptimizationVMVXTransformPassPipeline(OpPassManager &passManager) {
-  OpPassManager &nestedModulePM = passManager.nest<ModuleOp>();
-
-  nestedModulePM.addNestedPass<func::FuncOp>(createLowerAffinePass());
-  nestedModulePM.addNestedPass<func::FuncOp>(createForOpCanonicalizationPass());
-  nestedModulePM.addNestedPass<func::FuncOp>(
-      createLoopInvariantCodeMotionPass());
+static void buildLoopOptimizationVMVXTransformPassPipeline(
+    FunctionLikeNest &funcPassManager) {
+  funcPassManager.addPass(createLowerAffinePass)
+      .addPass(createForOpCanonicalizationPass)
+      .addPass(createIREELoopInvariantCodeMotionPass);
 }
 
-void buildVMVXTransformPassPipeline(OpPassManager &passManager) {
+void buildVMVXTransformPassPipeline(OpPassManager &variantPassManager) {
   // ---------------------------------------------------------------------------
   // Linalg -> Scalars/Vectors
   // ---------------------------------------------------------------------------
 
-  buildVectorVMVXTransformPassPipeline(passManager);
-
-  passManager.addPass(createCanonicalizerPass());
-  passManager.addPass(createCSEPass());
+  buildVectorVMVXTransformPassPipeline(variantPassManager);
 
   // ---------------------------------------------------------------------------
   // Standard/Vector/HAL/etc -> VMVX conversion
   // ---------------------------------------------------------------------------
 
-  passManager.addNestedPass<mlir::ModuleOp>(createMaterializeConstantsPass());
-  passManager.addNestedPass<mlir::ModuleOp>(createConversionPass());
-  passManager.addPass(createCanonicalizerPass());
-  passManager.addPass(createCSEPass());
+  OpPassManager &modulePassManager = variantPassManager.nest<mlir::ModuleOp>();
+  modulePassManager.addPass(createMaterializeConstantsPass());
+  modulePassManager.addPass(createConversionPass());
+
+  FunctionLikeNest funcPassManager(modulePassManager);
+  funcPassManager.addPass(createCanonicalizerPass).addPass(createCSEPass);
 
   // ---------------------------------------------------------------------------
   // Cleanup and canonicalization
   // ---------------------------------------------------------------------------
 
-  buildLoopOptimizationVMVXTransformPassPipeline(passManager);
-  passManager.addPass(createCanonicalizerPass());
-  passManager.addPass(createCSEPass());
+  buildLoopOptimizationVMVXTransformPassPipeline(funcPassManager);
+  funcPassManager.addPass(createCanonicalizerPass)
+      .addPass(createCSEPass)
+      .addPass(IREE::Util::createDropCompilerHintsPass);
 }
 
 namespace {
@@ -152,15 +158,15 @@ void registerVMVXPasses() {
   static PassPipelineRegistration<> configurationPassPipeline(
       "iree-vmvx-configuration-pipeline",
       "Runs the full IREE VMVX dialect configuration pipeline",
-      [](OpPassManager &passManager) {
-        buildVMVXConfigurationPassPipeline(passManager);
+      [](OpPassManager &modulePassManager) {
+        buildVMVXConfigurationPassPipeline(modulePassManager);
       });
 
   static PassPipelineRegistration<> transformPassPipeline(
       "iree-vmvx-transformation-pipeline",
       "Runs the full IREE VMVX dialect transformation pipeline",
-      [](OpPassManager &passManager) {
-        buildVMVXTransformPassPipeline(passManager);
+      [](OpPassManager &variantPassManager) {
+        buildVMVXTransformPassPipeline(variantPassManager);
       });
 }
 

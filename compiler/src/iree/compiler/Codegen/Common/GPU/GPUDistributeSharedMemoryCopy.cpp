@@ -5,17 +5,14 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include <algorithm>
-#include <numeric>
 
-#include "iree-dialects/Dialect/LinalgExt/Passes/Passes.h"
-#include "iree-dialects/Dialect/LinalgExt/Transforms/Transforms.h"
-#include "iree/compiler/Codegen/Common/GPU/PassDetail.h"
 #include "iree/compiler/Codegen/Common/GPU/Passes.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Transforms/Transforms.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/MarkerUtils.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -23,44 +20,42 @@
 #include "mlir/Dialect/Vector/Transforms/VectorTransforms.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/MLIRContext.h"
-#include "mlir/Support/MathExtras.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Transforms/Passes.h"
 
 #define DEBUG_TYPE "iree-codegen-gpu-distribute-shared-memory-copy"
 
-using mlir::iree_compiler::IREE::LinalgExt::LinalgVectorizationPattern;
-using mlir::iree_compiler::IREE::LinalgExt::VectorizationPatterns;
+namespace mlir::iree_compiler {
 
-/// Prints the given `funcOp` after a leading `step` comment header.
-void debugPrint(mlir::func::FuncOp funcOp, const char *step) {
-  LLVM_DEBUG({
-    llvm::dbgs() << "//--- " << step << " ---//\n";
-    funcOp.print(llvm::dbgs(), mlir::OpPrintingFlags().useLocalScope());
-    llvm::dbgs() << "\n\n";
-  });
-}
+#define GEN_PASS_DEF_GPUDISTRIBUTESHAREDMEMORYCOPYPASS
+#include "iree/compiler/Codegen/Common/GPU/Passes.h.inc"
 
+namespace {
 //====---------------------------------------------------------------------===//
 // Pass to lower workgroup memory copy to distibuted
 // transfer_read/transfer_write ops.
 //====---------------------------------------------------------------------===//
 
+/// Prints the given `funcOp` after a leading `step` comment header.
+static void debugPrint(Operation *op, const char *step) {
+  LLVM_DEBUG({
+    llvm::dbgs() << "//--- " << step << " ---//\n";
+    op->print(llvm::dbgs(), mlir::OpPrintingFlags().useLocalScope());
+    llvm::dbgs() << "\n\n";
+  });
+}
+
 // Markers for intermediate transformations.
 static const llvm::StringRef kCopyToDistribute = "copy_to_distribute";
 static const llvm::StringRef kCopyDistributed = "copy_distributed";
 
-namespace mlir::iree_compiler {
-
 // For optimal performance we always want to copy 128 bits
 static constexpr int copyVectorNumBits = 128;
 
-/// Patterns for copy to shared memory mapping. Copy to shared memory are not
-/// part of the launch config but needs to be distributed on the workgroup
-/// picked by the root op.
-static void
-populateTilingCopyToWorkgroupMemPatterns(RewritePatternSet &patterns,
-                                         ArrayRef<int64_t> workgroupSize) {
+/// Tiles copy to shared memory mapping. Copy to shared memory are not part of
+/// the launch config but needs to be distributed on the workgroup picked by the
+/// root op.
+static LogicalResult tileCopyToWorkgroupMem(mlir::FunctionOpInterface funcOp,
+                                            ArrayRef<int64_t> workgroupSize) {
   // Tile and distribute copy to workgroup memory.
   linalg::TileSizeComputationFunction wgCopyTileSizeFn =
       [](OpBuilder &builder, Operation *operation) {
@@ -102,13 +97,11 @@ populateTilingCopyToWorkgroupMemPatterns(RewritePatternSet &patterns,
           .setLoopType(linalg::LinalgTilingLoopType::Loops)
           .setTileSizeComputationFunction(wgCopyTileSizeFn)
           .setDistributionOptions(copyInvocationDistributionOptions);
-  patterns.insert<IREE::LinalgExt::LinalgTilingPattern>(
-      linalg::GenericOp::getOperationName(), patterns.getContext(),
-      tilingOptions,
-      IREE::LinalgExt::LinalgTransformationFilter(
-          {StringAttr::get(patterns.getContext(),
-                           getCopyToWorkgroupMemoryMarker())},
-          StringAttr::get(patterns.getContext(), getVectorizeMarker())));
+
+  auto filter = LinalgTransformationFilter(
+      {StringAttr::get(funcOp.getContext(), getCopyToWorkgroupMemoryMarker())},
+      StringAttr::get(funcOp.getContext(), getVectorizeMarker()));
+  return distributeLinalgOpsWithFilter(funcOp, tilingOptions, filter);
 }
 
 // Returns the vector size to use for the given genericOp considering its
@@ -122,7 +115,8 @@ static int getBaseVectorSize(linalg::GenericOp genericOp) {
   // sure we at least read a full byte for the sub-byte-element operands.
   unsigned operandBW = std::numeric_limits<unsigned>::max();
   for (OpOperand *operand : genericOp.getDpsInputOperands()) {
-    unsigned b = getElementTypeOrSelf(operand->get()).getIntOrFloatBitWidth();
+    unsigned b =
+        IREE::Util::getTypeBitWidth(getElementTypeOrSelf(operand->get()));
     operandBW = std::min(operandBW, b);
   }
   int vectorSize = copyVectorNumBits / resultBW;
@@ -160,10 +154,10 @@ getTileToDistributableSize(linalg::GenericOp copyOp,
   return unroll;
 }
 
-/// Pattern to tile copies using serial loops into a shape that can be
-/// distributed onto thread.
-static void populateTileToUnroll(RewritePatternSet &patterns,
-                                 int64_t flatWorkgroupSize) {
+/// Tiles copies using serial loops into a shape that can be distributed onto
+/// thread.
+static LogicalResult tileToUnroll(mlir::FunctionOpInterface funcOp,
+                                  int64_t flatWorkgroupSize) {
   linalg::TileSizeComputationFunction wgCopyTileSizeFn =
       [flatWorkgroupSize](OpBuilder &builder, Operation *operation) {
         SmallVector<Value> tileSizesVal;
@@ -182,13 +176,12 @@ static void populateTileToUnroll(RewritePatternSet &patterns,
   auto tilingOptions = linalg::LinalgTilingOptions()
                            .setLoopType(linalg::LinalgTilingLoopType::Loops)
                            .setTileSizeComputationFunction(wgCopyTileSizeFn);
-  patterns.insert<IREE::LinalgExt::LinalgTilingPattern>(
-      linalg::GenericOp::getOperationName(), patterns.getContext(),
-      tilingOptions,
-      IREE::LinalgExt::LinalgTransformationFilter(
-          {StringAttr::get(patterns.getContext(),
-                           getCopyToWorkgroupMemoryMarker())},
-          StringAttr::get(patterns.getContext(), kCopyToDistribute)));
+
+  MLIRContext *context = funcOp.getContext();
+  auto filter = LinalgTransformationFilter(
+      {StringAttr::get(context, getCopyToWorkgroupMemoryMarker())},
+      StringAttr::get(context, kCopyToDistribute));
+  return distributeLinalgOpsWithFilter(funcOp, tilingOptions, filter);
 }
 
 /// Break up the flat id onto the static loop ranges.
@@ -196,30 +189,29 @@ SmallVector<linalg::ProcInfo> getIds(OpBuilder &b, Location loc,
                                      ArrayRef<Range> parallelLoopRanges,
                                      Value flatThreadId) {
   SmallVector<linalg::ProcInfo> infos;
-  Value id = flatThreadId;
-  AffineExpr d0 = b.getAffineDimExpr(0);
-  for (Range r : llvm::reverse(parallelLoopRanges)) {
-    linalg::ProcInfo info;
-    auto offset = r.offset.dyn_cast<Attribute>();
-    auto stride = r.stride.dyn_cast<Attribute>();
-    auto size = r.size.dyn_cast<Attribute>();
+  SmallVector<int64_t> delinSizes;
+  for (Range r : parallelLoopRanges) {
+    auto offset = dyn_cast<Attribute>(r.offset);
+    auto stride = dyn_cast<Attribute>(r.stride);
+    auto size = dyn_cast<Attribute>(r.size);
     assert(offset && stride && size);
     int64_t numThreadsDim = (llvm::cast<IntegerAttr>(size).getInt() -
                              llvm::cast<IntegerAttr>(offset).getInt()) /
                             llvm::cast<IntegerAttr>(stride).getInt();
-    Value dimId = id;
-    if (infos.size() != parallelLoopRanges.size() - 1)
-      dimId =
-          affine::makeComposedAffineApply(b, loc, d0 % numThreadsDim, {dimId});
+    delinSizes.push_back(numThreadsDim);
+  }
+  ValueRange dims =
+      b.create<affine::AffineDelinearizeIndexOp>(loc, flatThreadId, delinSizes)
+          .getResults();
+
+  for (auto [dimId, numThreadsDim] : llvm::zip_equal(dims, delinSizes)) {
+    linalg::ProcInfo info;
     info.procId = dimId;
     info.nprocs = b.create<arith::ConstantIndexOp>(loc, numThreadsDim);
     info.distributionMethod =
         linalg::DistributionMethod::CyclicNumProcsEqNumIters;
     infos.push_back(info);
-    id = affine::makeComposedAffineApply(b, loc, d0.floorDiv(numThreadsDim),
-                                         {id});
   }
-  std::reverse(infos.begin(), infos.end());
   return infos;
 }
 
@@ -236,9 +228,9 @@ SmallVector<int64_t> getNativeDstShape(linalg::GenericOp copyOp) {
   return dstShape;
 }
 
-/// Distribute linalg copy onto threads based on the flat id.
-static void populateTilingAndDistribute(RewritePatternSet &patterns,
-                                        Value flatThreadId) {
+/// Distributes linalg copy onto threads based on the flat id.
+static LogicalResult tileAndDistribute(mlir::FunctionOpInterface funcOp,
+                                       Value flatThreadId) {
   linalg::TileSizeComputationFunction wgCopyTileSizeFn =
       [](OpBuilder &builder, Operation *operation) {
         SmallVector<Value> tileSizesVal;
@@ -265,47 +257,51 @@ static void populateTilingAndDistribute(RewritePatternSet &patterns,
           .setLoopType(linalg::LinalgTilingLoopType::ParallelLoops)
           .setTileSizeComputationFunction(wgCopyTileSizeFn)
           .setDistributionOptions(copyInvocationDistributionOptions);
-  patterns.insert<IREE::LinalgExt::LinalgTilingPattern>(
-      linalg::GenericOp::getOperationName(), patterns.getContext(),
-      tilingOptions,
-      IREE::LinalgExt::LinalgTransformationFilter(
-          {StringAttr::get(patterns.getContext(), kCopyToDistribute)},
-          StringAttr::get(patterns.getContext(), kCopyDistributed)));
+
+  auto filter = LinalgTransformationFilter(
+      {StringAttr::get(funcOp.getContext(), kCopyToDistribute)},
+      StringAttr::get(funcOp.getContext(), kCopyDistributed));
+  return distributeLinalgOpsWithFilter(funcOp, tilingOptions, filter);
 }
 
-static void populateVectorizationPatterns(RewritePatternSet &patterns) {
-  VectorizationPatterns<linalg::GenericOp>::insert(
-      patterns, IREE::LinalgExt::LinalgVectorizationOptions(),
-      IREE::LinalgExt::LinalgTransformationFilter(
-          {StringAttr::get(patterns.getContext(),
-                           getCopyToWorkgroupMemoryMarker()),
-           StringAttr::get(patterns.getContext(), kCopyDistributed)},
-          std::nullopt));
+/// Vectorizes generic ops that have CopyToWorkgroupMemoryMarker or
+// `kCopyDistributed` marker.
+static void
+vectorizeCopyToWorkgroupMemoryOps(mlir::FunctionOpInterface funcOp) {
+  MLIRContext *context = funcOp.getContext();
+  IRRewriter rewriter(context);
+  auto filter = LinalgTransformationFilter(
+      {StringAttr::get(context, getCopyToWorkgroupMemoryMarker()),
+       StringAttr::get(context, kCopyDistributed)},
+      std::nullopt);
+
+  funcOp.walk([&](linalg::GenericOp op) {
+    if (succeeded(filter.checkAndNotify(rewriter, op))) {
+      (void)linalg::vectorize(rewriter, op);
+    }
+  });
 }
 
 /// Return a flattened Id Value by combining the 3D gpu thread IDs.
-static Value createFlatId(func::FuncOp funcOp,
+static Value createFlatId(mlir::FunctionOpInterface funcOp,
                           ArrayRef<int64_t> workgroupSize) {
   OpBuilder b(funcOp.getFunctionBody());
   Type indexType = b.getIndexType();
-  AffineExpr d0 = getAffineDimExpr(0, b.getContext());
-  AffineExpr d1 = getAffineDimExpr(1, b.getContext());
-  AffineExpr d2 = getAffineDimExpr(2, b.getContext());
   Value threadX =
       b.create<gpu::ThreadIdOp>(funcOp.getLoc(), indexType, gpu::Dimension::x);
   Value threadY =
       b.create<gpu::ThreadIdOp>(funcOp.getLoc(), indexType, gpu::Dimension::y);
   Value threadZ =
       b.create<gpu::ThreadIdOp>(funcOp.getLoc(), indexType, gpu::Dimension::z);
-  Value flatThreadId = affine::makeComposedAffineApply(
-      b, funcOp.getLoc(),
-      d0 + workgroupSize[0] * d1 + (workgroupSize[0] * workgroupSize[1]) * d2,
-      {threadX, threadY, threadZ});
+  Value flatThreadId = b.create<affine::AffineLinearizeIndexOp>(
+      funcOp.getLoc(), ValueRange{threadZ, threadY, threadX},
+      ArrayRef<int64_t>{workgroupSize[2], workgroupSize[1], workgroupSize[0]},
+      /*disjoint=*/true);
   return flatThreadId;
 }
 
 /// Hoist allocations to the top of the loop if they have no dependencies.
-static void hoistAlloc(func::FuncOp funcOp) {
+static void hoistAlloc(mlir::FunctionOpInterface funcOp) {
   SmallVector<memref::AllocOp> allocs;
   funcOp.walk([&](memref::AllocOp alloc) {
     if (alloc.getOperands().empty())
@@ -319,7 +315,7 @@ static void hoistAlloc(func::FuncOp funcOp) {
 
 /// We insert barriers conservatively, remove barriers that are obviously not
 /// needed.
-static void removeRedundantBarriers(func::FuncOp funcOp) {
+static void removeRedundantBarriers(mlir::FunctionOpInterface funcOp) {
   funcOp.walk([](linalg::GenericOp copyOp) {
     if (hasMarker(copyOp, getCopyToWorkgroupMemoryMarker())) {
       Operation *prevOp = copyOp->getPrevNode();
@@ -348,13 +344,13 @@ static int64_t numIteration(scf::ForOp forOp) {
       ubCstOp.value() < 0 || stepCstOp.value() < 0)
     return 0;
   int64_t tripCount =
-      mlir::ceilDiv(ubCstOp.value() - lbCstOp.value(), stepCstOp.value());
+      llvm::divideCeil(ubCstOp.value() - lbCstOp.value(), stepCstOp.value());
   return tripCount;
 }
 
 /// Fully unroll all the static loops unless they are part of the ignore map.
 static void
-UnrollSharedMemoryLoops(func::FuncOp funcOp,
+unrollSharedMemoryLoops(mlir::FunctionOpInterface funcOp,
                         const llvm::SmallDenseSet<scf::ForOp> &loopsToIgnore) {
   SmallVector<scf::ForOp> forOpsToUnroll;
   funcOp.walk([&](scf::ForOp forOp) {
@@ -365,119 +361,104 @@ UnrollSharedMemoryLoops(func::FuncOp funcOp,
     (void)loopUnrollByFactor(forOp, numIteration(forOp));
   }
 }
+} // namespace
+
+LogicalResult gpuDistributeSharedMemoryCopy(mlir::FunctionOpInterface funcOp) {
+  auto maybeWorkgroupSize = getWorkgroupSize(funcOp);
+  if (!maybeWorkgroupSize) {
+    return funcOp.emitOpError("failed to distribute shared memory copy since "
+                              "workgroup size isnt set");
+  }
+  SmallVector<int64_t> workgroupSize = maybeWorkgroupSize.value();
+  workgroupSize.resize(3, 1);
+  MLIRContext *context = funcOp.getContext();
+  SmallVector<linalg::GenericOp> copiesToWorkgroupMem;
+  funcOp.walk([&](linalg::GenericOp copyOp) {
+    if (hasMarker(copyOp, getCopyToWorkgroupMemoryMarker()))
+      copiesToWorkgroupMem.push_back(copyOp);
+  });
+  if (copiesToWorkgroupMem.empty())
+    return success();
+
+  // Step 0. First clean up the IR.
+  hoistAlloc(funcOp);
+  removeRedundantBarriers(funcOp);
+
+  int64_t flatWorkgroupSize =
+      workgroupSize[0] * workgroupSize[1] * workgroupSize[2];
+  bool isAligned = llvm::all_of(
+      copiesToWorkgroupMem, [flatWorkgroupSize](linalg::GenericOp copyOp) {
+        MemRefType dstMemRefType = llvm::cast<MemRefType>(
+            copyOp.getDpsInitOperand(0)->get().getType());
+        auto shape = dstMemRefType.getShape();
+        int targetVectorSize =
+            copyVectorNumBits / dstMemRefType.getElementTypeBitWidth();
+        return canPerformVectorAccessUsingAllThreads(shape, flatWorkgroupSize,
+                                                     targetVectorSize);
+      });
+  debugPrint(funcOp, "After initial IR cleanup");
+
+  if (isAligned) {
+    // Ignore all the exisiting loop
+    llvm::SmallDenseSet<scf::ForOp> loopsToIgnore;
+    funcOp.walk([&](scf::ForOp loop) { loopsToIgnore.insert(loop); });
+
+    // Step 1. tile copies to get to a shape that can be distributed to
+    // 128bits per lane copies.
+    if (failed(tileToUnroll(funcOp, flatWorkgroupSize))) {
+      return failure();
+    }
+    debugPrint(funcOp, "After step 1: tiling");
+
+    // Calculate a flat id that will then be broken down during distribution.
+    Value flatId = createFlatId(funcOp, workgroupSize);
+    // Step 2. Distribute the linalg op onto threads.
+    if (failed(tileAndDistribute(funcOp, flatId))) {
+      return failure();
+    }
+    debugPrint(funcOp, "After step 2: thread distribution");
+
+    // Step 3. Vectorize the distributed copies.
+    vectorizeCopyToWorkgroupMemoryOps(funcOp);
+    debugPrint(funcOp, "After step 3: vectorization");
+
+    // Step4. Finally unroll all the loop created
+    unrollSharedMemoryLoops(funcOp, loopsToIgnore);
+    debugPrint(funcOp, "After step 4: unrolling");
+  } else {
+    // Fall back to basic tiling for cases where workgroup memory size is not
+    // well aligned on the number of threads.
+    // TODO(thomasraoux): Handle this case with padding instead so that we get
+    // good performance for more complex shapes.
+    if (failed(tileCopyToWorkgroupMem(funcOp, workgroupSize))) {
+      return failure();
+    }
+    debugPrint(funcOp, "After tiling for unaligned case");
+
+    // Apply canonicalization patterns.
+    RewritePatternSet threadTilingCanonicalizationPatterns =
+        linalg::getLinalgTilingCanonicalizationPatterns(context);
+    populateAffineMinSCFCanonicalizationPattern(
+        threadTilingCanonicalizationPatterns);
+    if (failed(applyPatternsGreedily(
+            funcOp, std::move(threadTilingCanonicalizationPatterns)))) {
+      return failure();
+    }
+  }
+
+  return success();
+}
 
 namespace {
-
-class GPUDistributeSharedMemoryCopyPass
-    : public GPUDistributeSharedMemoryCopyBase<
+struct GPUDistributeSharedMemoryCopyPass final
+    : impl::GPUDistributeSharedMemoryCopyPassBase<
           GPUDistributeSharedMemoryCopyPass> {
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<gpu::GPUDialect, vector::VectorDialect, scf::SCFDialect>();
-  }
   void runOnOperation() override {
-    func::FuncOp funcOp = getOperation();
-    FailureOr<IREE::HAL::ExecutableExportOp> exportOp = getEntryPoint(funcOp);
-    if (failed(exportOp))
-      return;
-    auto workgroupSize = getWorkgroupSize(exportOp.value());
-    workgroupSize.resize(3, 1);
-    MLIRContext *context = &getContext();
-    SmallVector<linalg::GenericOp> copiesToWorkgroupMem;
-    funcOp.walk([&](linalg::GenericOp copyOp) {
-      if (hasMarker(copyOp, getCopyToWorkgroupMemoryMarker()))
-        copiesToWorkgroupMem.push_back(copyOp);
-    });
-    if (copiesToWorkgroupMem.empty())
-      return;
-
-    // Step 0. First clean up the IR.
-    hoistAlloc(funcOp);
-    removeRedundantBarriers(funcOp);
-
-    int64_t flatWorkgroupSize =
-        workgroupSize[0] * workgroupSize[1] * workgroupSize[2];
-    bool isAligned = llvm::all_of(
-        copiesToWorkgroupMem, [flatWorkgroupSize](linalg::GenericOp copyOp) {
-          MemRefType dstMemRefType = llvm::cast<MemRefType>(
-              copyOp.getDpsInitOperand(0)->get().getType());
-          auto shape = dstMemRefType.getShape();
-          int targetVectorSize =
-              copyVectorNumBits / dstMemRefType.getElementTypeBitWidth();
-          return canPerformVectorAccessUsingAllThreads(shape, flatWorkgroupSize,
-                                                       targetVectorSize);
-        });
-    debugPrint(funcOp, "After initial IR cleanup");
-
-    if (isAligned) {
-      // Ignore all the exisiting loop
-      llvm::SmallDenseSet<scf::ForOp> loopsToIgnore;
-      funcOp.walk([&](scf::ForOp loop) { loopsToIgnore.insert(loop); });
-
-      // Step 1. tile copies to get to a shape that can be distributed to
-      // 128bits per lane copies.
-      RewritePatternSet serialTilingPatterns(context);
-      populateTileToUnroll(serialTilingPatterns, flatWorkgroupSize);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(serialTilingPatterns)))) {
-        return signalPassFailure();
-      }
-      debugPrint(funcOp, "After step 1: tiling");
-
-      // Calculate a flat id that will then be broken down during distribution.
-      Value flatId = createFlatId(funcOp, workgroupSize);
-      // Step 2. Distribute the linalg op onto threads.
-      RewritePatternSet tileAndDistributePatterns(context);
-      populateTilingAndDistribute(tileAndDistributePatterns, flatId);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(tileAndDistributePatterns)))) {
-        return signalPassFailure();
-      }
-      debugPrint(funcOp, "After step 2: thread distribution");
-
-      // Step 3. Vectorize the distributed copies.
-      RewritePatternSet vectorizationPatterns(context);
-      populateVectorizationPatterns(vectorizationPatterns);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(vectorizationPatterns)))) {
-        return signalPassFailure();
-      }
-      debugPrint(funcOp, "After step 3: vectorization");
-
-      // Step4. Finally unroll all the loop created
-      UnrollSharedMemoryLoops(funcOp, loopsToIgnore);
-      debugPrint(funcOp, "After step 4: unrolling");
-    } else {
-      // Fall back to basic tiling for cases where workgroup memory size is not
-      // well aligned on the number of threads.
-      // TODO(thomasraoux): Handle this case with padding instead so that we get
-      // good performance for more complex shapes.
-      RewritePatternSet threadLevelTilingPatterns(context);
-      populateTilingCopyToWorkgroupMemPatterns(threadLevelTilingPatterns,
-                                               workgroupSize);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(threadLevelTilingPatterns)))) {
-        return signalPassFailure();
-      }
-      debugPrint(funcOp, "After tiling for unaligned case");
-
-      // Apply canonicalization patterns.
-      RewritePatternSet threadTilingCanonicalizationPatterns =
-          linalg::getLinalgTilingCanonicalizationPatterns(context);
-      populateAffineMinSCFCanonicalizationPattern(
-          threadTilingCanonicalizationPatterns);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(threadTilingCanonicalizationPatterns)))) {
-        return signalPassFailure();
-      }
+    auto funcOp = getOperation();
+    if (failed(gpuDistributeSharedMemoryCopy(funcOp))) {
+      return signalPassFailure();
     }
   }
 };
-
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createGPUDistributeSharedMemoryCopy() {
-  return std::make_unique<GPUDistributeSharedMemoryCopyPass>();
-}
-
 } // namespace mlir::iree_compiler

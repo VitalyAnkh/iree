@@ -187,7 +187,7 @@ static bool resultsInSupportedAsyncCopy(MemRefType memrefType,
   return true;
 }
 
-void createAsyncGroups(RewriterBase &rewriter, func::FuncOp funcOp,
+void createAsyncGroups(RewriterBase &rewriter, mlir::FunctionOpInterface funcOp,
                        bool useMMASync) {
   LDBG("Start asyncGroups: useMMASync=" << useMMASync);
   llvm::SmallSetVector<Operation *, 16> copyToSharedMem;
@@ -317,7 +317,8 @@ void createAsyncGroups(RewriterBase &rewriter, func::FuncOp funcOp,
   }
 }
 
-void reorderTranspose(RewriterBase &rewriter, func::FuncOp funcOp) {
+void reorderTranspose(RewriterBase &rewriter,
+                      mlir::FunctionOpInterface funcOp) {
   SmallVector<vector::TransposeOp> transposeOps;
   funcOp.walk([&](Operation *op) {
     if (auto transposeOp = dyn_cast<vector::TransposeOp>(op)) {
@@ -348,10 +349,8 @@ void reorderTranspose(RewriterBase &rewriter, func::FuncOp funcOp) {
   }
 }
 
-/// Insert barriers and wait operations if there are allocs of a different alias
-/// group before the given alloc.
-static void addBarrier(func::FuncOp funcOp, Operation *alloc,
-                       ArrayRef<Operation *> aliasGroup) {
+void addBarrier(mlir::FunctionOpInterface funcOp, Operation *alloc,
+                ArrayRef<Operation *> aliasGroup, bool hasAsyncCopies) {
   Block *entryBlock = &(*funcOp.getBlocks().begin());
   bool needBarrier = false;
   if (alloc->getBlock() != entryBlock) {
@@ -374,7 +373,6 @@ static void addBarrier(func::FuncOp funcOp, Operation *alloc,
     return;
   OpBuilder builder(alloc);
   // TODO: make it a option if needed.
-  bool hasAsyncCopies = true;
   if (hasAsyncCopies) {
     Value groupToken = builder.create<nvgpu::DeviceAsyncCreateGroupOp>(
         funcOp.getLoc(), nvgpu::DeviceAsyncTokenType::get(funcOp.getContext()),
@@ -385,7 +383,7 @@ static void addBarrier(func::FuncOp funcOp, Operation *alloc,
   builder.create<gpu::BarrierOp>(alloc->getLoc());
 }
 
-void packSharedMemoryAlloc(func::FuncOp funcOp) {
+void packSharedMemoryAlloc(mlir::FunctionOpInterface funcOp) {
   DominanceInfo dominators(funcOp);
   SmallVector<Operation *> allocs;
   funcOp.walk([&](memref::AllocOp alloc) {

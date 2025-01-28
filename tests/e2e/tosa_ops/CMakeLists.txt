@@ -59,6 +59,8 @@ iree_check_single_backend_test_suite(
     "llvm-cpu"
   DRIVER
     "local-task"
+  COMPILER_FLAGS
+    "--iree-llvmcpu-target-cpu=generic"
   INPUT_TYPE
     "tosa"
 )
@@ -98,6 +100,7 @@ iree_check_single_backend_test_suite(
     "negate.mlir"
     "pad.mlir"
     "reciprocal.mlir"
+    "reduce.mlir"
     "reshape.mlir"
     "rsqrt.mlir"
     "select.mlir"
@@ -195,6 +198,7 @@ iree_check_single_backend_test_suite(
     "log.mlir"
     "logical_left_shift.mlir"
     "logical_right_shift.mlir"
+    "logical_right_shift_16.mlir"
     "matmul.mlir"
     "max_pool.mlir"
     "maximum.mlir"
@@ -220,62 +224,6 @@ iree_check_single_backend_test_suite(
     "vulkan"
   INPUT_TYPE
     "tosa"
-)
-
-### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###
-
-iree_check_single_backend_test_suite(
-  NAME
-    check_webgpu
-  SRCS
-    "abs.mlir"
-    "add.mlir"
-    "arithmetic_right_shift.mlir"
-    "bitwise_and.mlir"
-    "bitwise_or.mlir"
-    "bitwise_xor.mlir"
-    "ceil.mlir"
-    "clamp.mlir"
-    "clz.mlir"
-    "const.mlir"
-    # "equal.mlir"  # TODO(#10906): fix (i8/i16?)
-    "exp.mlir"
-    "floor.mlir"
-    "fully_connected.mlir"
-    "gather.mlir"
-    # "greater.mlir"  # TODO(#10906): fix (i8/i16?)
-    # "greater_equal.mlir"  # TODO(#10906): fix (i8/i16?)
-    "if.mlir"
-    "log.mlir"
-    "logical_left_shift.mlir"
-    "logical_right_shift.mlir"
-    "matmul.mlir"
-    # "max_pool.mlir"  # TODO(#10906): fix (i8/i16?)
-    "maximum.mlir"
-    "minimum.mlir"
-    "mul.mlir"
-    "mul_shift.mlir"
-    "negate.mlir"
-    "pad.mlir"
-    "reciprocal.mlir"
-    "reduce.mlir"
-    "reshape.mlir"
-    "rsqrt.mlir"
-    "select.mlir"
-    "sigmoid.mlir"
-    "sub.mlir"
-    # "table.mlir"  # TODO(#10906): fix (i8/i16?)
-    "tanh.mlir"
-    "transpose.mlir"
-    # "while.mlir"  # TODO(#12509): WebGPU SPIR-V broken
-  TARGET_BACKEND
-    "webgpu"
-  # Only test compilation for now, the WebGPU driver is not stable/tested yet.
-  # DRIVER
-  #   "webgpu"
-  COMPILER_FLAGS
-    "--iree-input-type=tosa"
-    "--iree-codegen-gpu-native-math-precision=true"  # TODO(#11321): Infer/flip default
 )
 
 iree_check_single_backend_test_suite(
@@ -327,8 +275,240 @@ iree_check_single_backend_test_suite(
     "metal-spirv"
   DRIVER
     "metal"
+  INPUT_TYPE
+    "tosa"
+)
+
+iree_check_single_backend_test_suite(
+  NAME
+    check_cuda_graph
+  SRCS
+    "abs.mlir"
+    "add.mlir"
+    "arithmetic_right_shift.mlir"
+    "bitwise_and.mlir"
+    "bitwise_or.mlir"
+    "bitwise_xor.mlir"
+    "ceil.mlir"
+    "clamp.mlir"
+    "clz.mlir"
+    "const.mlir"
+    "equal.mlir"
+    "exp.mlir"
+    "floor.mlir"
+    "fully_connected.mlir"
+    "gather.mlir"
+    "greater.mlir"
+    "greater_equal.mlir"
+    "if.mlir"
+    "log.mlir"
+    "logical_left_shift.mlir"
+    "logical_right_shift.mlir"
+    "logical_right_shift_16.mlir"
+    "matmul.mlir"
+    "max_pool.mlir"
+    "maximum.mlir"
+    "minimum.mlir"
+    "mul.mlir"
+    "negate.mlir"
+    "pad.mlir"
+    "reciprocal.mlir"
+    "reduce.mlir"
+    "reshape.mlir"
+    "rsqrt.mlir"
+    "select.mlir"
+    "sigmoid.mlir"
+    "sub.mlir"
+    "table.mlir"
+    "tanh.mlir"
+    "transpose.mlir"
+    "while.mlir"
+  TARGET_BACKEND
+    "cuda"
+  DRIVER
+    "cuda"
+  COMPILER_FLAGS
+    "--iree-stream-emulate-memset"
+  INPUT_TYPE
+    "tosa"
+  RUNNER_ARGS
+    "--cuda_use_streams=false"
+  LABELS
+    "noasan"
+    "nomsan"
+    "notsan"
+    "noubsan"
+    "requires-gpu-nvidia"
+)
+
+iree_check_single_backend_test_suite(
+  NAME
+    check_cuda_stream
+  SRCS
+    "abs.mlir"
+    "add.mlir"
+    "arithmetic_right_shift.mlir"
+    "bitwise_and.mlir"
+    "bitwise_or.mlir"
+    "bitwise_xor.mlir"
+    "ceil.mlir"
+    "clamp.mlir"
+    "clz.mlir"
+    "const.mlir"
+    "equal.mlir"
+    "exp.mlir"
+    "floor.mlir"
+    "fully_connected.mlir"
+    "gather.mlir"
+    "greater.mlir"
+    "greater_equal.mlir"
+    "if.mlir"
+    "log.mlir"
+    "logical_left_shift.mlir"
+    "logical_right_shift.mlir"
+    "logical_right_shift_16.mlir"
+    "matmul.mlir"
+    "max_pool.mlir"
+    "maximum.mlir"
+    "minimum.mlir"
+    "mul.mlir"
+    "negate.mlir"
+    "pad.mlir"
+    "reciprocal.mlir"
+    "reduce.mlir"
+    "reshape.mlir"
+    "rsqrt.mlir"
+    "select.mlir"
+    "sigmoid.mlir"
+    "sub.mlir"
+    "table.mlir"
+    "tanh.mlir"
+    "transpose.mlir"
+    "while.mlir"
+  TARGET_BACKEND
+    "cuda"
+  DRIVER
+    "cuda"
+  INPUT_TYPE
+    "tosa"
+  RUNNER_ARGS
+    "--cuda_use_streams=true"
+  LABELS
+    "noasan"
+    "nomsan"
+    "notsan"
+    "noubsan"
+    "requires-gpu-nvidia"
+)
+
+iree_check_single_backend_test_suite(
+  NAME
+    check_rocm_hip_stream
+  SRCS
+    "abs.mlir"
+    "add.mlir"
+    "arithmetic_right_shift.mlir"
+    "bitwise_and.mlir"
+    "bitwise_or.mlir"
+    "bitwise_xor.mlir"
+    "ceil.mlir"
+    "clamp.mlir"
+    "clz.mlir"
+    "const.mlir"
+    "equal.mlir"
+    "exp.mlir"
+    "floor.mlir"
+    "fully_connected.mlir"
+    "gather.mlir"
+    "greater.mlir"
+    "greater_equal.mlir"
+    "if.mlir"
+    "log.mlir"
+    "logical_left_shift.mlir"
+    "logical_right_shift.mlir"
+    "logical_right_shift_16.mlir"
+    "matmul.mlir"
+    "max_pool.mlir"
+    "maximum.mlir"
+    "minimum.mlir"
+    "mul.mlir"
+    "negate.mlir"
+    "pad.mlir"
+    "reciprocal.mlir"
+    "reduce.mlir"
+    "reshape.mlir"
+    "rsqrt.mlir"
+    "select.mlir"
+    "sigmoid.mlir"
+    "sub.mlir"
+    "table.mlir"
+    "tanh.mlir"
+    "transpose.mlir"
+    "while.mlir"
+  TARGET_BACKEND
+    "rocm"
+  DRIVER
+    "hip"
+  INPUT_TYPE
+    "tosa"
+  RUNNER_ARGS
+    "--hip_use_streams=true"
+)
+
+### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###
+
+iree_check_single_backend_test_suite(
+  NAME
+    check_webgpu
+  SRCS
+    "abs.mlir"
+    "add.mlir"
+    "arithmetic_right_shift.mlir"
+    "bitwise_and.mlir"
+    "bitwise_or.mlir"
+    "bitwise_xor.mlir"
+    "ceil.mlir"
+    "clamp.mlir"
+    "clz.mlir"
+    "const.mlir"
+    # "equal.mlir"  # TODO(#10906): fix (i8/i16?)
+    "exp.mlir"
+    "floor.mlir"
+    "fully_connected.mlir"
+    "gather.mlir"
+    # "greater.mlir"  # TODO(#10906): fix (i8/i16?)
+    # "greater_equal.mlir"  # TODO(#10906): fix (i8/i16?)
+    "if.mlir"
+    "log.mlir"
+    "logical_left_shift.mlir"
+    "logical_right_shift.mlir"
+    "matmul.mlir"
+    # "max_pool.mlir"  # TODO(#10906): fix (i8/i16?)
+    "maximum.mlir"
+    "minimum.mlir"
+    "mul.mlir"
+    "mul_shift.mlir"
+    "negate.mlir"
+    "pad.mlir"
+    "reciprocal.mlir"
+    "reduce.mlir"
+    "reshape.mlir"
+    "rsqrt.mlir"
+    "select.mlir"
+    "sigmoid.mlir"
+    "sub.mlir"
+    # "table.mlir"  # TODO(#10906): fix (i8/i16?)
+    "tanh.mlir"
+    "transpose.mlir"
+    # "while.mlir"  # TODO(#12509): WebGPU SPIR-V broken
+  TARGET_BACKEND
+    "webgpu-spirv"
+  # Only test compilation for now, the WebGPU driver is not stable/tested yet.
+  # DRIVER
+  #   "webgpu"
   COMPILER_FLAGS
     "--iree-input-type=tosa"
+    "--iree-codegen-gpu-native-math-precision=true"  # TODO(#11321): Infer/flip default
 )
 
 iree_check_single_backend_test_suite(

@@ -28,7 +28,6 @@ iree_lit_test_suite(
     iree-run-mlir
   LABELS
     "driver=local-task"
-    "driver=vulkan"
     "hostonly"
 )
 
@@ -43,6 +42,7 @@ iree_check_single_backend_test_suite(
     "local-task"
   COMPILER_FLAGS
     "--iree-llvmcpu-reassociate-fp-reductions=false"
+    "--iree-llvmcpu-target-cpu=generic"
   INPUT_TYPE
     "stablehlo"
 )
@@ -73,6 +73,8 @@ iree_check_single_backend_test_suite(
     "llvm-cpu"
   DRIVER
     "local-task"
+  COMPILER_FLAGS
+    "--iree-llvmcpu-target-cpu=generic"
   INPUT_TYPE
     "stablehlo"
 )
@@ -86,6 +88,8 @@ iree_check_single_backend_test_suite(
     "llvm-cpu"
   DRIVER
     "local-task"
+  COMPILER_FLAGS
+    "--iree-llvmcpu-target-cpu=generic"
   INPUT_TYPE
     "tosa"
 )
@@ -191,7 +195,7 @@ iree_check_single_backend_test_suite(
   DRIVER
     "cuda"
   COMPILER_FLAGS
-    "--iree-flow-fuse-multi-use"
+    "--iree-dispatch-creation-fuse-multi-use"
   LABELS
     "noasan"
     "nomsan"
@@ -210,7 +214,8 @@ iree_check_single_backend_test_suite(
   DRIVER
     "local-task"
   COMPILER_FLAGS
-    "-iree-opt-demote-f64-to-f32=false"
+    "--iree-input-demote-f64-to-f32=false"
+    "--iree-llvmcpu-target-cpu=generic"
 )
 
 iree_check_single_backend_test_suite(
@@ -223,7 +228,8 @@ iree_check_single_backend_test_suite(
   DRIVER
     "local-task"
   COMPILER_FLAGS
-    "--iree-flow-fuse-multi-use"
+    "--iree-dispatch-creation-fuse-multi-use"
+    "--iree-llvmcpu-target-cpu=generic"
 )
 
 iree_check_single_backend_test_suite(

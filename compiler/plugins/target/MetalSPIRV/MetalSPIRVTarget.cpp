@@ -4,14 +4,15 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "./MetalSPIRVTarget.h"
-
-#include "./MSLToMetalLib.h"
-#include "./MetalTargetPlatform.h"
-#include "./SPIRVToMSL.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenDialect.h"
+#include "compiler/plugins/target/MetalSPIRV/MSLToMetalLib.h"
+#include "compiler/plugins/target/MetalSPIRV/MetalTargetPlatform.h"
+#include "compiler/plugins/target/MetalSPIRV/SPIRVToMSL.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
+#include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/KnownTargets.h"
 #include "iree/compiler/Codegen/SPIRV/Passes.h"
+#include "iree/compiler/Dialect/Flow/IR/FlowDialect.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
+#include "iree/compiler/Dialect/HAL/Utils/ExecutableDebugInfoUtils.h"
 #include "iree/compiler/PluginAPI/Client.h"
 #include "iree/compiler/Utils/FlatbufferUtils.h"
 #include "iree/schemas/metal_executable_def_builder.h"
@@ -20,9 +21,7 @@
 #include "llvm/TargetParser/Triple.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
-#include "mlir/Dialect/SPIRV/IR/SPIRVEnums.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
-#include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Target/SPIRV/Serialization.h"
 
@@ -53,111 +52,92 @@ struct MetalSPIRVOptions {
 };
 } // namespace
 
-static spirv::TargetEnvAttr getMetalTargetEnv(MLIRContext *context) {
-  using spirv::Capability;
-  using spirv::Extension;
+// TODO: MetalOptions for choosing the Metal version.
+class MetalTargetDevice : public TargetDevice {
+public:
+  MetalTargetDevice(const MetalSPIRVOptions &options) : options(options) {}
 
-  // Capabilities and limits according to Metal 3 devices.
-  const std::array<Extension, 4> extensions = {
-      Extension::SPV_KHR_16bit_storage,
-      Extension::SPV_KHR_8bit_storage,
-      Extension::SPV_KHR_storage_buffer_storage_class,
-      Extension::SPV_KHR_variable_pointers,
-  };
-  const std::array<Capability, 21> capabilities = {
-      Capability::Shader,
-      Capability::Int8,
-      Capability::Int16,
-      Capability::Int64,
-      Capability::Float16,
-      Capability::UniformAndStorageBuffer8BitAccess,
-      Capability::StorageBuffer8BitAccess,
-      Capability::StoragePushConstant8,
-      Capability::StorageUniform16,
-      Capability::StorageBuffer16BitAccess,
-      Capability::StoragePushConstant16,
-      Capability::GroupNonUniform,
-      Capability::GroupNonUniformVote,
-      Capability::GroupNonUniformArithmetic,
-      Capability::GroupNonUniformBallot,
-      Capability::GroupNonUniformShuffle,
-      Capability::GroupNonUniformShuffleRelative,
-      Capability::GroupNonUniformQuad,
-      Capability::StoragePushConstant16,
-      Capability::VariablePointers,
-      Capability::VariablePointersStorageBuffer,
-  };
-  auto limits = spirv::ResourceLimitsAttr::get(
-      context,
-      /*max_compute_shared_memory_size=*/32768,
-      /*max_compute_workgroup_invocations=*/1024,
-      /*max_compute_workgroup_size=*/
-      Builder(context).getI32ArrayAttr({1024, 1024, 1024}),
-      /*subgroup_size=*/32,
-      /*min_subgroup_size=*/std::nullopt,
-      /*max_subgroup_size=*/std::nullopt,
-      /*cooperative_matrix_properties_khr=*/ArrayAttr{},
-      /*cooperative_matrix_properties_nv=*/ArrayAttr{});
+  IREE::HAL::DeviceTargetAttr
+  getDefaultDeviceTarget(MLIRContext *context,
+                         const TargetRegistry &targetRegistry) const override {
+    Builder b(context);
+    auto configAttr = b.getDictionaryAttr({});
 
-  auto triple = spirv::VerCapExtAttr::get(spirv::Version::V_1_3, capabilities,
-                                          extensions, context);
-  // Further assuming Apple GPUs.
-  return spirv::TargetEnvAttr::get(
-      triple, limits, spirv::ClientAPI::Metal, spirv::Vendor::Apple,
-      spirv::DeviceType::IntegratedGPU, spirv::TargetEnvAttr::kUnknownDeviceID);
-}
+    // If we had multiple target environments we would generate one target attr
+    // per environment, with each setting its own environment attribute.
+    SmallVector<IREE::HAL::ExecutableTargetAttr> executableTargetAttrs;
+    targetRegistry.getTargetBackend("metal-spirv")
+        ->getDefaultExecutableTargets(context, "metal", configAttr,
+                                      executableTargetAttrs);
+
+    return IREE::HAL::DeviceTargetAttr::get(context, b.getStringAttr("metal"),
+                                            configAttr, executableTargetAttrs);
+  }
+
+private:
+  const MetalSPIRVOptions &options;
+};
 
 class MetalSPIRVTargetBackend : public TargetBackend {
 public:
   MetalSPIRVTargetBackend(const MetalSPIRVOptions &options)
       : options(options) {}
 
-  // NOTE: we could vary this based on the options such as 'metal-v2'.
-  std::string name() const override { return "metal"; }
+  std::string getLegacyDefaultDeviceID() const override { return "metal"; }
+
+  void getDefaultExecutableTargets(
+      MLIRContext *context, StringRef deviceID, DictionaryAttr deviceConfigAttr,
+      SmallVectorImpl<IREE::HAL::ExecutableTargetAttr> &executableTargetAttrs)
+      const override {
+    executableTargetAttrs.push_back(getExecutableTarget(context));
+  }
+
+  IREE::HAL::ExecutableTargetAttr
+  getExecutableTarget(MLIRContext *context) const {
+    Builder b(context);
+    SmallVector<NamedAttribute, 1> configItems;
+    if (auto target = GPU::getMetalTargetDetails(context)) {
+      configItems.emplace_back("iree.gpu.target", target);
+    }
+
+    return b.getAttr<IREE::HAL::ExecutableTargetAttr>(
+        b.getStringAttr("metal-spirv"), b.getStringAttr("metal-msl-fb"),
+        b.getDictionaryAttr(configItems));
+  }
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<gpu::GPUDialect, IREE::Codegen::IREECodegenDialect,
-                    IREE::Flow::FlowDialect, spirv::SPIRVDialect>();
+                    IREE::Flow::FlowDialect, spirv::SPIRVDialect,
+                    IREE::GPU::IREEGPUDialect>();
   }
 
-  IREE::HAL::DeviceTargetAttr
-  getDefaultDeviceTarget(MLIRContext *context) const override {
-    Builder b(context);
-    SmallVector<NamedAttribute> configItems;
-
-    configItems.emplace_back(b.getStringAttr("executable_targets"),
-                             getExecutableTargets(context));
-
-    auto configAttr = b.getDictionaryAttr(configItems);
-    return IREE::HAL::DeviceTargetAttr::get(
-        context, b.getStringAttr(deviceID()), configAttr);
-  }
-
-  void buildConfigurationPassPipeline(IREE::HAL::ExecutableVariantOp variantOp,
-                                      OpPassManager &passManager) override {
-    // For now we disable configuration if the variant has external object
-    // files.
-    if (variantOp.isExternal())
-      return;
-
+  void
+  buildConfigurationPassPipeline(IREE::HAL::ExecutableTargetAttr targetAttr,
+                                 OpPassManager &passManager) override {
     buildSPIRVCodegenConfigurationPassPipeline(passManager);
   }
 
-  void buildTranslationPassPipeline(IREE::HAL::ExecutableVariantOp variantOp,
+  void buildTranslationPassPipeline(IREE::HAL::ExecutableTargetAttr targetAttr,
                                     OpPassManager &passManager) override {
-    // For now we disable translation if the variant has external object files.
-    // We could instead perform linking with those objects (if they're Metal
-    // archives, etc).
-    if (variantOp.isExternal())
-      return;
-
-    buildSPIRVCodegenPassPipeline(passManager, /*enableFastMath=*/false);
+    buildSPIRVCodegenPassPipeline(passManager);
   }
 
   LogicalResult serializeExecutable(const SerializationOptions &serOptions,
                                     IREE::HAL::ExecutableVariantOp variantOp,
                                     OpBuilder &executableBuilder) override {
     ModuleOp innerModuleOp = variantOp.getInnerModule();
+
+    // TODO: rework this to compile all modules into the same metallib and
+    // source the entry points from them. Or use a linking tool (metal-ar) to
+    // link the compiled metallibs together. If we were not using spirv-cross
+    // we'd never do it like this with one module per function.
+    //
+    // Currently this is _really_ bad because it doesn't support linking like
+    // the Vulkan SPIR-V target: that allows multiple spirv::ModuleOps so we
+    // at least only have a single HAL executable; this should all be reworked
+    // to have multiple SPIR-V modules in a single executable and then even if
+    // passing through spirv-cross independently should link the resulting
+    // metallibs together.
     auto spvModuleOp = *innerModuleOp.getOps<spirv::ModuleOp>().begin();
     if (!serOptions.dumpIntermediatesPath.empty()) {
       std::string assembly;
@@ -166,14 +146,6 @@ public:
       dumpDataToPath(serOptions.dumpIntermediatesPath, serOptions.dumpBaseName,
                      variantOp.getName(), ".mlir", assembly);
     }
-
-    // The runtime use ordinals instead of names but Metal requires function
-    // names for constructing pipeline states. Get an ordered list of the entry
-    // point names.
-    SmallVector<StringRef, 8> spirvEntryPointNames;
-    spvModuleOp.walk([&](spirv::EntryPointOp exportOp) {
-      spirvEntryPointNames.push_back(exportOp.getFn());
-    });
 
     // 1. Serialize the spirv::ModuleOp into binary format.
     SmallVector<uint32_t, 0> spvBinary;
@@ -185,6 +157,14 @@ public:
                                serOptions.dumpBaseName, variantOp.getName(),
                                ".spv", spvBinary);
     }
+
+    // The runtime use ordinals instead of names but Metal requires function
+    // names for constructing pipeline states. Get an ordered list of the entry
+    // point names.
+    SmallVector<StringRef, 8> spirvEntryPointNames;
+    spvModuleOp.walk([&](spirv::EntryPointOp exportOp) {
+      spirvEntryPointNames.push_back(exportOp.getFn());
+    });
 
     // 2. Cross compile SPIR-V to MSL source code.
     SmallVector<MetalShader, 2> mslShaders;
@@ -214,15 +194,17 @@ public:
     }
 
     // 3. Compile MSL to MTLLibrary.
-    SmallVector<std::unique_ptr<llvm::MemoryBuffer>> metalLibs;
+    SmallVector<std::unique_ptr<llvm::MemoryBuffer>> metallibs;
+    metallibs.resize(mslShaders.size());
     if (options.compileToMetalLib) {
       // We need to use offline Metal shader compilers.
       // TODO(#14048): The toolchain can also exist on other platforms. Probe
       // the PATH instead.
       auto hostTriple = llvm::Triple(llvm::sys::getProcessTriple());
       if (hostTriple.isMacOSX()) {
-        for (auto [shader, entryPoint] :
-             llvm::zip(mslShaders, mslEntryPointNames)) {
+        for (auto [i, shader, entryPoint] :
+             llvm::zip_equal(llvm::seq(mslShaders.size()), mslShaders,
+                             mslEntryPointNames)) {
           std::unique_ptr<llvm::MemoryBuffer> lib = compileMSLToMetalLib(
               options.targetPlatform, shader.source, entryPoint);
           if (!lib) {
@@ -230,7 +212,7 @@ public:
                    << "failed to compile to MTLLibrary from MSL:\n\n"
                    << shader.source << "\n\n";
           }
-          metalLibs.push_back(std::move(lib));
+          metallibs[i] = std::move(lib);
         }
       }
     }
@@ -239,36 +221,88 @@ public:
     FlatbufferBuilder builder;
     iree_hal_metal_ExecutableDef_start_as_root(builder);
 
-    auto entryPointNamesRef = builder.createStringVec(mslEntryPointNames);
-    iree_hal_metal_ExecutableDef_entry_points_add(builder, entryPointNamesRef);
+    // Attach embedded source file contents.
+    auto sourceFilesRef = createSourceFilesVec(
+        serOptions.debugLevel, variantOp.getSourcesAttr(), builder);
 
-    iree_hal_metal_ThreadgroupSize_vec_start(builder);
-    for (auto &shader : mslShaders) {
-      iree_hal_metal_ThreadgroupSize_vec_push_create(
-          builder, shader.threadgroupSize.x, shader.threadgroupSize.y,
-          shader.threadgroupSize.z);
+    // Each library may provide multiple functions so we encode them
+    // independently.
+    SmallVector<iree_hal_metal_LibraryDef_ref_t> libraryRefs;
+    for (auto [shader, metallib] : llvm::zip_equal(mslShaders, metallibs)) {
+      const bool embedSource = !metallib || serOptions.debugLevel > 1;
+      iree_hal_metal_MSLSourceDef_ref_t sourceRef = 0;
+      if (embedSource) {
+        // TODO: pull this from an attribute?
+        // https://developer.apple.com/documentation/metal/mtllanguageversion
+        unsigned version = 196608; // MTLLanguageVersion3_0
+        auto sourceStrRef = builder.createString(shader.source);
+        sourceRef =
+            iree_hal_metal_MSLSourceDef_create(builder, version, sourceStrRef);
+      }
+      flatbuffers_string_ref_t metallibRef = 0;
+      if (metallib) {
+        metallibRef = flatbuffers_string_create(
+            builder, metallib->getBufferStart(), metallib->getBufferSize());
+      }
+      iree_hal_metal_LibraryDef_start(builder);
+      iree_hal_metal_LibraryDef_source_add(builder, sourceRef);
+      iree_hal_metal_LibraryDef_metallib_add(builder, metallibRef);
+      libraryRefs.push_back(iree_hal_metal_LibraryDef_end(builder));
     }
-    auto threadgroupSizesRef = iree_hal_metal_ThreadgroupSize_vec_end(builder);
-    iree_hal_metal_ExecutableDef_threadgroup_sizes_add(builder,
-                                                       threadgroupSizesRef);
+    auto librariesRef = builder.createOffsetVecDestructive(libraryRefs);
 
-    if (metalLibs.empty()) {
-      auto shaderSourcesRef = builder.createStringVec(
-          llvm::map_range(mslShaders, [&](const MetalShader &shader) {
-            return shader.source;
-          }));
-      iree_hal_metal_ExecutableDef_shader_sources_add(builder,
-                                                      shaderSourcesRef);
-    } else {
-      auto refs = llvm::to_vector<8>(llvm::map_range(
-          metalLibs, [&](const std::unique_ptr<llvm::MemoryBuffer> &buffer) {
-            return flatbuffers_string_create(builder, buffer->getBufferStart(),
-                                             buffer->getBufferSize());
-          }));
-      auto libsRef =
-          flatbuffers_string_vec_create(builder, refs.data(), refs.size());
-      iree_hal_metal_ExecutableDef_shader_libraries_add(builder, libsRef);
+    // Generate optional per-export debug information.
+    // May be empty if no debug information was requested.
+    auto exportOps = llvm::to_vector_of<IREE::HAL::ExecutableExportOp>(
+        variantOp.getExportOps());
+    auto exportDebugInfos =
+        createExportDefs(serOptions.debugLevel, exportOps, builder);
+
+    SmallVector<iree_hal_metal_PipelineDef_ref_t> pipelineRefs;
+    for (auto [i, shader, entryPoint, exportOp] :
+         llvm::zip_equal(llvm::seq(mslShaders.size()), mslShaders,
+                         mslEntryPointNames, exportOps)) {
+      auto entryPointRef = builder.createString(entryPoint);
+
+      iree_hal_metal_ThreadgroupSize_t threadgroupSize = {
+          shader.threadgroupSize.x,
+          shader.threadgroupSize.y,
+          shader.threadgroupSize.z,
+      };
+
+      auto layoutAttr = exportOp.getLayoutAttr();
+      uint32_t constantCount = static_cast<uint32_t>(layoutAttr.getConstants());
+      SmallVector<iree_hal_metal_BindingBits_enum_t> bindingFlags;
+      for (auto bindingAttr : layoutAttr.getBindings()) {
+        iree_hal_metal_BindingBits_enum_t flags = 0;
+        if (allEnumBitsSet(bindingAttr.getFlags(),
+                           IREE::HAL::DescriptorFlags::ReadOnly)) {
+          flags |= iree_hal_metal_BindingBits_IMMUTABLE;
+        }
+        bindingFlags.push_back(flags);
+      }
+      auto bindingFlagsRef = iree_hal_metal_BindingBits_vec_create(
+          builder, bindingFlags.data(), bindingFlags.size());
+
+      iree_hal_metal_PipelineDef_start(builder);
+      iree_hal_metal_PipelineDef_library_ordinal_add(builder, i);
+      iree_hal_metal_PipelineDef_entry_point_add(builder, entryPointRef);
+      iree_hal_metal_PipelineDef_threadgroup_size_add(builder,
+                                                      &threadgroupSize);
+      // TODO: embed additional metadata on threadgroup info if available.
+      // iree_hal_metal_PipelineDef_max_threads_per_threadgroup_add(builder, 0);
+      // iree_hal_metal_PipelineDef_threadgroup_size_aligned_add(builder,
+      // false);
+      iree_hal_metal_PipelineDef_constant_count_add(builder, constantCount);
+      iree_hal_metal_PipelineDef_binding_flags_add(builder, bindingFlagsRef);
+      iree_hal_metal_PipelineDef_debug_info_add(builder, exportDebugInfos[i]);
+      pipelineRefs.push_back(iree_hal_metal_PipelineDef_end(builder));
     }
+    auto pipelinesRef = builder.createOffsetVecDestructive(pipelineRefs);
+
+    iree_hal_metal_ExecutableDef_pipelines_add(builder, pipelinesRef);
+    iree_hal_metal_ExecutableDef_libraries_add(builder, librariesRef);
+    iree_hal_metal_ExecutableDef_source_files_add(builder, sourceFilesRef);
 
     iree_hal_metal_ExecutableDef_end_as_root(builder);
 
@@ -284,48 +318,29 @@ public:
   }
 
 private:
-  ArrayAttr getExecutableTargets(MLIRContext *context) const {
-    SmallVector<Attribute> targetAttrs;
-    // If we had multiple target environments we would generate one target attr
-    // per environment, with each setting its own environment attribute.
-    targetAttrs.push_back(
-        getExecutableTarget(context, getMetalTargetEnv(context)));
-    return ArrayAttr::get(context, targetAttrs);
-  }
-
-  IREE::HAL::ExecutableTargetAttr
-  getExecutableTarget(MLIRContext *context,
-                      spirv::TargetEnvAttr targetEnv) const {
-    Builder b(context);
-    SmallVector<NamedAttribute> configItems;
-
-    configItems.emplace_back(b.getStringAttr(spirv::getTargetEnvAttrName()),
-                             targetEnv);
-
-    auto configAttr = b.getDictionaryAttr(configItems);
-    return IREE::HAL::ExecutableTargetAttr::get(
-        context, b.getStringAttr("metal"), b.getStringAttr("metal-msl-fb"),
-        configAttr);
-  }
-
   const MetalSPIRVOptions &options;
 };
 
 struct MetalSPIRVSession
     : public PluginSession<MetalSPIRVSession, MetalSPIRVOptions,
                            PluginActivationPolicy::DefaultActivated> {
-  void populateHALTargetBackends(IREE::HAL::TargetBackendList &targets) {
-    auto backendFactory = [=]() {
-      return std::make_shared<MetalSPIRVTargetBackend>(options);
-    };
+  void populateHALTargetDevices(IREE::HAL::TargetDeviceList &targets) {
     // #hal.device.target<"metal", ...
-    targets.add("metal", backendFactory);
+    targets.add("metal",
+                [=]() { return std::make_shared<MetalTargetDevice>(options); });
+  }
+  void populateHALTargetBackends(IREE::HAL::TargetBackendList &targets) {
     // #hal.executable.target<"metal-spirv", ...
-    targets.add("metal-spirv", backendFactory);
+    targets.add("metal-spirv", [=]() {
+      return std::make_shared<MetalSPIRVTargetBackend>(options);
+    });
   }
 };
 
 } // namespace mlir::iree_compiler::IREE::HAL
+
+IREE_DEFINE_COMPILER_OPTION_FLAGS(
+    mlir::iree_compiler::IREE::HAL::MetalSPIRVOptions);
 
 extern "C" bool iree_register_compiler_plugin_hal_target_metal_spirv(
     mlir::iree_compiler::PluginRegistrar *registrar) {
@@ -333,6 +348,3 @@ extern "C" bool iree_register_compiler_plugin_hal_target_metal_spirv(
       "hal_target_metal_spirv");
   return true;
 }
-
-IREE_DEFINE_COMPILER_OPTION_FLAGS(
-    mlir::iree_compiler::IREE::HAL::MetalSPIRVOptions);

@@ -4,15 +4,16 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
-using namespace mlir;
-using namespace mlir::iree_compiler;
+namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_REPLACESLOWMINMAXOPSPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 namespace {
 
@@ -40,14 +41,14 @@ struct ReplaceSlowWithFastReductionMinMaxOpPattern final
   LogicalResult matchAndRewrite(SlowReductionOp slowReductionOp,
                                 PatternRewriter &rewriter) const override {
     if (slowReductionOp.getKind() == vector::CombiningKind::MINIMUMF) {
-      rewriter.updateRootInPlace(slowReductionOp, [&]() {
-        slowReductionOp.setKind(vector::CombiningKind::MINF);
+      rewriter.modifyOpInPlace(slowReductionOp, [&]() {
+        slowReductionOp.setKind(vector::CombiningKind::MINNUMF);
       });
       return success();
     }
     if (slowReductionOp.getKind() == vector::CombiningKind::MAXIMUMF) {
-      rewriter.updateRootInPlace(slowReductionOp, [&]() {
-        slowReductionOp.setKind(vector::CombiningKind::MAXF);
+      rewriter.modifyOpInPlace(slowReductionOp, [&]() {
+        slowReductionOp.setKind(vector::CombiningKind::MAXNUMF);
       });
       return success();
     }
@@ -56,17 +57,17 @@ struct ReplaceSlowWithFastReductionMinMaxOpPattern final
   }
 };
 
-struct ReplaceSlowMinMaxOpsPass
-    : public ReplaceSlowMinMaxOpsBase<ReplaceSlowMinMaxOpsPass> {
+struct ReplaceSlowMinMaxOpsPass final
+    : impl::ReplaceSlowMinMaxOpsPassBase<ReplaceSlowMinMaxOpsPass> {
 public:
-  using ReplaceSlowMinMaxOpsBase::ReplaceSlowMinMaxOpsBase;
+  using impl::ReplaceSlowMinMaxOpsPassBase<
+      ReplaceSlowMinMaxOpsPass>::ReplaceSlowMinMaxOpsPassBase;
   void runOnOperation() override;
 };
 
 } // namespace
 
-void mlir::iree_compiler::populateReplaceSlowMinMaxOpsPatterns(
-    RewritePatternSet &patterns) {
+void populateReplaceSlowMinMaxOpsPatterns(RewritePatternSet &patterns) {
   patterns.add<
       ReplaceSlowWithFastMinMaxOpPattern<arith::MinimumFOp, arith::MinNumFOp>,
       ReplaceSlowWithFastMinMaxOpPattern<arith::MaximumFOp, arith::MaxNumFOp>,
@@ -78,13 +79,9 @@ void mlir::iree_compiler::populateReplaceSlowMinMaxOpsPatterns(
 void ReplaceSlowMinMaxOpsPass::runOnOperation() {
   RewritePatternSet patterns(&getContext());
   populateReplaceSlowMinMaxOpsPatterns(patterns);
-  if (failed(
-          applyPatternsAndFoldGreedily(getOperation(), std::move(patterns)))) {
+  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
     return signalPassFailure();
   }
 }
 
-std::unique_ptr<OperationPass<func::FuncOp>>
-mlir::iree_compiler::createReplaceSlowMinMaxOpsPass() {
-  return std::make_unique<ReplaceSlowMinMaxOpsPass>();
-}
+} // namespace mlir::iree_compiler

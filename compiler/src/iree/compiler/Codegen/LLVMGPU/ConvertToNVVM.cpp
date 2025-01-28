@@ -6,11 +6,10 @@
 
 #include "iree/compiler/Codegen/Common/GPU/GPUPatterns.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUDialect.h"
 #include "iree/compiler/Codegen/LLVMGPU/ConvertToLLVM.h"
-#include "iree/compiler/Codegen/LLVMGPU/PassDetail.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
-#include "iree/compiler/Codegen/Utils/Utils.h"
-#include "iree/compiler/Dialect/Util/IR/UtilOps.h"
+#include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
@@ -24,53 +23,37 @@
 #include "mlir/Conversion/NVGPUToNVVM/NVGPUToNVVM.h"
 #include "mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
+#include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Transforms/Passes.h"
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_CONVERTTONVVMPASS
+#include "iree/compiler/Codegen/LLVMGPU/Passes.h.inc"
+
 namespace {
-
-int kDefaultCUDACapability = 80;
-
-/// Return the CUDA capability of the gpu. Assumes CUDA capability is 80 (sm_80)
-/// if not specified.
-static int getCUDACapbility(Operation *op) {
-  FailureOr<IREE::HAL::ExecutableVariantOp> variantOp =
-      getExecutableVariantOp(op);
-  if (failed(variantOp)) {
-    return kDefaultCUDACapability;
-  }
-
-  auto targetAttr = variantOp->getTargetAttr();
-  if (auto config = targetAttr.getConfiguration()) {
-    if (auto attr = config.getAs<StringAttr>("target_arch")) {
-      StringRef targetName = attr.getValue();
-      APInt version;
-      if (targetName.starts_with("sm_") &&
-          !targetName.substr(3).getAsInteger(10, version)) {
-        return version.getZExtValue();
-      }
-    }
-  }
-  return kDefaultCUDACapability;
-}
 
 /// A pass that replaces all occurrences of GPU device operations with their
 /// corresponding NVVM equivalent.
 ///
 /// This pass only handles device code and is not meant to be run on GPU host
 /// code.
-struct ConvertToNVVMPass : public ConvertToNVVMBase<ConvertToNVVMPass> {
+struct ConvertToNVVMPass final
+    : impl::ConvertToNVVMPassBase<ConvertToNVVMPass> {
+  using impl::ConvertToNVVMPassBase<ConvertToNVVMPass>::ConvertToNVVMPassBase;
+
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<gpu::GPUDialect, LLVM::LLVMDialect, NVVM::NVVMDialect>();
+    registry
+        .insert<gpu::GPUDialect, IREE::GPU::IREEGPUDialect, LLVM::LLVMDialect,
+                NVVM::NVVMDialect, affine::AffineDialect>();
   }
   void runOnOperation() override {
     ModuleOp m = getOperation();
@@ -108,6 +91,8 @@ struct ConvertToNVVMPass : public ConvertToNVVMBase<ConvertToNVVMPass> {
     // Run Vector -> Vector transformations ahead of conversion to LLVM.
     {
       RewritePatternSet patterns(&getContext());
+      populateVectorToSCFConversionPatterns(
+          patterns, VectorTransferToSCFOptions().enableFullUnroll());
       populateDropSharedMemoryDeallocOpPatterns(patterns);
       populateScalarizeMathOps(patterns);
       populateConvertSharedMemoryAllocOps(patterns);
@@ -128,14 +113,15 @@ struct ConvertToNVVMPass : public ConvertToNVVMBase<ConvertToNVVMPass> {
       vector::populateVectorTransposeLoweringPatterns(
           patterns, vector::VectorTransformsOptions());
       vector::populateVectorTransferLoweringPatterns(patterns);
-      if (failed(applyPatternsAndFoldGreedily(m, std::move(patterns)))) {
+      arith::populateExpandBFloat16Patterns(patterns);
+      if (failed(applyPatternsGreedily(m, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
     {
       RewritePatternSet patterns(&getContext());
       populateGpuRewritePatterns(patterns);
-      if (failed(applyPatternsAndFoldGreedily(m, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(m, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
@@ -144,10 +130,11 @@ struct ConvertToNVVMPass : public ConvertToNVVMBase<ConvertToNVVMPass> {
       // is faulty for them.
       // TODO: Remove this once the lowering in LLVM is fixed
       // (https://github.com/llvm/llvm-project/issues/64606).
-      if (getCUDACapbility(m) < 80) {
+      std::optional<int> cc = getGPUTargetAttr(m).getCUDAComputeCapability();
+      if (!cc || cc.value() < 80) {
         RewritePatternSet patterns(&getContext());
         populateReplaceSlowMinMaxOpsPatterns(patterns);
-        if (failed(applyPatternsAndFoldGreedily(m, std::move(patterns)))) {
+        if (failed(applyPatternsGreedily(m, std::move(patterns)))) {
           return signalPassFailure();
         }
       }
@@ -158,17 +145,38 @@ struct ConvertToNVVMPass : public ConvertToNVVMBase<ConvertToNVVMPass> {
       populateLLVMConversionPatterns(&getContext(), llvmPatterns, converter);
       populateComplexToLLVMConversionPatterns(converter, llvmPatterns);
       populateMathToLLVMConversionPatterns(converter, llvmPatterns);
-      memref::populateExpandStridedMetadataPatterns(llvmPatterns);
+      iree_compiler::populateIREEResolveExtractStridedMetadataPatterns(
+          llvmPatterns);
       populateFinalizeMemRefToLLVMConversionPatterns(converter, llvmPatterns);
       populateFuncToLLVMConversionPatterns(converter, llvmPatterns);
       cf::populateControlFlowToLLVMConversionPatterns(converter, llvmPatterns);
+      arith::populateCeilFloorDivExpandOpsPatterns(llvmPatterns);
       arith::populateArithToLLVMConversionPatterns(converter, llvmPatterns);
+      vector::populateVectorRankReducingFMAPattern(llvmPatterns);
+      vector::populateVectorInsertExtractStridedSliceTransforms(llvmPatterns);
+      vector::populateVectorStepLoweringPatterns(llvmPatterns);
       populateVectorToLLVMConversionPatterns(converter, llvmPatterns);
+      vector::populateVectorTransferLoweringPatterns(llvmPatterns,
+                                                     /*maxTransferRank=*/1);
       populateGpuToNVVMConversionPatterns(converter, llvmPatterns);
       populateNVGPUToNVVMConversionPatterns(converter, llvmPatterns);
       populateGpuWMMAToNVVMConversionPatterns(converter, llvmPatterns);
+
+      /// Target specification.
       LLVMConversionTarget target(getContext());
-      configureGpuToNVVMConversionLegality(target);
+      target.addIllegalOp<func::FuncOp>();
+      target.addLegalDialect<::mlir::LLVM::LLVMDialect>();
+      target.addLegalDialect<::mlir::NVVM::NVVMDialect>();
+      target.addIllegalDialect<gpu::GPUDialect>();
+      target.addIllegalOp<
+          LLVM::CopySignOp, LLVM::CosOp, LLVM::ExpOp, LLVM::Exp2Op,
+          LLVM::FAbsOp, LLVM::FCeilOp, LLVM::FFloorOp, LLVM::FRemOp,
+          LLVM::LogOp, LLVM::Log10Op, LLVM::Log2Op, LLVM::PowOp,
+          LLVM::RoundEvenOp, LLVM::RoundOp, LLVM::SinOp, LLVM::SqrtOp>();
+
+      // TODO: Remove once we support replacing non-root ops.
+      target.addLegalOp<gpu::YieldOp, gpu::GPUModuleOp>();
+
       if (failed(applyPartialConversion(m, target, std::move(llvmPatterns)))) {
         signalPassFailure();
       }
@@ -177,7 +185,7 @@ struct ConvertToNVVMPass : public ConvertToNVVMBase<ConvertToNVVMPass> {
     {
       RewritePatternSet patterns(&getContext());
       populateNVVMToLLVMConversionPatterns(patterns);
-      if (failed(applyPatternsAndFoldGreedily(m, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(m, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
@@ -186,9 +194,4 @@ struct ConvertToNVVMPass : public ConvertToNVVMBase<ConvertToNVVMPass> {
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<ModuleOp>> createConvertToNVVMPass() {
-  return std::make_unique<ConvertToNVVMPass>();
-}
-
 } // namespace mlir::iree_compiler

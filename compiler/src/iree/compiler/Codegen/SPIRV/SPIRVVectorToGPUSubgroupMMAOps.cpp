@@ -5,7 +5,6 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/GPU/GPUPatterns.h"
-#include "iree/compiler/Codegen/SPIRV/PassDetail.h"
 #include "iree/compiler/Codegen/SPIRV/Passes.h"
 #include "mlir/Conversion/VectorToGPU/VectorToGPU.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -16,9 +15,13 @@
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_SPIRVVECTORTOGPUSUBGROUPMMAPASS
+#include "iree/compiler/Codegen/SPIRV/Passes.h.inc"
+
 namespace {
 struct SPIRVVectorToGPUSubgroupMMAPass final
-    : public SPIRVVectorToGPUSubgroupMMABase<SPIRVVectorToGPUSubgroupMMAPass> {
+    : public impl::SPIRVVectorToGPUSubgroupMMAPassBase<
+          SPIRVVectorToGPUSubgroupMMAPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<affine::AffineDialect, gpu::GPUDialect,
                     memref::MemRefDialect>();
@@ -29,16 +32,14 @@ struct SPIRVVectorToGPUSubgroupMMAPass final
 
     RewritePatternSet flatternpatterns(funcOp.getContext());
     populateVectorTransferToGPUMMAPreparationPatterns(flatternpatterns);
-    if (failed(applyPatternsAndFoldGreedily(funcOp,
-                                            std::move(flatternpatterns)))) {
+    if (failed(applyPatternsGreedily(funcOp, std::move(flatternpatterns)))) {
       return signalPassFailure();
     }
 
     RewritePatternSet patterns(funcOp.getContext());
     mlir::vector::populateCastAwayVectorLeadingOneDimPatterns(patterns);
     populatePrepareVectorToMMAPatterns(patterns, /*useNvGpu=*/false);
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
 
@@ -61,7 +62,7 @@ struct SPIRVVectorToGPUSubgroupMMAPass final
 };
 } // namespace
 
-std::unique_ptr<OperationPass<func::FuncOp>>
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 createSPIRVVectorToGPUSubgroupMMAOpsPass() {
   return std::make_unique<SPIRVVectorToGPUSubgroupMMAPass>();
 }

@@ -13,14 +13,12 @@
 #include "iree/compiler/Dialect/VM/Conversion/ConversionDialectInterface.h"
 #include "iree/compiler/Dialect/VM/Conversion/ConversionTarget.h"
 #include "iree/compiler/Dialect/VM/Conversion/ImportUtils.h"
-#include "iree/compiler/Dialect/VM/Conversion/MathToVM/ConvertMathToVM.h"
-#include "iree/compiler/Dialect/VM/Conversion/StandardToVM/ConvertStandardToVM.h"
 #include "iree/compiler/Dialect/VM/Conversion/TypeConverter.h"
-#include "iree/compiler/Dialect/VM/Conversion/UtilToVM/ConvertUtilToVM.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -29,27 +27,13 @@
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/DialectConversion.h"
 
+#include "iree/compiler/Dialect/VM/Conversion/ArithToVM/Patterns.h"
+#include "iree/compiler/Dialect/VM/Conversion/MathToVM/Patterns.h"
+#include "iree/compiler/Dialect/VM/Conversion/StandardToVM/Patterns.h"
+#include "iree/compiler/Dialect/VM/Conversion/UtilToVM/Patterns.h"
+
 namespace mlir::iree_compiler::IREE::VM {
 namespace {
-
-// TODO#(11786): The expansions of integer min and max ops were removed in
-// llvm-project@e502f4fc2e25. They are added here for moving integrate forward.
-// We should add native VM ops for supporting them.
-template <typename OpTy, arith::CmpIPredicate pred>
-struct MaxMinIOpConverter : public OpRewritePattern<OpTy> {
-public:
-  using OpRewritePattern<OpTy>::OpRewritePattern;
-  LogicalResult matchAndRewrite(OpTy op,
-                                PatternRewriter &rewriter) const final {
-    Value lhs = op.getLhs();
-    Value rhs = op.getRhs();
-
-    Location loc = op.getLoc();
-    Value cmp = rewriter.create<arith::CmpIOp>(loc, pred, lhs, rhs);
-    rewriter.replaceOpWithNewOp<arith::SelectOp>(op, cmp, lhs, rhs);
-    return success();
-  }
-};
 
 // Returns a stably sorted list of dialect interfaces of T for all dialects used
 // within the given module.
@@ -145,20 +129,27 @@ public:
       }
     }
 
+    // Populated below after all type converters are registered.
+    ImportTable importTable;
+
     RewritePatternSet patterns(&getContext());
     populateUtilConversionPatterns(context, conversionTarget, typeConverter,
                                    patterns);
     populateUtilToVMPatterns(context, conversionTarget, typeConverter,
-                             patterns);
-    arith::populateCeilFloorDivExpandOpsPatterns(patterns);
-    populateStandardToVMPatterns(context, typeConverter, patterns);
-    populateMathToVMPatterns(context, typeConverter, patterns);
+                             importTable, patterns);
+
+    conversionTarget.addIllegalDialect<affine::AffineDialect>();
     populateAffineToStdConversionPatterns(patterns);
 
-    conversionTarget
-        .addIllegalDialect<func::FuncDialect, mlir::arith::ArithDialect>();
-    conversionTarget.addIllegalDialect<affine::AffineDialect>();
+    conversionTarget.addIllegalDialect<arith::ArithDialect>();
+    arith::populateCeilFloorDivExpandOpsPatterns(patterns);
+    populateArithToVMPatterns(context, typeConverter, patterns);
+
     conversionTarget.addIllegalDialect<math::MathDialect>();
+    populateMathToVMPatterns(context, typeConverter, patterns);
+
+    conversionTarget.addIllegalDialect<func::FuncDialect>();
+    populateStandardToVMPatterns(context, typeConverter, importTable, patterns);
 
     // Populate patterns from all used dialects, providing the imports they
     // registered earlier.
@@ -166,6 +157,12 @@ public:
     for (auto *dialectInterface : usedDialects) {
       dialectInterface->populateVMConversionPatterns(
           importSymbols, patterns, conversionTarget, typeConverter);
+    }
+
+    // Build an import table so that we can quickly look up import information
+    // during conversion.
+    if (failed(importTable.build(innerModuleOp, typeConverter))) {
+      return signalPassFailure(); // error emitted already
     }
 
     if (failed(applyPartialConversion(outerModuleOp, conversionTarget,

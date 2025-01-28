@@ -42,23 +42,25 @@ class DeviceArray(numpy.lib.mixins.NDArrayOperatorsMixin):
     """An IREE device array.
 
     Device arrays can be in one of two states:
-      1. Host accessible: The array will be backed by host accessible memory
-         and can have the usual things done with it that one expects to be
-         able to do with an ndarray.
-      2. Device resident: The array is just a handle to a device resident
-         Buffer (and BufferView wrapper). Metadata about the array are accessible
-         (shape and dtype) but anything that touches the data cannot be accessed
-         in this state.
+
+    1. Host accessible: The array will be backed by host accessible memory
+       and can have the usual things done with it that one expects to be
+       able to do with an ndarray.
+    2. Device resident: The array is just a handle to a device resident
+       Buffer (and BufferView wrapper). Metadata about the array are accessible
+       (shape and dtype) but anything that touches the data cannot be accessed
+       in this state.
 
     How a device array comes into existence controls how it can transition
     between these states:
-      * A user can create a DeviceArray explicitly with a device allocator.
-        Such an array will not be implicitly convertible to host accessible,
-        although accessors exist to do so.
-      * When created by the platform with a synchronization policy, then
-        implicit transfer back to the host will trigger appropriate waits and
-        be performed automatically (this is the common case for function return
-        values if not otherwise configured, as an example).
+
+    * A user can create a DeviceArray explicitly with a device allocator.
+      Such an array will not be implicitly convertible to host accessible,
+      although accessors exist to do so.
+    * When created by the platform with a synchronization policy, then
+      implicit transfer back to the host will trigger appropriate waits and
+      be performed automatically (this is the common case for function return
+      values if not otherwise configured, as an example).
     """
 
     def __init__(
@@ -78,11 +80,11 @@ class DeviceArray(numpy.lib.mixins.NDArrayOperatorsMixin):
         self._host_array: Optional[np.ndarray] = None
 
     def __array__(self, dtype=None):
-        self._transfer_to_host(True)
+        host_array = self._transfer_to_host(True)
         if dtype is None:
-            return self._host_array
+            return host_array
         else:
-            return self._host_array.__array__(dtype)  # pytype: disable=attribute-error
+            return host_array.__array__(dtype)  # pytype: disable=attribute-error
 
     def __array_function__(self, func, types, args, kwargs):
         if func in _DEVICE_HANDLED_FUNCTIONS:
@@ -104,35 +106,35 @@ class DeviceArray(numpy.lib.mixins.NDArrayOperatorsMixin):
         return self._host_array is not None
 
     def to_host(self) -> np.ndarray:
-        self._transfer_to_host(False)
-        return self._host_array
+        """Return the array as host accessible NumPy ndarray.
+        This may map the memory or create a copy depending on wether the array is
+        mappable to the host."""
+        return self._transfer_to_host(False)
 
     def _is_mappable(self) -> bool:
         buffer = self._buffer_view.get_buffer()
-        if (
-            buffer.memory_type() & int(MemoryType.HOST_VISIBLE)
-            != MemoryType.HOST_VISIBLE
+        if buffer.memory_type() & int(MemoryType.HOST_VISIBLE) != int(
+            MemoryType.HOST_VISIBLE
         ):
             return False
-        if (
-            buffer.allowed_usage() & int(BufferUsage.MAPPING_SCOPED)
-            != BufferUsage.MAPPING_SCOPED
+        if buffer.allowed_usage() & int(BufferUsage.MAPPING_SCOPED) != int(
+            BufferUsage.MAPPING_SCOPED
         ):
             return False
         return True
 
-    def _transfer_to_host(self, implicit):
-        if self._host_array is not None:
-            return
+    def _transfer_to_host(self, implicit) -> np.ndarray:
         if implicit and not self._implicit_host_transfer:
             raise ValueError(
                 "DeviceArray cannot be implicitly transferred to the host: "
                 "if necessary, do an explicit transfer via .to_host()"
             )
         if self._is_mappable():
-            self._mapped_memory, self._host_array = self._map_to_host()
+            if self._host_array is None:
+                self._mapped_memory, self._host_array = self._map_to_host()
+            return self._host_array
         else:
-            self._host_array = self._copy_to_host()
+            return self._copy_to_host()
 
     def _map_to_host(self) -> Tuple[MappedMemory, np.ndarray]:
         # TODO: When synchronization is enabled, need to block here.
@@ -209,12 +211,13 @@ class DeviceArray(numpy.lib.mixins.NDArrayOperatorsMixin):
         host_ary = self.to_host()
         return host_ary.__getitem__(index)
 
+    def __deepcopy__(self, memo):
+        return self.to_host()
+
     def __reduce__(self):
-        # Since this is used for making deep copies and pickling, we map
-        # separately from any interactive state. We just reduce to the actual
-        # host ndarray, which supports the necessary serialization protocols.
-        _, host_array = self._map_to_host()
-        return _restore_reduced_array, (host_array,)
+        # We just reduce to the actual host ndarray, which supports the necessary
+        # serialization protocols.
+        return _restore_reduced_array, (self.to_host(),)
 
 
 def _restore_reduced_array(ary):
@@ -291,7 +294,6 @@ _DTYPE_TO_HAL_ELEMENT_TYPE = (
     (np.float16, HalElementType.FLOAT_16),
     (np.float32, HalElementType.FLOAT_32),
     (np.float64, HalElementType.FLOAT_64),
-    (np.float16, HalElementType.FLOAT_16),
     (np.int32, HalElementType.SINT_32),
     (np.int64, HalElementType.SINT_64),
     (np.int16, HalElementType.SINT_16),

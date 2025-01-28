@@ -666,6 +666,10 @@ static iree_status_t allocate_mappable_device_buffer(
                             "unable to allocate buffer of size %" PRIdsz,
                             data_length);
   }
+  const iree_hal_buffer_placement_t placement = {
+      .device = device,
+      .queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY,
+  };
   const iree_hal_buffer_params_t target_params = {
       .usage = IREE_HAL_BUFFER_USAGE_TRANSFER | IREE_HAL_BUFFER_USAGE_MAPPING,
       .type =
@@ -673,8 +677,8 @@ static iree_status_t allocate_mappable_device_buffer(
       .access = IREE_HAL_MEMORY_ACCESS_ALL,
   };
   return iree_hal_webgpu_buffer_wrap(
-      device, iree_hal_device_allocator(device), target_params.type,
-      target_params.access, target_params.usage, data_length,
+      origin, target_params.type, target_params.access, target_params.usage,
+      data_length,
       /*byte_offset=*/0,
       /*byte_length=*/data_length, device_buffer_handle,
       iree_allocator_system(), out_buffer);
@@ -782,7 +786,8 @@ static iree_status_t process_call_outputs(
   }
   iree_hal_semaphore_t* signal_semaphore = NULL;
   if (iree_status_is_ok(status)) {
-    status = iree_hal_semaphore_create(device, 0ull, &signal_semaphore);
+    status = iree_hal_semaphore_create(
+        device, 0ull, IREE_HAL_SEMAPHORE_FLAG_NONE, &signal_semaphore);
   }
   uint64_t signal_value = 1ull;
   if (iree_status_is_ok(status)) {
@@ -793,7 +798,8 @@ static iree_status_t process_call_outputs(
     };
     status = iree_hal_device_queue_execute(
         device, IREE_HAL_QUEUE_AFFINITY_ANY, iree_hal_semaphore_list_empty(),
-        signal_semaphores, 1, &transfer_command_buffer);
+        signal_semaphores, transfer_command_buffer,
+        iree_hal_buffer_binding_table_empty());
   }
   // TODO(scotttodd): Make this async - pass a wait source to iree_loop_wait_one
   //     1. create iree_hal_fence_t, iree_hal_fence_insert(fance, semaphore)

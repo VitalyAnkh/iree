@@ -6,25 +6,29 @@
 
 #include "iree/compiler/Codegen/Interfaces/Interfaces.h"
 
+#include "iree/compiler/Codegen/Dialect/GPU/TransformExtensions/IREEGPUExtensions.h"
+#include "iree/compiler/Codegen/ExternalInterfaces/Interfaces.h"
 #include "iree/compiler/Codegen/Interfaces/BufferizationInterfaces.h"
 #include "iree/compiler/Codegen/Interfaces/PartitionableLoopsInterface.h"
 #include "iree/compiler/Codegen/Interfaces/ProcessorOpInterfaces.h"
 // TODO: Remove this dependency once the transform dialect extensions
 // have a better registration mechanism.
-#include "iree-dialects/Dialect/LinalgExt/TransformOps/LinalgExtTransformOps.h"
 #include "iree-dialects/Dialect/LinalgTransform/StructuredTransformOpsExt.h"
 #include "iree/compiler/Codegen/Common/TransformExtensions/CommonExtensions.h"
 #include "iree/compiler/Codegen/LLVMCPU/TransformExtensions/LLVMCPUExtensions.h"
 #include "iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.h"
 #include "iree/compiler/Dialect/Flow/TransformExtensions/FlowExtensions.h"
+#include "iree/compiler/Dialect/LinalgExt/TransformExtensions/LinalgExtExtensionsOps.h"
 #include "mlir/Dialect/Affine/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/Affine/TransformOps/AffineTransformOps.h"
 #include "mlir/Dialect/Arith/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/TransformOps/BufferizationTransformOps.h"
+#include "mlir/Dialect/GPU/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/GPU/TransformOps/GPUTransformOps.h"
 #include "mlir/Dialect/Linalg/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
 #include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
+#include "mlir/Dialect/Linalg/Transforms/SubsetInsertionOpInterfaceImpl.h"
 #include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
 #include "mlir/Dialect/MemRef/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/MemRef/TransformOps/MemRefTransformOps.h"
@@ -34,6 +38,7 @@
 #include "mlir/Dialect/Tensor/TransformOps/TensorTransformOps.h"
 #include "mlir/Dialect/Tensor/Transforms/SubsetInsertionOpInterfaceImpl.h"
 #include "mlir/Dialect/Transform/LoopExtension/LoopExtension.h"
+#include "mlir/Dialect/Vector/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/Vector/TransformOps/VectorTransformOps.h"
 #include "mlir/Dialect/Vector/Transforms/SubsetOpInterfaceImpl.h"
 
@@ -41,6 +46,7 @@ namespace mlir::iree_compiler {
 
 void registerCodegenInterfaces(DialectRegistry &registry) {
   registerProcessorOpInterfaceExternalModels(registry);
+  registerCodegenExternalInterfaces(registry);
   registerBufferizationInterfaces(registry);
   // TODO: Remove this dependency once the transform dialect extensions
   // have a better registration mechanism.
@@ -49,6 +55,7 @@ void registerCodegenInterfaces(DialectRegistry &registry) {
                          transform_ext::StructuredTransformOpsExtension>();
   registerPartitionableLoopsInterfaceModels(registry);
   registerTransformDialectCommonExtension(registry);
+  registerTransformDialectIREEGPUExtension(registry);
   registerTransformDialectFlowExtension(registry);
   registerTransformDialectLLVMCPUExtension(registry);
   registerTransformDialectLLVMGPUExtension(registry);
@@ -57,9 +64,12 @@ void registerCodegenInterfaces(DialectRegistry &registry) {
   affine::registerValueBoundsOpInterfaceExternalModels(registry);
   arith::registerValueBoundsOpInterfaceExternalModels(registry);
   bufferization::registerTransformDialectExtension(registry);
+  gpu::registerValueBoundsOpInterfaceExternalModels(registry);
   gpu::registerTransformDialectExtension(registry);
+  gpu::registerValueBoundsOpInterfaceExternalModels(registry);
   linalg::registerTransformDialectExtension(registry);
   linalg::registerValueBoundsOpInterfaceExternalModels(registry);
+  linalg::registerSubsetOpInterfaceExternalModels(registry);
   memref::registerTransformDialectExtension(registry);
   memref::registerValueBoundsOpInterfaceExternalModels(registry);
   scf::registerTransformDialectExtension(registry);
@@ -70,6 +80,7 @@ void registerCodegenInterfaces(DialectRegistry &registry) {
   transform::registerLoopExtension(registry);
   vector::registerSubsetOpInterfaceExternalModels(registry);
   vector::registerTransformDialectExtension(registry);
+  vector::registerValueBoundsOpInterfaceExternalModels(registry);
 }
 
 } // namespace mlir::iree_compiler

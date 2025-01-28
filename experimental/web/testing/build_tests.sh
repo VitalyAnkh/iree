@@ -9,11 +9,13 @@
 #
 # Prerequisites:
 #   * Environment must be configured for Emscripten
-#   * Host tools must be built (default at IREE_SOURCE_DIR/build-host/install).
-#     The build_tools/cmake/build_host_tools.sh script can do this for you.
+#   * Host tools must be available at the $1 arg
 #
-# Usage:
-#   build_tests.sh (optional install path) && serve_tests.sh
+# Sample usage:
+#   python -m venv .venv
+#   source .venv/bin/activate
+#   python -m pip install iree-base-compiler iree-base-runtime
+#   build_tests.sh .venv/bin && serve_tests.sh
 
 set -e
 
@@ -37,7 +39,7 @@ mkdir -p ${BUILD_DIR}
 BINARY_DIR=${BUILD_DIR}/experimental/web/testing
 mkdir -p ${BINARY_DIR}
 
-INSTALL_ROOT="${1:-${ROOT_DIR}/build-host/install}"
+HOST_TOOLS_BINARY_DIR="$1"
 
 ###############################################################################
 # Build the web artifacts using Emscripten                                    #
@@ -50,7 +52,7 @@ pushd ${ROOT_DIR?}/build-emscripten > /dev/null
 # Configure using Emscripten's CMake wrapper, then build.
 emcmake "${CMAKE_BIN?}" -G Ninja .. \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DIREE_HOST_BIN_DIR="${INSTALL_ROOT}/bin" \
+    -DIREE_HOST_BIN_DIR="${HOST_TOOLS_BINARY_DIR}" \
     -DIREE_BUILD_COMPILER=OFF \
     -DIREE_HAL_DRIVER_DEFAULTS=OFF \
     -DIREE_EXTERNAL_HAL_DRIVERS=webgpu \
@@ -63,7 +65,6 @@ emcmake "${CMAKE_BIN?}" -G Ninja .. \
     -DIREE_BUILD_EXPERIMENTAL_WEB_SAMPLES=OFF \
     -DIREE_BUILD_SAMPLES=OFF \
     -DIREE_ENABLE_THREADING=ON \
-    -DIREE_ENABLE_CPUINFO=OFF \
     -DIREE_ENABLE_ASAN=OFF \
     -DIREE_BUILD_TESTS=ON
 
@@ -101,4 +102,4 @@ echo "=== Copying static files to the build directory ==="
 
 cp ${SOURCE_DIR?}/test-runner.html ${BINARY_DIR}
 cp ${SOURCE_DIR?}/*.js ${BINARY_DIR}
-cp ${ROOT_DIR?}/docs/website/overrides/.icons/iree/ghost.svg ${BINARY_DIR}
+cp ${ROOT_DIR?}/docs/website/docs/assets/images/IREE_Logo_Icon_Color.svg ${BINARY_DIR}

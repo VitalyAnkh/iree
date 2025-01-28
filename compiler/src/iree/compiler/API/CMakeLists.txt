@@ -12,26 +12,19 @@ iree_add_all_subdirs()
 
 iree_cc_library(
   NAME
-    MLIRInteropHeaders
-  HDRS
-    "MLIRInterop.h"
-  DEPS
-    IREELLVMIncludeSetup
-    iree::compiler::bindings::c::headers
-  PUBLIC
-)
-
-iree_cc_library(
-  NAME
     StaticImpl
   DEPS
     IREEDialectsCAPI
     MLIRCAPIDebug
+    MLIRCAPIGPU
     MLIRCAPIIR
     MLIRCAPIInterfaces
+    MLIRCAPILLVM
     MLIRCAPILinalg
     MLIRCAPIPDL
     MLIRCAPITransformDialect
+    MLIRCAPITransformDialectTransforms
+    MLIRCAPITransforms
     iree::compiler::API::Internal::CompilerDriver
     iree::compiler::API::Internal::IREECompileToolEntryPoint
     iree::compiler::API::Internal::IREEMLIRLSPServerToolEntryPoint
@@ -76,11 +69,17 @@ set(_EXPORT_OBJECT_LIBS
   obj.MLIRCAPIDebug
   obj.MLIRCAPIIR
   obj.MLIRCAPIInterfaces
+  obj.MLIRCAPIGPU
+  obj.MLIRCAPILLVM
   obj.MLIRCAPILinalg
   obj.MLIRCAPIPDL
+  obj.MLIRCAPITransforms
   obj.MLIRCAPITransformDialect
+  obj.MLIRCAPITransformDialectTransforms
   iree_compiler_API_Internal_CompilerDriver.objects
   iree_compiler_API_Internal_IREECompileToolEntryPoint.objects
+  iree_compiler_API_Internal_IREECodegenDialectCAPI.objects
+  iree_compiler_API_Internal_IREEGPUDialectCAPI.objects
   iree_compiler_API_Internal_IREEMLIRLSPServerToolEntryPoint.objects
   iree_compiler_API_Internal_IREEOptToolEntryPoint.objects
   iree_compiler_API_Internal_IREEReduceToolEntryPoint.objects
@@ -113,7 +112,8 @@ foreach(_object_lib ${_EXPORT_OBJECT_LIBS})
   # It isn't super polite to be poking at other people's library definitions
   # like this, but MSVC is weird and given the structure of the projects, this
   # isn't so bad.
-  if(MSVC)
+  get_target_property(_imported ${_object_lib} IMPORTED)
+  if(MSVC AND NOT ${_imported})
     target_compile_definitions(${_object_lib} PRIVATE
       # See compiler/bindings/c/iree/compiler/api_support.h.
       # IREE embedded CAPI uses its own macros to enable
@@ -159,6 +159,8 @@ iree_cc_library(
   LINKOPTS
     # Linux uses a linker script to version symbols.
     $<$<PLATFORM_ID:Linux>:-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/api_version.ld>
+  DEPS
+    iree::compiler::bindings::c::headers
 )
 
 # Make sure that re-link if extra linker inputs change.
@@ -201,6 +203,18 @@ set_target_properties(
     SOVERSION "0"
 )
 
+# We can install shared libraries and export them without exporting their
+# deps. This wouldn't work if this were a static library as we'd need to
+# untangle the exporting of all of LLVM.
+iree_install_targets(
+  TARGETS
+    iree_compiler_API_SharedImpl
+  COMPONENT
+    IREERuntimeLibraries-Compiler
+  EXPORT_SET
+    Compiler
+)
+
 # Signal the main shared library/dll as part of the bundle of files that
 # must be included with compiler dylibs.
 # What we really want to be using here is the TARGET_LINKER_FILE_NAME
@@ -208,7 +222,7 @@ set_target_properties(
 # dependent generator expressions are not legal, we guesstimate it with
 # platform specific logic.
 set(_target_linker_file_name "${CMAKE_SHARED_LIBRARY_PREFIX}IREECompiler${CMAKE_SHARED_LIBRARY_SUFFIX}")
-set_property(GLOBAL APPEND PROPERTY 
+set_property(GLOBAL APPEND PROPERTY
   IREE_COMPILER_DYLIB_RELPATHS "${_target_linker_file_name}")
 
 install(

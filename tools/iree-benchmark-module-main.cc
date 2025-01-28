@@ -67,7 +67,7 @@
 #include "iree/modules/hal/types.h"
 #include "iree/tooling/context_util.h"
 #include "iree/tooling/device_util.h"
-#include "iree/tooling/vm_util.h"
+#include "iree/tooling/function_io.h"
 #include "iree/vm/api.h"
 
 constexpr char kNanosecondsUnitString[] = "ns";
@@ -252,8 +252,8 @@ static void BenchmarkAsyncFunction(
     std::vector<vm::ref<iree_hal_semaphore_t>> timeline_semaphores;
     for (int32_t i = 0; i < batch_concurrency; ++i) {
       vm::ref<iree_hal_semaphore_t> timeline_semaphore;
-      IREE_CHECK_OK(
-          iree_hal_semaphore_create(device, 0ull, &timeline_semaphore));
+      IREE_CHECK_OK(iree_hal_semaphore_create(
+          device, 0ull, IREE_HAL_SEMAPHORE_FLAG_NONE, &timeline_semaphore));
       timeline_semaphores.push_back(std::move(timeline_semaphore));
     }
 
@@ -498,10 +498,15 @@ class IREEBenchmark {
         iree_string_view_t{function_name.data(),
                            (iree_host_size_t)function_name.size()},
         &function));
+    iree_vm_function_signature_t signature =
+        iree_vm_function_signature(&function);
+    iree_string_view_t arguments_cconv, results_cconv;
+    IREE_RETURN_IF_ERROR(iree_vm_function_call_get_cconv_fragments(
+        &signature, &arguments_cconv, &results_cconv));
 
-    IREE_CHECK_OK(iree_tooling_parse_to_variant_list(
-        device_.get(), device_allocator_.get(), FLAG_input_list().values,
-        FLAG_input_list().count, iree_vm_instance_allocator(instance_.get()),
+    IREE_CHECK_OK(iree_tooling_parse_variants(
+        arguments_cconv, FLAG_input_list(), device_.get(),
+        device_allocator_.get(), iree_vm_instance_allocator(instance_.get()),
         &inputs_));
 
     iree_string_view_t invocation_model = iree_vm_function_lookup_attr_by_name(

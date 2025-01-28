@@ -4,9 +4,14 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+# TODO(#18518): re-enable when the test remote files are accessible again
+return()
+
+# These tests use compiler APIs as well as runtime APIs.
+#
 # These tests perform linking via the Compiler API, which is only supported
 # in bundled-LLVM builds at the moment (#14086).
-if(NOT IREE_BUILD_BUNDLED_LLVM)
+if(NOT IREE_BUILD_COMPILER OR NOT IREE_BUILD_BUNDLED_LLVM)
   return()
 endif()
 

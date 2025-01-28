@@ -5,7 +5,6 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
-#include "iree/compiler/GlobalOptimization/PassDetail.h"
 #include "iree/compiler/GlobalOptimization/Passes.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -15,6 +14,9 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler::GlobalOptimization {
+
+#define GEN_PASS_DEF_OPTIMIZENUMERICSPASS
+#include "iree/compiler/GlobalOptimization/Passes.h.inc"
 
 namespace {
 
@@ -239,29 +241,23 @@ struct LinalgFpMatmulToLowP : public OpRewritePattern<linalg::MatmulOp> {
         castNumeric(rhsParams->producer, rhsLowPType, isSigned, rewriter);
     Value newAccum =
         castNumeric(accumParams->producer, accumLowPType, isSigned, rewriter);
-    Value newResult;
 
-    if (isSigned) {
-      newResult = rewriter
-                      .create<linalg::MatmulOp>(loc, ValueRange{newLhs, newRhs},
-                                                ValueRange{newAccum})
-                      .getResult(0);
-    } else {
-      newResult = rewriter
-                      .create<linalg::MatmulUnsignedOp>(
-                          loc, ValueRange{newLhs, newRhs}, ValueRange{newAccum})
-                      .getResult(0);
+    auto newMatmulOp = rewriter.create<linalg::MatmulOp>(
+        loc, ValueRange{newLhs, newRhs}, ValueRange{newAccum});
+    if (!isSigned) {
+      newMatmulOp.setCast(linalg::TypeFn::cast_unsigned);
     }
-
     // Cast back.
-    newResult = castNumeric(newResult, origResultType, isSigned, rewriter);
+    Value newResult = castNumeric(newMatmulOp.getResult(0), origResultType,
+                                  isSigned, rewriter);
     rewriter.replaceOp(matmulOp, ValueRange{newResult});
 
     return success();
   }
 };
 
-class OptimizeNumericsPass : public OptimizeNumericsBase<OptimizeNumericsPass> {
+class OptimizeNumericsPass
+    : public impl::OptimizeNumericsPassBase<OptimizeNumericsPass> {
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
@@ -273,17 +269,11 @@ class OptimizeNumericsPass : public OptimizeNumericsBase<OptimizeNumericsPass> {
     patterns.insert<TensorEmptyCast>(context);
     patterns.insert<LinalgFillCast>(context);
 
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
   }
 };
 
 } // namespace
-
-std::unique_ptr<Pass> createOptimizeNumericsPass() {
-  return std::make_unique<OptimizeNumericsPass>();
-}
-
 } // namespace mlir::iree_compiler::GlobalOptimization

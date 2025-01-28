@@ -108,6 +108,30 @@ vm.module @constants {
   // CHECK-NEXT: ]
   vm.rodata private @dense_f32 dense<[1.000000e+00, 2.000000e+00, 3.000000e+00]> : tensor<3xf32>
 
+
+  //      CHECK: "embedded_data": [
+  // CHECK-NEXT:   0,
+  // CHECK-NEXT:   0,
+  // CHECK-NEXT:   128,
+  // CHECK-NEXT:   63,
+  // CHECK-NEXT:   0,
+  // CHECK-NEXT:   0,
+  // CHECK-NEXT:   0,
+  // CHECK-NEXT:   64,
+  // CHECK-NEXT:   0,
+  // CHECK-NEXT:   0,
+  // CHECK-NEXT:   64,
+  // CHECK-NEXT:   64,
+
+  // CHECK-NEXT:   0,
+  // CHECK-NEXT:   0,
+  // CHECK-NEXT:   128,
+  // CHECK-NEXT:   64
+  // CHECK-NEXT: ]
+  vm.rodata private @dense_resource_complex_f32 dense<
+                      "0x0000803F000000400000404000008040"
+                    > : tensor<2xcomplex<f32>>
+
   //      CHECK: "embedded_data": [
   // CHECK-NEXT:   0,
   // CHECK-NEXT:   0,
@@ -158,4 +182,32 @@ vm.module @constants {
   // CHECK-NEXT:   1
   // CHECK-NEXT: ]
   vm.rodata private @byte_pattern_i2 #util.byte_pattern<1> : tensor<9xi2>
+
+    //      CHECK: "embedded_data": [
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   240,
+    // CHECK-NEXT:   63,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   64,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   0,
+    // CHECK-NEXT:   8,
+    // CHECK-NEXT:   64
+    // CHECK-NEXT: ]
+    vm.rodata private @dense_f64 dense<[1.000000e+00, 2.000000e+00, 3.000000e+00]> : tensor<3xf64>
 }

@@ -21,7 +21,7 @@ iree_cc_library(
   NAME
     CUDA
   HDRS
-    "LLVMPasses.h"
+    "SetBlockIdsRangePass.h"
   SRCS
     "CUDATarget.cpp"
     "SetBlockIdsRangePass.cpp"
@@ -52,13 +52,18 @@ iree_cc_library(
     MLIRTransformDialect
     iree::base::internal::flatcc::building
     iree::compiler::Codegen
-    iree::compiler::Codegen::Dialect::IREECodegenDialect
+    iree::compiler::Codegen::Common
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::GPU::TargetUtils::KnownTargets
     iree::compiler::Codegen::LLVMGPU
+    iree::compiler::Codegen::Utils
     iree::compiler::Dialect::HAL::Target
-    iree::compiler::Dialect::HAL::Target::LLVMLinkerUtils
+    iree::compiler::Dialect::HAL::Utils::ExecutableDebugInfoUtils
+    iree::compiler::Dialect::HAL::Utils::LLVMLinkerUtils
     iree::compiler::PluginAPI
     iree::compiler::Utils
     iree::schemas::cuda_executable_def_c_fbs
+    iree::schemas::executable_debug_info_c_fbs
     iree_cuda::libdevice_embedded
   PUBLIC
 )

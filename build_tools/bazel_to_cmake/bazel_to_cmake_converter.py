@@ -150,9 +150,11 @@ class BuildFileFunctions(object):
             return ""
 
         srcs = [
-            self._normalize_label(s)
-            if s.startswith("$") or os.path.splitext(s)[1]
-            else self._filegroup_dep_filename(self._normalize_label(s))
+            (
+                self._normalize_label(s)
+                if s.startswith("$") or os.path.splitext(s)[1]
+                else self._filegroup_dep_filename(self._normalize_label(s))
+            )
             for s in srcs
         ]
 
@@ -394,6 +396,7 @@ class BuildFileFunctions(object):
         testonly=None,
         linkopts=None,
         includes=None,
+        system_includes=None,
         **kwargs,
     ):
         if self._should_skip_target(**kwargs):
@@ -412,6 +415,9 @@ class BuildFileFunctions(object):
         deps_block = self._convert_target_list_block("DEPS", deps)
         testonly_block = self._convert_option_block("TESTONLY", testonly)
         includes_block = self._convert_includes_block(includes)
+        system_includes_block = self._convert_string_list_block(
+            "SYSTEM_INCLUDES", system_includes
+        )
 
         self._converter.body += (
             f"iree_cc_library(\n"
@@ -425,6 +431,7 @@ class BuildFileFunctions(object):
             f"{defines_block}"
             f"{testonly_block}"
             f"{includes_block}"
+            f"{system_includes_block}"
             f"  PUBLIC\n)\n\n"
         )
 
@@ -524,7 +531,7 @@ class BuildFileFunctions(object):
             f")\n\n"
         )
 
-    def c_embed_data(
+    def iree_c_embed_data(
         self,
         name,
         srcs,
@@ -548,6 +555,7 @@ class BuildFileFunctions(object):
             "H_FILE_OUTPUT", h_file_output
         )
         testonly_block = self._convert_option_block("TESTONLY", testonly)
+        strip_prefix_block = self._convert_option_block("STRIP_PREFIX", strip_prefix)
         identifier_block = self._convert_string_arg_block("IDENTIFIER", identifier)
         flatten_block = self._convert_option_block("FLATTEN", flatten)
         deps_block = self._convert_target_list_block("DEPS", deps)
@@ -561,6 +569,7 @@ class BuildFileFunctions(object):
             f"{h_file_output_block}"
             f"{identifier_block}"
             f"{testonly_block}"
+            f"{strip_prefix_block}"
             f"{flatten_block}"
             f"  PUBLIC\n)\n\n"
         )
@@ -597,6 +606,25 @@ class BuildFileFunctions(object):
             f"{name_block}"
             f"{cuda_arch_block}"
             f"{srcs_block}"
+            f"{copts_block}"
+            f")\n\n"
+        )
+
+    def iree_amdgpu_bitcode_library(self, name, gpu_arch, srcs, copts=None, out=None):
+        name_block = self._convert_string_arg_block("NAME", name, quote=False)
+        gpu_arch_block = self._convert_string_arg_block(
+            "GPU_ARCH", gpu_arch, quote=False
+        )
+        srcs_block = self._convert_srcs_block(srcs)
+        out_block = self._convert_string_arg_block("OUT", out, quote=True)
+        copts_block = self._convert_string_list_block("COPTS", copts, sort=False)
+
+        self._converter.body += (
+            f"iree_amdgpu_bitcode_library(\n"
+            f"{name_block}"
+            f"{gpu_arch_block}"
+            f"{srcs_block}"
+            f"{out_block}"
             f"{copts_block}"
             f")\n\n"
         )
@@ -653,16 +681,18 @@ class BuildFileFunctions(object):
             f"  PUBLIC\n)\n\n"
         )
 
-    def iree_flatbuffer_c_library(self, name, srcs, flatcc_args=None):
+    def iree_flatbuffer_c_library(self, name, srcs, flatcc_args=None, includes=None):
         name_block = self._convert_string_arg_block("NAME", name, quote=False)
         srcs_block = self._convert_srcs_block(srcs)
         flatcc_args_block = self._convert_string_list_block("FLATCC_ARGS", flatcc_args)
+        includes_block = self._convert_srcs_block(includes, block_name="INCLUDES")
 
         self._converter.body += (
             f"flatbuffer_c_library(\n"
             f"{name_block}"
             f"{srcs_block}"
             f"{flatcc_args_block}"
+            f"{includes_block}"
             f"  PUBLIC\n)\n\n"
         )
 
@@ -758,7 +788,6 @@ class BuildFileFunctions(object):
         target_backends_and_drivers=None,
         runner_args=None,
         tags=None,
-        target_cpu_features=None,
         timeout=None,
         **kwargs,
     ):
@@ -776,9 +805,6 @@ class BuildFileFunctions(object):
         input_type_block = self._convert_string_arg_block("INPUT_TYPE", input_type)
         runner_args_block = self._convert_string_list_block("RUNNER_ARGS", runner_args)
         labels_block = self._convert_string_list_block("LABELS", tags)
-        target_cpu_features_block = self._convert_string_arg_block(
-            "TARGET_CPU_FEATURES", target_cpu_features
-        )
         timeout_block = self._convert_timeout_arg_block("TIMEOUT", timeout)
 
         self._converter.body += (
@@ -791,7 +817,6 @@ class BuildFileFunctions(object):
             f"{input_type_block}"
             f"{runner_args_block}"
             f"{labels_block}"
-            f"{target_cpu_features_block}"
             f"{timeout_block}"
             f")\n\n"
         )
@@ -802,6 +827,7 @@ class BuildFileFunctions(object):
         srcs,
         target_backends_and_drivers=None,
         compiler_flags=None,
+        input_type=None,
         runner_args=None,
         tags=None,
         target_cpu_features_variants=None,
@@ -825,6 +851,7 @@ class BuildFileFunctions(object):
         compiler_flags_block = self._convert_string_list_block(
             "COMPILER_FLAGS", compiler_flags
         )
+        input_type_block = self._convert_string_arg_block("INPUT_TYPE", input_type)
         runner_args_block = self._convert_string_list_block("RUNNER_ARGS", runner_args)
         labels_block = self._convert_string_list_block("LABELS", tags)
         target_cpu_features_variants_block = self._convert_string_list_block(
@@ -839,6 +866,7 @@ class BuildFileFunctions(object):
             f"{target_backends_block}"
             f"{drivers_block}"
             f"{compiler_flags_block}"
+            f"{input_type_block}"
             f"{runner_args_block}"
             f"{labels_block}"
             f"{target_cpu_features_variants_block}"
@@ -846,12 +874,13 @@ class BuildFileFunctions(object):
             f")\n\n"
         )
 
-    def iree_generated_trace_runner_test(
+    def iree_generated_e2e_runner_test(
         self,
         name,
+        test_type,
         generator,
         generator_args=None,
-        trace_runner=None,
+        test_runner=None,
         target_backends_and_drivers=None,
         compiler_flags=None,
         runner_args=None,
@@ -868,6 +897,9 @@ class BuildFileFunctions(object):
             drivers = [it[1] for it in target_backends_and_drivers]
 
         name_block = self._convert_string_arg_block("NAME", name, quote=False)
+        test_type_block = self._convert_string_arg_block(
+            "TEST_TYPE", test_type, quote=False
+        )
         # For now we assume that the generator target is a py_binary with a single
         # source .py file named like it.
         generator_py = f"{generator.split(':')[-1]}.py"
@@ -877,7 +909,7 @@ class BuildFileFunctions(object):
         generator_args_block = self._convert_string_list_block(
             "GENERATOR_ARGS", generator_args
         )
-        trace_runner_block = self._convert_target_block("TRACE_RUNNER", trace_runner)
+        test_runner_block = self._convert_target_block("TEST_RUNNER", test_runner)
         target_backends_block = self._convert_string_list_block(
             "TARGET_BACKENDS", target_backends
         )
@@ -892,11 +924,12 @@ class BuildFileFunctions(object):
         )
 
         self._converter.body += (
-            f"iree_generated_trace_runner_test(\n"
+            f"iree_generated_e2e_runner_test(\n"
             f"{name_block}"
+            f"{test_type_block}"
             f"{generator_block}"
             f"{generator_args_block}"
-            f"{trace_runner_block}"
+            f"{test_runner_block}"
             f"{target_backends_block}"
             f"{drivers_block}"
             f"{compiler_flags_block}"

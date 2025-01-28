@@ -23,7 +23,6 @@ iree_cc_library(
   NAME
     PassHeaders
   HDRS
-    "PassDetail.h"
     "Passes.h"
     "Passes.h.inc"
   DEPS
@@ -31,8 +30,9 @@ iree_cc_library(
     MLIRLinalgTransforms
     MLIRMemRefDialect
     MLIRPass
+    MLIRTransformUtils
     MLIRTransforms
-    iree::compiler::Codegen::Dialect::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Utils
   PUBLIC
@@ -46,37 +46,41 @@ iree_cc_library(
     "Passes.h"
   SRCS
     "KernelDispatch.cpp"
-    "LowerLinalgMicrokernels.cpp"
     "Passes.cpp"
     "VMVXAssignConstantOrdinals.cpp"
     "VMVXLinkExecutables.cpp"
     "VMVXLowerExecutableTargetPass.cpp"
+    "VMVXLowerLinalgMicrokernels.cpp"
     "VMVXSelectLoweringStrategy.cpp"
   DEPS
     ::PassHeaders
     ::PassesIncGen
-    IREELinalgExtDialect
-    IREELinalgExtPasses
     LLVMSupport
     MLIRArithDialect
     MLIRBufferizationDialect
     MLIRFuncDialect
+    MLIRFunctionInterfaces
     MLIRIR
     MLIRLinalgDialect
     MLIRMathDialect
     MLIRMemRefDialect
     MLIRMemRefTransforms
     MLIRPass
+    MLIRSCFDialect
     MLIRTensorDialect
     MLIRTensorTransforms
+    MLIRTransformUtils
     MLIRTransforms
     MLIRVectorDialect
     iree::compiler::Codegen::Common
     iree::compiler::Codegen::Common::CPU::CommonCPUPasses
-    iree::compiler::Codegen::Dialect::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
+    iree::compiler::Codegen::Interfaces::PartitionableLoopsInterface
     iree::compiler::Codegen::Utils
     iree::compiler::Dialect::Flow::IR
     iree::compiler::Dialect::HAL::IR
+    iree::compiler::Dialect::LinalgExt::IR
+    iree::compiler::Dialect::LinalgExt::Transforms
     iree::compiler::Dialect::Util::IR
     iree::compiler::Dialect::VM::IR
     iree::compiler::Dialect::VMVX::IR

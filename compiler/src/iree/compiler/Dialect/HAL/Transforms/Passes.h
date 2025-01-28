@@ -9,9 +9,10 @@
 
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
+#include "iree/compiler/Dialect/HAL/Target/TargetDevice.h"
+#include "iree/compiler/Dialect/HAL/Target/TargetOptions.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "llvm/ADT/StringMap.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -20,7 +21,7 @@
 namespace mlir::iree_compiler::IREE::HAL {
 
 //===----------------------------------------------------------------------===//
-// Helpers
+// Pipelines
 //===----------------------------------------------------------------------===//
 
 enum class PipelinePhase {
@@ -37,6 +38,54 @@ enum class PipelinePhase {
   End,
 };
 
+// Hooks for injecting behavior into the HAL pipeline.
+struct PipelineHooks {
+  // Called immediately before a compilation phase.
+  std::function<void(PipelinePhase phase, OpPassManager &)> beforePhase;
+  // Called immediately after a compilation phase.
+  std::function<void(PipelinePhase phase, OpPassManager &)> afterPhase;
+};
+
+struct AssignmentOptions : public PassPipelineOptions<AssignmentOptions> {
+  // TODO(benvanik): remove the legacy flag once users are switched to devices.
+  ListOption<std::string> legacyTargetBackends{
+      *this,
+      "legacy-target-backends",
+      llvm::cl::desc("DEPRECATED: Target backend names."),
+      llvm::cl::ZeroOrMore,
+  };
+  ListOption<std::string> targetDevices{
+      *this,
+      "target-devices",
+      llvm::cl::desc("Target device specifications."),
+      llvm::cl::ZeroOrMore,
+  };
+  Option<std::string> defaultDevice{
+      *this,
+      "default-device",
+      llvm::cl::desc("Which device is considered the default when no device "
+                     "affinity is specified. Either the device name when names "
+                     "are specified or the numeric ordinal of the device."),
+      llvm::cl::init(""),
+  };
+};
+
+// Assigns devices from flags and coarse module-level specification.
+// Frontends are encouraged to create and assign devices themselves in order to
+// support more complex configurations (multiple devices, fallbacks, etc).
+void buildHALDeviceAssignmentPassPipeline(
+    OpPassManager &passManager, const TargetRegistry &targetRegistry,
+    const AssignmentOptions &assignmentOptions);
+
+// Adds a set of passes to the given pass manager that run the head of the HAL
+// pipeline to materialize interfaces, import externally specified executables,
+// and translate executables. The host portion of the program is annotated but
+// not modified.
+void buildHALConfigurationPassPipeline(OpPassManager &passManager,
+                                       const TargetRegistry &targetRegistry,
+                                       const TargetOptions &targetOptions,
+                                       PipelineHooks hooks = {});
+
 // Adds a set of passes to the given pass manager that run the required HAL
 // transforms in the canonical order.
 //
@@ -48,198 +97,27 @@ enum class PipelinePhase {
 //   buildHALTransformPassPipeline & run
 //   <run conversion from HAL to vm/etc>
 void buildHALTransformPassPipeline(
-    OpPassManager &passManager, const TargetBackendRegistry &targetRegistry,
-    const TargetOptions &targetOptions,
+    OpPassManager &passManager, const TargetRegistry &targetRegistry,
+    const TargetOptions &targetOptions, PipelineHooks hooks = {},
     PipelinePhase compileFrom = PipelinePhase::Start,
     PipelinePhase compileTo = PipelinePhase::End);
 
-// Adds a set of passes to the given pass manager that run the head of the HAL
-// pipeline to assign devices, materialize interfaces, and translate
-// executables. The host portion of the program is annotated but not modified.
-void buildHALConfigurationPassPipeline(
-    OpPassManager &passManager, const TargetBackendRegistry &targetRegistry,
-    const TargetOptions &targetOptions);
-
-void registerHALTransformPassPipeline();
-void registerHALConfigurationPassPipeline();
-
 //===----------------------------------------------------------------------===//
-// Conversion
+// Passes
 //===----------------------------------------------------------------------===//
 
-// Converts input flow/std/etc dialects to the IREE HAL dialect.
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createConvertToHALPass();
-
-//===----------------------------------------------------------------------===//
-// Device management
-//===----------------------------------------------------------------------===//
-
-// Verifies that the target execution environment is valid.
-// #hal.device.target and #hal.executable.target attribute placement and
-// definition will be checked as well along with other structural requirements.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createVerifyTargetEnvironmentPass(const TargetBackendRegistry &targetRegistry);
-
-// Assigns the HAL devices the module will target to the given list of targets.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createAssignTargetDevicesPass(const TargetBackendRegistry &targetRegistry,
-                              ArrayRef<std::string> targets);
-
-// Applies fixups to the program for when using legacy HAL devices that only
-// support synchronous execution. Once all devices support async this will be
-// removed.
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createFixupLegacySyncPass();
-
-// Finds hal.device.query ops and creates variables initialized on startup.
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createMemoizeDeviceQueriesPass();
-
-//===----------------------------------------------------------------------===//
-// Executable translation
-//===----------------------------------------------------------------------===//
-
-// Defines hal.executables and hal.interfaces for flow.executable ops based on
-// usage within the module. Target backends are queried to check for support and
-// device placements are made.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createMaterializeInterfacesPass();
-
-// Dumps individual hal.executable source listings to |path|.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createDumpExecutableSourcesPass(StringRef path, StringRef prefix = "");
-
-// Dumps standalone hal.executable benchmarks to |path|.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createDumpExecutableBenchmarksPass(StringRef path);
-
-// Strips executable module contents for reducing IR size during debugging.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createStripExecutableContentsPass();
-
-// Substitutes hal.executable ops by parsing |substitutions| in
-// `executable_name=file.xxx` strings. File paths may be absolute or relative to
-// the paths specified on `--iree-hal-executable-object-search-path=`.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createSubstituteExecutablesPass(ArrayRef<std::string> substitutions = {});
-// Substitutes hal.executable ops with files in the given |searchPath| matching
-// the symbol name.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createSubstituteExecutablesPass(std::string searchPath);
-
-// Preprocess each executable with either a pass pipeline or external tool.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableOp>>
-createPreprocessExecutablesPass(std::string command);
-// Preprocesses each executable with a pass pipeline.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableOp>>
-createPreprocessExecutablesWithPipelinePass(std::string pipeline);
-// Preprocesses each executable with an external tool.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableOp>>
-createPreprocessExecutablesWithToolPass(std::string command);
-
-// Configures hal.executable.variant ops in all hal.executable ops via a nested
-// translation pipeline.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableOp>>
-createConfigureExecutablesPass(const TargetBackendRegistry &targetRegistry);
-
-// Configures hal.executable.variant ops for the specified |target| backend.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableVariantOp>>
-createConfigureTargetExecutableVariantsPass(
-    const TargetBackendRegistry &targetRegistry, StringRef target);
-
-// Translates hal.executable.variant ops via a nested translation pipeline.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableOp>>
-createTranslateExecutablesPass(const TargetBackendRegistry &targetRegistry);
-
-// Translates hal.executable.variant ops for the specified |target| backend.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableVariantOp>>
-createTranslateTargetExecutableVariantsPass(
-    const TargetBackendRegistry &targetRegistry, StringRef target);
-
-// Calls into each target backend to have it link multiple hal.executables
-// together (if that makes sense). For example, the LLVM AOT backend may combine
-// all executable targets for the same architecture into a single executable and
-// link it as a shared library.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createLinkExecutablesPass(const TargetBackendRegistry &targetRegistry);
-
-// Links executables for the specified |target| backend.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createLinkTargetExecutablesPass(const TargetBackendRegistry &targetRegistry,
-                                StringRef target);
-
-// Resolves hal.executable.export references to ordinals.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createResolveExportOrdinalsPass();
-
-// Converts hal.executable.variants to one or more hal.executable.binary ops.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableOp>>
-createSerializeExecutablesPass(const TargetBackendRegistry &targetRegistry,
-                               int debugLevel = 2,
-                               std::string dumpIntermediatesPath = "",
-                               std::string dumpBinariesPath = "");
-
-// Serializes executables for the specified |target| backend.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableOp>>
-createSerializeTargetExecutablesPass(
-    const TargetBackendRegistry &targetRegistry, StringRef target,
-    int debugLevel = 2, std::string dumpIntermediatesPath = "",
-    std::string dumpBinariesPath = "");
-
-//===----------------------------------------------------------------------===//
-// Resource initialization, caching, and optimization
-//===----------------------------------------------------------------------===//
-
-// Materializes host and device dispatch instrumentation resources on stream IR.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createMaterializeDispatchInstrumentationPass(int64_t bufferSize);
-
-// Finds all resource lookups (such as hal.executable.lookup), materializes
-// their cache storage and initialization, and rewrites the lookups to
-// references.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createMaterializeResourceCachesPass(TargetOptions targetOptions);
-
-// Elides stateful command buffer ops that set redundant state.
-std::unique_ptr<OperationPass<void>> createElideRedundantCommandsPass();
-
-// Repeats dispatches `iree-hal-repeat-dispatch-num` times, which is 1 by
-// default.
-std::unique_ptr<OperationPass<func::FuncOp>>
-createBenchmarkBatchDispatchesPass(unsigned repeatCount);
+// Preprocesses each executable with an MLIR pass pipeline or external command
+// line tool.
+std::unique_ptr<Pass> createPreprocessExecutablesPass(std::string command = "");
 
 //===----------------------------------------------------------------------===//
 // Register all Passes
 //===----------------------------------------------------------------------===//
 
-inline void registerHALPasses() {
-  registerHALTransformPassPipeline();
-  registerHALConfigurationPassPipeline();
-  auto targetOptions = TargetOptions::FromFlags::get();
-  createAssignTargetDevicesPass(TargetBackendRegistry::getGlobal(), {});
-  createBenchmarkBatchDispatchesPass(/*repeatCount=*/1);
-  createConfigureExecutablesPass(TargetBackendRegistry::getGlobal());
-  createConfigureTargetExecutableVariantsPass(
-      TargetBackendRegistry::getGlobal(), "");
-  createConvertToHALPass();
-  createDumpExecutableSourcesPass("");
-  createElideRedundantCommandsPass();
-  createFixupLegacySyncPass();
-  createLinkExecutablesPass(TargetBackendRegistry::getGlobal());
-  createLinkTargetExecutablesPass(TargetBackendRegistry::getGlobal(), "");
-  createMaterializeDispatchInstrumentationPass(0);
-  createMaterializeInterfacesPass();
-  createMaterializeResourceCachesPass(targetOptions);
-  createMemoizeDeviceQueriesPass();
-  createPreprocessExecutablesPass("");
-  createResolveExportOrdinalsPass();
-  createSerializeExecutablesPass(TargetBackendRegistry::getGlobal());
-  createSerializeTargetExecutablesPass(TargetBackendRegistry::getGlobal(), "");
-  createStripExecutableContentsPass();
-  createSubstituteExecutablesPass();
-  createTranslateExecutablesPass(TargetBackendRegistry::getGlobal());
-  createTranslateTargetExecutableVariantsPass(
-      TargetBackendRegistry::getGlobal(), "");
-  createVerifyTargetEnvironmentPass(TargetBackendRegistry::getGlobal());
-}
+#define GEN_PASS_DECL
+#include "iree/compiler/Dialect/HAL/Transforms/Passes.h.inc" // IWYU pragma: keep
+
+void registerHALPasses();
 
 } // namespace mlir::iree_compiler::IREE::HAL
 

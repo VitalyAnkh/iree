@@ -13,12 +13,4 @@ include "mlir/Pass/PassBase.td"
 // WGSL passes (keep alphabetical)
 //===---------------------------------------------------------------------===//
 
-def WGSLReplacePushConstants :
-    Pass<"iree-wgsl-replace-push-constants", "func::FuncOp"> {
-  let summary =
-      "Replaces push constant loads with binding loads for when using "
-      "WGSL without push constant support";
-  let constructor = "mlir::iree_compiler::createWGSLReplacePushConstantsPass()";
-}
-
 #endif // IREE_CODEGEN_WGSL_PASSES

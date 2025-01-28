@@ -24,6 +24,12 @@ IREE_API_EXPORT void iree_io_parameter_archive_builder_deinitialize(
   memset(builder, 0, sizeof(*builder));
 }
 
+IREE_API_EXPORT bool iree_io_parameter_archive_builder_is_empty(
+    const iree_io_parameter_archive_builder_t* builder) {
+  IREE_ASSERT_ARGUMENT(builder);
+  return iree_io_parameter_index_count(builder->index) == 0;
+}
+
 static iree_io_physical_size_t
 iree_io_parameter_archive_builder_storage_alignment(
     const iree_io_parameter_archive_builder_t* builder) {
@@ -183,10 +189,10 @@ IREE_API_EXPORT iree_status_t iree_io_parameter_archive_builder_write(
         break;
       }
       default: {
-        IREE_RETURN_AND_END_ZONE_IF_ERROR(
-            z0, iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                                 "unhandled entry type %d",
-                                 (int)source_entry->type));
+        IREE_TRACE_ZONE_END(z0);
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "unhandled entry type %d",
+                                (int)source_entry->type);
       }
     }
 

@@ -41,7 +41,6 @@
 #include <limits>
 
 #include "iree/compiler/API/Internal/Diagnostics.h"
-#include "iree/compiler/API/MLIRInterop.h"
 #include "iree/compiler/ConstEval/Passes.h"
 #include "iree/compiler/Dialect/VM/Target/init_targets.h"
 #include "iree/compiler/Pipelines/Pipelines.h"
@@ -49,14 +48,16 @@
 #include "iree/compiler/Tools/init_dialects.h"
 #include "iree/compiler/Tools/init_llvmir_translations.h"
 #include "iree/compiler/Tools/init_passes.h"
-#include "iree/compiler/Tools/init_targets.h"
 #include "iree/compiler/Tools/version.h"
+#include "iree/compiler/Utils/ModuleUtils.h"
 #include "iree/compiler/Utils/TracingUtils.h"
 #include "iree/compiler/embedding_api.h"
+#include "iree/compiler/mlir_interop.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/SMLoc.h"
 #include "llvm/Support/Signals.h"
@@ -66,6 +67,7 @@
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/CAPI/IR.h"
 #include "mlir/CAPI/Wrap.h"
+#include "mlir/Debug/CLOptionsSetup.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Dialect.h"
@@ -215,7 +217,7 @@ struct GlobalInit {
   // Reference count of balanced calls to ireeCompilerGlobalInitialize
   // and ireeCompilerGlobalShutdown. Upon reaching zero, must be deleted.
   std::atomic<int> refCount{1};
-  llvm::ThreadPool threadPool;
+  llvm::DefaultThreadPool threadPool;
   llvm::BumpPtrAllocator alloc;
   mlir::DialectRegistry registry;
   PluginManager pluginManager;
@@ -248,7 +250,6 @@ GlobalInit::GlobalInit() : threadPool(getGlobalThreadPoolStrategy()) {
   // Allegedly need to register passes to get good reproducers
   // TODO: Verify this (I think that this was fixed some time ago).
   mlir::iree_compiler::registerAllPasses();
-  mlir::iree_compiler::registerHALTargetBackends();
   mlir::iree_compiler::registerVMTargets();
 
   // MLIRContext registration and hooks.
@@ -274,6 +275,7 @@ void GlobalInit::registerCommandLineOptions() {
   // Register pass manager command-line options like -mlir-print-ir-*.
   mlir::registerPassManagerCLOptions();
   mlir::registerDefaultTimingManagerCLOptions();
+  mlir::tracing::DebugConfig::registerCLOptions();
 
   // Bind session options to the command line environment.
   clPluginManagerOptions = &PluginManagerOptions::FromFlags::get();
@@ -345,10 +347,13 @@ struct Session {
         pluginActivationStatus = pluginSession.activatePlugins(&context);
 
         // Initialize target registry, bootstrapping with the static globals.
-        targetRegistry.mergeFrom(IREE::HAL::TargetBackendRegistry::getGlobal());
-        IREE::HAL::TargetBackendList pluginTargetList;
-        pluginSession.populateHALTargetBackends(pluginTargetList);
-        targetRegistry.mergeFrom(pluginTargetList);
+        targetRegistry.mergeFrom(IREE::HAL::TargetRegistry::getGlobal());
+        IREE::HAL::TargetDeviceList pluginTargetDeviceList;
+        pluginSession.populateHALTargetDevices(pluginTargetDeviceList);
+        targetRegistry.mergeFrom(pluginTargetDeviceList);
+        IREE::HAL::TargetBackendList pluginTargetBackendList;
+        pluginSession.populateHALTargetBackends(pluginTargetBackendList);
+        targetRegistry.mergeFrom(pluginTargetBackendList);
       }
     }
     return pluginActivationStatus;
@@ -363,13 +368,18 @@ struct Session {
   // All user access to the context is done via this reference.
   MLIRContext &context;
   OptionsBinder binder;
+
+  // Debug configuration.
+  mlir::tracing::DebugConfig debugConfig;
+  std::optional<mlir::tracing::InstallDebugHandler> debugHandlerInstall;
+
   // PluginManagerOptions must initialize first because the session depends on
   // it.
   PluginManagerOptions pluginManagerOptions;
   PluginManagerSession pluginSession;
 
-  // We initialize the TargetBackendRegistry lazily with the plugins.
-  IREE::HAL::TargetBackendRegistry targetRegistry;
+  // We initialize the TargetRegistry lazily with the plugins.
+  IREE::HAL::TargetRegistry targetRegistry;
 
   // We lazily activate plugins on the first invocation. This allows plugin
   // activation to be configured at the session level via the API, if
@@ -399,6 +409,7 @@ Session::Session(GlobalInit &globalInit)
 
   // Bootstrap session options from the cl environment, if enabled.
   if (globalInit.usesCommandLine) {
+    debugConfig = mlir::tracing::DebugConfig::createFromCLOptions();
     pluginManagerOptions = *globalInit.clPluginManagerOptions;
     bindingOptions = *globalInit.clBindingOptions;
     inputOptions = *globalInit.clInputOptions;
@@ -413,6 +424,9 @@ Session::Session(GlobalInit &globalInit)
     cTargetOptions = IREE::VM::getCTargetOptionsFromFlags();
 #endif
   }
+
+  // Enable debug integration.
+  debugHandlerInstall.emplace(context, debugConfig);
 
   // Register each options struct with the binder so we can manipulate
   // mnemonically via the API.
@@ -674,6 +688,8 @@ struct Invocation {
   bool runPipeline(enum iree_compiler_pipeline_t pipeline);
   bool getCompilationPhase(IREEVMPipelinePhase &compileFrom,
                            IREEVMPipelinePhase &compileTo);
+  void dumpCompilationPhase(IREEVMPipelinePhase phase,
+                            OpPassManager &passManager);
   bool runTextualPassPipeline(const char *textPassPipeline);
   Error *outputIR(Output &output);
   Error *outputIRBytecode(Output &output, int bytecodeVersion);
@@ -697,6 +713,7 @@ struct Invocation {
   // Run options.
   std::string compileToPhaseName{"end"};
   std::string compileFromPhaseName{"start"};
+  std::string dumpCompilationPhasesTo;
   bool enableVerifier = true;
 
   // Diagnostic options.
@@ -715,8 +732,15 @@ Invocation::Invocation(Session &session) : session(session) {
   auto &targetRegistry = session.targetRegistry;
   pipelineHooks.buildConstEvalPassPipelineCallback =
       [&targetRegistry](OpPassManager &pm) {
-        pm.addPass(ConstEval::createJitGlobalsPass(targetRegistry));
+        pm.addPass(ConstEval::createJitGlobalsPass({&targetRegistry}));
       };
+
+  // Dump compilation phase results if the option is set.
+  pipelineHooks.afterPhase = [this](IREEVMPipelinePhase phase,
+                                    OpPassManager &passManager) {
+    dumpCompilationPhase(phase, passManager);
+  };
+
   // The PluginSession implements PipelineExtensions and delegates it to
   // activated plugins.
   pipelineHooks.pipelineExtensions = &session.pluginSession;
@@ -888,6 +912,30 @@ bool Invocation::getCompilationPhase(IREEVMPipelinePhase &compileFrom,
   return true;
 }
 
+void Invocation::dumpCompilationPhase(IREEVMPipelinePhase phase,
+                                      OpPassManager &passManager) {
+  if (!parsedModule || dumpCompilationPhasesTo.empty())
+    return;
+
+  std::string phaseName;
+  enumerateIREEVMPipelinePhases(
+      [&](IREEVMPipelinePhase enumeratedPhase, StringRef name, StringRef desc) {
+        if (enumeratedPhase == phase)
+          phaseName = name;
+      });
+
+  std::string fileName =
+      guessModuleName(cast<ModuleOp>(parsedModule), "module") + "." +
+      std::to_string(static_cast<int>(phase)) + "." + phaseName + ".mlir";
+
+  SmallVector<char> path;
+  path.append(dumpCompilationPhasesTo.begin(), dumpCompilationPhasesTo.end());
+  llvm::sys::path::append(path, fileName);
+
+  passManager.addPass(
+      IREE::Util::createDumpModulePass(std::string(path.begin(), path.end())));
+}
+
 bool Invocation::runPipeline(enum iree_compiler_pipeline_t pipeline) {
   auto passManager = createPassManager();
   switch (pipeline) {
@@ -897,10 +945,12 @@ bool Invocation::runPipeline(enum iree_compiler_pipeline_t pipeline) {
     if (!getCompilationPhase(compileFrom, compileTo)) {
       return false;
     }
+
+    // TODO: move to someplace centralized; erroring here is not great.
     // InlineStatic (currently) only supports the `vmvx-inline` backend.
     if (session.schedulingOptions.executionModel ==
         SchedulingOptions::ExecutionModel::InlineStatic) {
-      for (auto target : session.halTargetOptions.targets) {
+      for (auto target : session.halTargetOptions.legacyTargetBackends) {
         if (target != "vmvx-inline") {
           parsedModule->emitError() << "InlineStatic execution model is not "
                                        "compatible with hal target '"
@@ -933,7 +983,8 @@ bool Invocation::runPipeline(enum iree_compiler_pipeline_t pipeline) {
       return false;
     }
     IREE::HAL::buildHALTransformPassPipeline(
-        *passManager, session.targetRegistry, session.halTargetOptions);
+        *passManager, session.targetRegistry, session.halTargetOptions,
+        pipelineHooks);
     break;
   }
   case IREE_COMPILER_PIPELINE_PRECOMPILE: {
@@ -942,7 +993,6 @@ bool Invocation::runPipeline(enum iree_compiler_pipeline_t pipeline) {
     if (!getCompilationPhase(compileFrom, compileTo)) {
       return false;
     }
-
     buildIREEPrecompileTransformPassPipeline(
         session.targetRegistry, session.bindingOptions, session.inputOptions,
         session.preprocessingOptions, session.highLevelOptimizationOptions,
@@ -1030,7 +1080,7 @@ Error *Invocation::outputVMCSource(Output &output) {
     parsedModule->emitError() << "expected a vm.module or builtin.module";
   }
   if (failed(result)) {
-    return new Error("failed to generate bytecode");
+    return new Error("failed to generate C source code");
   }
   output.outputStream->flush();
   return output.getWriteError();
@@ -1050,8 +1100,12 @@ Error *Invocation::outputHALExecutable(Output &output) {
     return new Error("not a valid HAL executable");
   }
   auto binaryOp = binaryOps.front();
-  auto rawData = binaryOp.getData().getRawData();
-  output.outputStream->write(rawData.data(), rawData.size());
+  if (failed(cast<IREE::Util::SerializableAttrInterface>(binaryOp.getData())
+                 .serializeToStream(binaryOp.getLoc(), llvm::endianness::little,
+                                    *output.outputStream))) {
+    return new Error(
+        "data attribute failed to serialize: unsupported format or encoding");
+  }
   output.outputStream->flush();
   return output.getWriteError();
 }
@@ -1215,7 +1269,7 @@ void ireeCompilerSetupGlobalCL(int argc, const char **argv, const char *banner,
   globalInit->registerCommandLineOptions();
 
   llvm::setBugReportMsg(
-      "Please report issues to https://github.com/openxla/iree/issues and "
+      "Please report issues to https://github.com/iree-org/iree/issues and "
       "include the crash backtrace.\n");
   llvm::cl::SetVersionPrinter(llvmVersionPrinter);
 
@@ -1325,7 +1379,7 @@ void ireeCompilerInvocationSetCrashHandler(
     iree_compiler_error_t *(*onCrashCallback)(
         iree_compiler_output_t **outOutput, void *userData),
     void *userData) {
-  struct StreamImpl : public mlir::PassManager::ReproducerStream {
+  struct StreamImpl : public mlir::ReproducerStream {
     StreamImpl(iree_compiler_output_t *output) : output(output) {
       unwrap(output)->keep();
     }
@@ -1344,7 +1398,7 @@ void ireeCompilerInvocationSetCrashHandler(
       [=](mlir::PassManager &passManager) {
         passManager.enableCrashReproducerGeneration(
             [=](std::string &errorMessage)
-                -> std::unique_ptr<mlir::PassManager::ReproducerStream> {
+                -> std::unique_ptr<mlir::ReproducerStream> {
               iree_compiler_output_t *output = nullptr;
               auto error = onCrashCallback(&output, userData);
               if (error) {
@@ -1376,6 +1430,11 @@ void ireeCompilerInvocationSetCompileFromPhase(iree_compiler_invocation_t *inv,
 void ireeCompilerInvocationSetCompileToPhase(iree_compiler_invocation_t *inv,
                                              const char *phase) {
   unwrap(inv)->compileToPhaseName = std::string(phase);
+}
+
+void ireeCompilerInvocationSetDumpCompilationPhasesTo(
+    iree_compiler_invocation_t *inv, const char *path) {
+  unwrap(inv)->dumpCompilationPhasesTo = std::string(path);
 }
 
 void ireeCompilerInvocationSetVerifyIR(iree_compiler_invocation_t *inv,
@@ -1502,7 +1561,7 @@ ireeCompilerInvocationOutputHALExecutable(iree_compiler_invocation_t *inv,
 }
 
 //===----------------------------------------------------------------------===//
-// Unstable MLIRInterop.h helpers
+// Unstable mlir_interop.h helpers
 //===----------------------------------------------------------------------===//
 
 void ireeCompilerRegisterDialects(MlirDialectRegistry registry) {

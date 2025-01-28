@@ -4,30 +4,19 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtDialect.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenAttrs.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenDialect.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUDialect.h"
 #include "iree/compiler/Codegen/SPIRV/KernelConfig.h"
-#include "iree/compiler/Codegen/SPIRV/PassDetail.h"
 #include "iree/compiler/Codegen/SPIRV/Passes.h"
-#include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
-#include "iree/compiler/Dialect/HAL/IR/HALOps.h"
-#include "llvm/Support/Debug.h"
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Dialect/GPU/IR/GPUDialect.h"
-#include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
-#include "mlir/Dialect/Transform/IR/TransformDialect.h"
-#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Pass/PassRegistry.h"
-#include "mlir/Transforms/Passes.h"
-
-#define DEBUG_TYPE "iree-spirv-select-lowering-strategy-pass"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_SPIRVSELECTLOWERINGSTRATEGYPASS
+#include "iree/compiler/Codegen/SPIRV/Passes.h.inc"
 
 using CodeGenPipeline = IREE::Codegen::DispatchLoweringPassPipeline;
 
@@ -36,23 +25,16 @@ namespace {
 /// code. Invokes different compilation pipeline to
 /// - first lower to scalar/native-vector code,
 /// - then convert to SPIRV dialect.
-class SPIRVSelectLoweringStrategyPass
-    : public SPIRVSelectLoweringStrategyBase<SPIRVSelectLoweringStrategyPass> {
+class SPIRVSelectLoweringStrategyPass final
+    : public impl::SPIRVSelectLoweringStrategyPassBase<
+          SPIRVSelectLoweringStrategyPass> {
 public:
-  SPIRVSelectLoweringStrategyPass() = default;
-  SPIRVSelectLoweringStrategyPass(const SPIRVSelectLoweringStrategyPass &pass) {
-  }
+  using impl::SPIRVSelectLoweringStrategyPassBase<
+      SPIRVSelectLoweringStrategyPass>::SPIRVSelectLoweringStrategyPassBase;
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    // TODO(qedawkins): Once TransformStrategies is deprecated, drop the
-    // unnecessary dialect registrations.
-    registry
-        .insert<IREE::Codegen::IREECodegenDialect, affine::AffineDialect,
-                gpu::GPUDialect, IREE::HAL::HALDialect, linalg::LinalgDialect,
-                IREE::LinalgExt::IREELinalgExtDialect, memref::MemRefDialect,
-                bufferization::BufferizationDialect, scf::SCFDialect,
-                spirv::SPIRVDialect, transform::TransformDialect,
-                vector::VectorDialect>();
+    registry.insert<IREE::Codegen::IREECodegenDialect,
+                    IREE::GPU::IREEGPUDialect, spirv::SPIRVDialect>();
   }
 
   void runOnOperation() override;
@@ -63,11 +45,12 @@ public:
 /// module.
 template <typename F>
 static LogicalResult
-verifyLoweringConfiguration(ModuleOp module,
+verifyLoweringConfiguration(FunctionOpInterface funcOp,
                             IREE::Codegen::TranslationInfoAttr translationInfo,
                             ArrayRef<int64_t> workgroupSize, F verificationFn) {
-  auto walkResult = module.walk([&](Operation *op) -> WalkResult {
-    IREE::Codegen::LoweringConfigAttr loweringConfig = getLoweringConfig(op);
+  auto walkResult = funcOp.walk([&](Operation *op) -> WalkResult {
+    auto loweringConfig =
+        getLoweringConfig<IREE::Codegen::LoweringConfigAttr>(op);
     if (!loweringConfig)
       return WalkResult::advance();
     return verificationFn(op, loweringConfig, translationInfo, workgroupSize);
@@ -76,40 +59,27 @@ verifyLoweringConfiguration(ModuleOp module,
 }
 
 static LogicalResult
-verifyEntryPoint(ModuleOp moduleOp,
-                 IREE::Codegen::TranslationInfoAttr translationInfo,
-                 IREE::HAL::ExecutableExportOp exportOp) {
+verifyTranslationInfo(FunctionOpInterface funcOp,
+                      IREE::Codegen::TranslationInfoAttr translationInfo) {
   if (translationInfo.getDispatchLoweringPassPipeline() ==
       CodeGenPipeline::TransformDialectCodegen) {
     // Transform dialect encodes configuration into the schedule directly.
     return success();
   }
 
-  std::optional<mlir::ArrayAttr> workgroupSizeAttr =
-      exportOp.getWorkgroupSize();
-  if (!workgroupSizeAttr || workgroupSizeAttr->size() != 3) {
-    return moduleOp.emitError(
-        "expected workgroup size to have three dimensions for SPIR-V "
-        "pipelines");
-  }
-
-  std::array<int64_t, 3> workgroupSizes;
-  for (auto [index, attr] : llvm::enumerate(workgroupSizeAttr.value())) {
-    workgroupSizes[index] = llvm::cast<IntegerAttr>(attr).getInt();
-  }
-
+  SmallVector<int64_t> workgroupSizes =
+      llvm::to_vector(translationInfo.getWorkgroupSize());
   switch (translationInfo.getDispatchLoweringPassPipeline()) {
   case CodeGenPipeline::SPIRVBaseVectorize:
-    return verifyLoweringConfiguration(moduleOp, translationInfo,
-                                       workgroupSizes,
+    return verifyLoweringConfiguration(funcOp, translationInfo, workgroupSizes,
                                        verifySPIRVBaseVectorizePassPipeline);
   case CodeGenPipeline::SPIRVMatmulPromoteVectorize:
     return verifyLoweringConfiguration(
-        moduleOp, translationInfo, workgroupSizes,
+        funcOp, translationInfo, workgroupSizes,
         verifySPIRVMatmulPromoteVectorizePassPipeline);
   case CodeGenPipeline::SPIRVCooperativeMatrixVectorize:
     return verifyLoweringConfiguration(
-        moduleOp, translationInfo, workgroupSizes,
+        funcOp, translationInfo, workgroupSizes,
         verifySPIRVCooperativeMatrixVectorizePassPipeline);
   default:
     break;
@@ -118,33 +88,23 @@ verifyEntryPoint(ModuleOp moduleOp,
 }
 
 void SPIRVSelectLoweringStrategyPass::runOnOperation() {
-  IREE::HAL::ExecutableVariantOp variantOp = getOperation();
-  ModuleOp moduleOp = variantOp.getInnerModule();
+  auto moduleOp = getOperation();
+  for (auto funcOp : moduleOp.getOps<FunctionOpInterface>()) {
+    if (failed(initSPIRVLaunchConfig(funcOp))) {
+      funcOp.emitOpError("failed to set lowering configuration");
+      return signalPassFailure();
+    }
 
-  if (failed(initSPIRVLaunchConfig(moduleOp))) {
-    return signalPassFailure();
-  }
+    auto translationInfo = getTranslationInfo(funcOp);
+    if (!translationInfo) {
+      continue;
+    }
 
-  std::optional<IREE::Codegen::TranslationInfoAttr> translationInfo =
-      getIdenticalTranslationInfo(variantOp);
-  if (!translationInfo) {
-    moduleOp.emitOpError(
-        "unhandled compilation of entry point functions with different "
-        "translation info");
-    return signalPassFailure();
-  }
-
-  // Verify the properties of each entry point based on the target pipeline.
-  for (auto exportOp : variantOp.getExportOps()) {
-    if (failed(verifyEntryPoint(moduleOp, translationInfo.value(), exportOp))) {
+    // Verify the properties of each entry point based on the target pipeline.
+    if (failed(verifyTranslationInfo(funcOp, translationInfo))) {
       return signalPassFailure();
     }
   }
-}
-
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableVariantOp>>
-createSPIRVSelectLoweringStrategyPass() {
-  return std::make_unique<SPIRVSelectLoweringStrategyPass>();
 }
 
 } // namespace mlir::iree_compiler

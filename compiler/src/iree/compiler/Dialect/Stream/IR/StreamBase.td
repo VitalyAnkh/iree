@@ -474,7 +474,7 @@ def Stream_LifetimeAttr :
 }
 
 def Stream_AnyResource : Type<
-    CPred<"$_self.isa<IREE::Stream::ResourceType>()">,
+    CPred<"mlir::isa<IREE::Stream::ResourceType>($_self)">,
     "any stream-compatible type">;
 
 // TODO(benvanik): support other types; the interface may be enough.
@@ -504,6 +504,7 @@ def Stream_Channel : TypeDef<Stream_Dialect, "Channel", [
 }
 
 def Stream_Resource : TypeDef<Stream_Dialect, "Resource", [
+  Stream_AffinityType,
   Util_ReferenceType,
   Util_SizeAwareType,
   DeclareTypeInterfaceMethods<Util_GlobalType, [
@@ -550,32 +551,32 @@ def Stream_Resource : TypeDef<Stream_Dialect, "Resource", [
 }
 
 def Stream_ResourceLifetimeUnknown : CPred<[{
-  $_self.cast<IREE::Stream::ResourceType>().getLifetime() ==
+  mlir::cast<IREE::Stream::ResourceType>($_self).getLifetime() ==
       IREE::Stream::Lifetime::Unknown
 }]>;
 def Stream_ResourceLifetimeExternal : CPred<[{
-  $_self.cast<IREE::Stream::ResourceType>().getLifetime() ==
+  mlir::cast<IREE::Stream::ResourceType>($_self).getLifetime() ==
       IREE::Stream::Lifetime::External
 }]>;
 def Stream_ResourceLifetimeStaging : CPred<[{
-  $_self.cast<IREE::Stream::ResourceType>().getLifetime() ==
+  mlir::cast<IREE::Stream::ResourceType>($_self).getLifetime() ==
       IREE::Stream::Lifetime::Staging
 }]>;
 def Stream_ResourceLifetimeTransient : CPred<[{
-  $_self.cast<IREE::Stream::ResourceType>().getLifetime() ==
+  mlir::cast<IREE::Stream::ResourceType>($_self).getLifetime() ==
       IREE::Stream::Lifetime::Transient
 }]>;
 def Stream_ResourceLifetimeVariable : CPred<[{
-  $_self.cast<IREE::Stream::ResourceType>().getLifetime() ==
+  mlir::cast<IREE::Stream::ResourceType>($_self).getLifetime() ==
       IREE::Stream::Lifetime::Variable
 }]>;
 def Stream_ResourceLifetimeConstant : CPred<[{
-  $_self.cast<IREE::Stream::ResourceType>().getLifetime() ==
+  mlir::cast<IREE::Stream::ResourceType>($_self).getLifetime() ==
       IREE::Stream::Lifetime::Constant
 }]>;
 
 def Stream_UnknownResource : DialectType<Stream_Dialect, And<[
-  CPred<"$_self.isa<IREE::Stream::ResourceType>()">,
+  CPred<"mlir::isa<IREE::Stream::ResourceType>($_self)">,
   Stream_ResourceLifetimeUnknown,
 ]>, "resource"> {
   let description = [{
@@ -584,7 +585,7 @@ def Stream_UnknownResource : DialectType<Stream_Dialect, And<[
 }
 
 def Stream_ExternalResource : DialectType<Stream_Dialect, And<[
-  CPred<"$_self.isa<IREE::Stream::ResourceType>()">,
+  CPred<"mlir::isa<IREE::Stream::ResourceType>($_self)">,
   Stream_ResourceLifetimeExternal,
 ]>, "external resource"> {
   let description = [{
@@ -601,7 +602,7 @@ def Stream_ExternalResource : DialectType<Stream_Dialect, And<[
 }
 
 def Stream_StagingResource : DialectType<Stream_Dialect, And<[
-  CPred<"$_self.isa<IREE::Stream::ResourceType>()">,
+  CPred<"mlir::isa<IREE::Stream::ResourceType>($_self)">,
   Stream_ResourceLifetimeStaging,
 ]>, "staging resource"> {
   let description = [{
@@ -613,7 +614,7 @@ def Stream_StagingResource : DialectType<Stream_Dialect, And<[
 }
 
 def Stream_TransientResource : DialectType<Stream_Dialect, And<[
-  CPred<"$_self.isa<IREE::Stream::ResourceType>()">,
+  CPred<"mlir::isa<IREE::Stream::ResourceType>($_self)">,
   Stream_ResourceLifetimeTransient,
 ]>, "transient resource"> {
   let description = [{
@@ -629,7 +630,7 @@ def Stream_TransientResource : DialectType<Stream_Dialect, And<[
 }
 
 def Stream_VariableResource : DialectType<Stream_Dialect, And<[
-  CPred<"$_self.isa<IREE::Stream::ResourceType>()">,
+  CPred<"mlir::isa<IREE::Stream::ResourceType>($_self)">,
   Stream_ResourceLifetimeVariable,
 ]>, "variable resource"> {
   let description = [{
@@ -645,7 +646,7 @@ def Stream_VariableResource : DialectType<Stream_Dialect, And<[
 }
 
 def Stream_ConstantResource : DialectType<Stream_Dialect, And<[
-  CPred<"$_self.isa<IREE::Stream::ResourceType>()">,
+  CPred<"mlir::isa<IREE::Stream::ResourceType>($_self)">,
   Stream_ResourceLifetimeConstant,
 ]>, "constant resource"> {
   let description = [{

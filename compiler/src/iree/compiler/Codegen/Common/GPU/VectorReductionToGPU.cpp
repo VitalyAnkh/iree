@@ -4,8 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/Common/GPU/PassDetail.h"
 #include "iree/compiler/Codegen/Common/GPU/Passes.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -15,6 +15,8 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
 #include "mlir/Dialect/Vector/Transforms/VectorDistribution.h"
+#include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -22,10 +24,14 @@
 
 namespace mlir::iree_compiler {
 
-void debugPrint(func::FuncOp funcOp, const char *message) {
+#define GEN_PASS_DEF_VECTORREDUCTIONTOGPUPASS
+#include "iree/compiler/Codegen/Common/GPU/Passes.h.inc"
+
+namespace {
+static void debugPrint(Operation *op, const char *message) {
   LLVM_DEBUG({
     llvm::dbgs() << "//--- " << message << " ---//\n";
-    funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
+    op->print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
     llvm::dbgs() << "\n\n";
   });
 }
@@ -33,7 +39,7 @@ void debugPrint(func::FuncOp funcOp, const char *message) {
 /// Emit shared local memory allocation in case it is needed when lowering the
 /// warp operations.
 static Value allocateGlobalSharedMemory(Location loc, OpBuilder &builder,
-                                        vector::WarpExecuteOnLane0Op warpOp,
+                                        gpu::WarpExecuteOnLane0Op warpOp,
                                         Type type) {
   MemRefType memrefType;
   auto addressSpaceAttr = gpu::AddressSpaceAttr::get(
@@ -77,8 +83,7 @@ static bool isUniformLoad(Operation *op) {
 
 /// Hoist uniform operations as well as special hal operations that have side
 /// effect but are safe to move out of the warp single lane region.
-static void
-moveScalarAndBindingUniformCode(vector::WarpExecuteOnLane0Op warpOp) {
+static void moveScalarAndBindingUniformCode(gpu::WarpExecuteOnLane0Op warpOp) {
   /// Hoist ops without side effect as well as special binding ops.
   auto canBeHoisted = [](Operation *op,
                          function_ref<bool(Value)> definedOutside) {
@@ -133,16 +138,12 @@ moveScalarAndBindingUniformCode(vector::WarpExecuteOnLane0Op warpOp) {
     op->moveBefore(warpOp);
 }
 
-namespace {
+/// Pattern to convert single element vector.insert to broadcast, this is a
+/// workaround until MultiDimReduction distribution is supported.
+struct InsertToBroadcast final : OpRewritePattern<vector::InsertOp> {
+  using OpRewritePattern::OpRewritePattern;
 
-/// Pattern to convert InsertElement to broadcast, this is a workaround until
-/// MultiDimReduction distribution is supported.
-class InsertElementToBroadcast final
-    : public OpRewritePattern<vector::InsertElementOp> {
-public:
-  using OpRewritePattern<vector::InsertElementOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(vector::InsertElementOp insertOp,
+  LogicalResult matchAndRewrite(vector::InsertOp insertOp,
                                 PatternRewriter &rewriter) const override {
     if (insertOp.getDestVectorType().getNumElements() != 1)
       return failure();
@@ -153,12 +154,12 @@ public:
 };
 
 /// Pattern to sink `gpu.barrier` ops out of a `warp_execute_on_lane_0` op.
-class WarpOpBarrier : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
-  using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
+struct WarpOpBarrier final : OpRewritePattern<gpu::WarpExecuteOnLane0Op> {
+  using OpRewritePattern<gpu::WarpExecuteOnLane0Op>::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+  LogicalResult matchAndRewrite(gpu::WarpExecuteOnLane0Op warpOp,
                                 PatternRewriter &rewriter) const override {
-    auto yield = cast<vector::YieldOp>(
+    auto yield = cast<gpu::YieldOp>(
         warpOp.getBodyRegion().getBlocks().begin()->getTerminator());
     Operation *lastNode = yield->getPrevNode();
     auto barrierOp = dyn_cast_or_null<gpu::BarrierOp>(lastNode);
@@ -188,22 +189,13 @@ static Value simpleWarpShuffleFunction(Location loc, OpBuilder &builder,
   return result;
 }
 
-class VectorReductionToGPUPass
-    : public VectorReductionToGPUBase<VectorReductionToGPUPass> {
-public:
-  explicit VectorReductionToGPUPass(
-      bool expandSubgroupReduction,
-      std::function<int(func::FuncOp)> getWarpSize)
-      : expandSubgroupReduction(expandSubgroupReduction),
-        getWarpSize(getWarpSize) {}
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<scf::SCFDialect, memref::MemRefDialect, gpu::GPUDialect,
-                    affine::AffineDialect>();
-  }
+struct VectorReductionToGPUPass final
+    : impl::VectorReductionToGPUPassBase<VectorReductionToGPUPass> {
+  VectorReductionToGPUPass(bool expandSubgroupReduction)
+      : expandSubgroupReduction(expandSubgroupReduction) {}
 
   void runOnOperation() override {
-    func::FuncOp funcOp = getOperation();
+    FunctionOpInterface funcOp = getOperation();
     MLIRContext *ctx = &getContext();
 
     debugPrint(funcOp, "after step #0: before vector reduction to gpu");
@@ -215,18 +207,23 @@ public:
       vector::populateVectorMultiReductionLoweringPatterns(
           patterns, vector::VectorMultiReductionLowering::InnerReduction);
       // Add clean up patterns after lowering of multidimreduce lowering.
-      patterns.add<InsertElementToBroadcast>(ctx);
+      patterns.add<InsertToBroadcast>(ctx);
       vector::ShapeCastOp::getCanonicalizationPatterns(patterns, ctx);
       vector::BroadcastOp::getCanonicalizationPatterns(patterns, ctx);
       vector::ExtractOp::getCanonicalizationPatterns(patterns, ctx);
-      (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+      (void)applyPatternsGreedily(getOperation(), std::move(patterns));
     }
 
     debugPrint(funcOp, "after step #1: preprocessing reduction ops");
 
-    auto workgroupSize = llvm::map_to_vector(
-        getEntryPoint(funcOp)->getWorkgroupSize().value(),
-        [&](Attribute attr) { return llvm::cast<IntegerAttr>(attr).getInt(); });
+    std::optional<SmallVector<int64_t>> maybeWorkgroupSize =
+        getWorkgroupSize(funcOp);
+    if (!maybeWorkgroupSize) {
+      funcOp->emitOpError(
+          "expected workgroup size to be set as part of `translation_info`");
+      return signalPassFailure();
+    }
+    SmallVector<int64_t> &workgroupSize = maybeWorkgroupSize.value();
     assert(workgroupSize[1] == 1 && workgroupSize[2] == 1);
     // 2. Create the warp op and move the function body into it.
     const int groupSize = workgroupSize[0];
@@ -235,7 +232,7 @@ public:
     auto threadX = builder.create<gpu::ThreadIdOp>(loc, builder.getIndexType(),
                                                    gpu::Dimension::x);
     auto cstGroupSize = builder.create<arith::ConstantIndexOp>(loc, groupSize);
-    auto warpOp = builder.create<vector::WarpExecuteOnLane0Op>(
+    auto warpOp = builder.create<gpu::WarpExecuteOnLane0Op>(
         loc, TypeRange(), threadX.getResult(), groupSize);
     warpOp.getWarpRegion().takeBody(funcOp.getFunctionBody());
     Block &newBlock = funcOp.getFunctionBody().emplaceBlock();
@@ -245,7 +242,7 @@ public:
     warpOp.getWarpRegion().getBlocks().back().back().moveBefore(&newBlock,
                                                                 newBlock.end());
     builder.setInsertionPointToEnd(&warpOp.getWarpRegion().getBlocks().back());
-    builder.create<vector::YieldOp>(loc);
+    builder.create<gpu::YieldOp>(loc);
 
     debugPrint(funcOp, "after step #2: wrapping code with the warp execute op");
 
@@ -257,33 +254,41 @@ public:
     // 4. Distribute transfer write operations and propagate vector
     // distribution.
     {
-      int warpSize = this->getWarpSize ? this->getWarpSize(funcOp) : 32;
+      std::optional<int> subgroupSize = getGPUSubgroupSize(funcOp);
+      if (!subgroupSize) {
+        funcOp->emitOpError("missing subgroup size");
+        return signalPassFailure();
+      }
       auto groupReductionFn = [=](Location loc, OpBuilder &builder, Value input,
                                   vector::CombiningKind kind,
                                   uint32_t size) -> Value {
-        return emitGPUGroupReduction(loc, builder, input, kind, size, warpSize,
-                                     expandSubgroupReduction);
+        return emitGPUGroupReduction(loc, builder, input, kind, size,
+                                     *subgroupSize, expandSubgroupReduction);
       };
       auto distributionFn = [](Value val) {
         auto vecType = llvm::dyn_cast<VectorType>(val.getType());
         if (!vecType)
           return AffineMap::get(val.getContext());
-        // Create a map (d0, d1) -> (d1) to distribute along the inner
-        // dimension. Once we support n-d distribution we can add more
-        // complex cases.
+        // Create an identity dim map of rank |vecRank|. This greedily divides
+        // threads along the outermost vector dimensions to the innermost ones.
         int64_t vecRank = vecType.getRank();
         OpBuilder builder(val.getContext());
-        return AffineMap::get(vecRank, 0,
-                              builder.getAffineDimExpr(vecRank - 1));
+        return builder.getMultiDimIdentityMap(vecRank);
       };
+
       RewritePatternSet patterns(ctx);
       vector::populatePropagateWarpVectorDistributionPatterns(
           patterns, distributionFn, simpleWarpShuffleFunction);
       vector::populateDistributeReduction(patterns, groupReductionFn);
-      vector::populateDistributeTransferWriteOpPatterns(patterns,
-                                                        distributionFn);
+
+      // We don't want to sink large transfer writes to a single lane -- pick a
+      // conservative value based on the group size.
+      unsigned maxWriteElementsToExtract = std::max(groupSize / 4, 1);
+      vector::populateDistributeTransferWriteOpPatterns(
+          patterns, distributionFn, maxWriteElementsToExtract);
       patterns.add<WarpOpBarrier>(patterns.getContext(), 3);
-      (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+      vector::ReductionOp::getCanonicalizationPatterns(patterns, ctx);
+      (void)applyPatternsGreedily(getOperation(), std::move(patterns));
     }
 
     debugPrint(funcOp, "after step #4: propagating distribution");
@@ -294,11 +299,11 @@ public:
       vector::WarpExecuteOnLane0LoweringOptions options;
       options.warpAllocationFn = allocateGlobalSharedMemory;
       options.warpSyncronizationFn = [](Location loc, OpBuilder &builder,
-                                        vector::WarpExecuteOnLane0Op warpOp) {
+                                        gpu::WarpExecuteOnLane0Op warpOp) {
         builder.create<gpu::BarrierOp>(loc);
       };
       vector::populateWarpExecuteOnLane0OpToScfForPattern(patterns, options);
-      (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+      (void)applyPatternsGreedily(getOperation(), std::move(patterns));
     }
 
     debugPrint(funcOp, "after step #5: lowering remaining ops");
@@ -306,17 +311,13 @@ public:
 
 private:
   bool expandSubgroupReduction;
-  std::function<int(func::FuncOp)> getWarpSize;
 };
 
 } // namespace
 
-std::unique_ptr<OperationPass<func::FuncOp>>
-createConvertVectorReductionToGPUPass(
-    bool expandSubgroupReduction,
-    std::function<int(func::FuncOp)> getWarpSize) {
-  return std::make_unique<VectorReductionToGPUPass>(expandSubgroupReduction,
-                                                    getWarpSize);
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
+createConvertVectorReductionToGPUPass(bool expandSubgroupReduction) {
+  return std::make_unique<VectorReductionToGPUPass>(expandSubgroupReduction);
 }
 
 } // namespace mlir::iree_compiler

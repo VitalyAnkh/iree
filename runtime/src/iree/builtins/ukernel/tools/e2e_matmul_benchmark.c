@@ -10,8 +10,10 @@
 #include "iree/base/internal/flags.h"
 #include "iree/builtins/ukernel/api.h"
 #include "iree/builtins/ukernel/mmt4d_internal.h"
+#include "iree/builtins/ukernel/pack_internal.h"
 #include "iree/builtins/ukernel/tools/benchmark.h"
 #include "iree/builtins/ukernel/tools/util.h"
+#include "iree/builtins/ukernel/unpack_internal.h"
 
 IREE_FLAG(string, type, "f32f32f32",
           "Element types triple (LHS, RHS, OUT). Valid values include: "
@@ -174,13 +176,13 @@ static void iree_uk_e2e_matmul(
     const iree_uk_pack_params_t* pack_out_params,
     const iree_uk_mmt4d_params_t* mmt4d_params,
     const iree_uk_unpack_params_t* unpack_out_params) {
-  iree_uk_pack(pack_lhs_params);
-  iree_uk_pack(pack_rhs_params);
+  iree_uk_pack_p(pack_lhs_params);
+  iree_uk_pack_p(pack_rhs_params);
   if (mmt4d_params->flags & IREE_UK_FLAG_MMT4D_ACCUMULATE) {
-    iree_uk_pack(pack_out_params);
+    iree_uk_pack_p(pack_out_params);
   }
-  iree_uk_mmt4d(mmt4d_params);
-  iree_uk_unpack(unpack_out_params);
+  iree_uk_mmt4d_p(mmt4d_params);
+  iree_uk_unpack_p(unpack_out_params);
 }
 
 static iree_status_t iree_uk_benchmark_e2e_matmul(
@@ -227,7 +229,9 @@ static iree_status_t iree_uk_benchmark_e2e_matmul(
       .out_size2 = M0,
       .out_size3 = K0,
       .in_stride0 = params->K,
+      .in_stride1 = 1,
       .out_stride0 = mmt4d_params.lhs_stride0,
+      .out_stride1 = M0 * K0,
       .padding_value = 0,
   };
 
@@ -243,7 +247,9 @@ static iree_status_t iree_uk_benchmark_e2e_matmul(
       .out_size2 = N0,
       .out_size3 = K0,
       .in_stride0 = params->N,
+      .in_stride1 = 1,
       .out_stride0 = mmt4d_params.rhs_stride0,
+      .out_stride1 = N0 * K0,
       .padding_value = 0,
   };
 
@@ -257,7 +263,9 @@ static iree_status_t iree_uk_benchmark_e2e_matmul(
       .out_size2 = M0,
       .out_size3 = N0,
       .in_stride0 = params->N,
+      .in_stride1 = 1,
       .out_stride0 = mmt4d_params.out_stride0,
+      .out_stride1 = M0 * N0,
       .padding_value = 0,
   };
 
@@ -271,7 +279,9 @@ static iree_status_t iree_uk_benchmark_e2e_matmul(
       .in_size2 = M0,
       .in_size3 = N0,
       .out_stride0 = params->N,
+      .out_stride1 = 1,
       .in_stride0 = mmt4d_params.out_stride0,
+      .in_stride1 = M0 * N0,
   };
 
   iree_uk_index_t rowmajor_lhs_buffer_size =
@@ -389,6 +399,7 @@ static void iree_uk_benchmark_register_e2e_matmul(const char* type_str, int M,
   char name[128];
   snprintf(name, sizeof name, "e2e_matmul_%s_%dx%dx%d", type_str, M, K, N);
   iree_uk_uint32_t mmt4d_flags = iree_uk_mmt4d_parse_type_into_flag(type_str);
+  mmt4d_flags |= IREE_UK_FLAG_MMT4D_ALLOW_GENERIC_FALLBACK_TILE_FUNCTION;
   if (accumulate) mmt4d_flags |= IREE_UK_FLAG_MMT4D_ACCUMULATE;
   iree_uk_benchmark_e2e_matmul_params_t params = {
       .mmt4d_flags = mmt4d_flags, .M = M, .K = K, .N = N};

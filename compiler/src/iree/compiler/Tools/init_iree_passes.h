@@ -14,21 +14,23 @@
 
 #include <cstdlib>
 
-#include "iree-dialects/Dialect/LinalgExt/Passes/Passes.h"
 #include "iree/compiler/Bindings/Native/Transforms/Passes.h"
 #include "iree/compiler/Bindings/TFLite/Transforms/Passes.h"
 #include "iree/compiler/ConstEval/Passes.h"
 #include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
 #include "iree/compiler/Dialect/HAL/Transforms/Passes.h"
+#include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Stream/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
 #include "iree/compiler/Dialect/VM/Analysis/TestPasses.h"
 #include "iree/compiler/Dialect/VM/Transforms/Passes.h"
 #include "iree/compiler/Dialect/VMVX/Transforms/Passes.h"
+#include "iree/compiler/DispatchCreation/Passes.h"
 #include "iree/compiler/GlobalOptimization/Passes.h"
 #include "iree/compiler/InputConversion/Common/Passes.h"
 #include "iree/compiler/Modules/HAL/Inline/Transforms/Passes.h"
 #include "iree/compiler/Modules/HAL/Loader/Transforms/Passes.h"
+#include "iree/compiler/Modules/IO/Parameters/Transforms/Passes.h"
 #include "iree/compiler/Pipelines/Pipelines.h"
 #include "iree/compiler/Preprocessing/Passes.h"
 
@@ -47,20 +49,22 @@ inline void registerAllIreePasses() {
   IREE::TFLite::registerPasses();
   IREE::TFLite::registerTransformPassPipeline();
 
-  registerCommonInputConversionPasses();
+  InputConversion::registerCommonInputConversionPasses();
   ConstEval::registerConstEvalPasses();
   GlobalOptimization::registerGlobalOptimizationPipeline();
+  DispatchCreation::registerDispatchCreationPipelines();
   Preprocessing::registerPreprocessingPasses();
+  DispatchCreation::registerDispatchCreationPasses();
   IREE::Flow::registerFlowPasses();
   IREE::HAL::registerHALPasses();
   IREE::HAL::Inline::registerHALInlinePasses();
   IREE::HAL::Loader::registerHALLoaderPasses();
+  IREE::IO::Parameters::registerParametersPasses();
   IREE::LinalgExt::registerPasses();
   IREE::Stream::registerStreamPasses();
   IREE::Util::registerTransformPasses();
   IREE::VM::registerVMPasses();
   IREE::VM::registerVMAnalysisTestPasses();
-  IREE::VM::registerVMTestPasses();
   IREE::VMVX::registerVMVXPasses();
   registerIREEVMTransformPassPipeline();
 

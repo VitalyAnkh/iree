@@ -7,9 +7,7 @@
 #include "iree/compiler/Dialect/Stream/IR/StreamDialect.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamTypes.h"
-#include "iree/compiler/Dialect/Stream/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Stream/Transforms/Passes.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -18,6 +16,10 @@
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::iree_compiler::IREE::Stream {
+
+#define GEN_PASS_DEF_VERIFYASYNCACCESSRANGESPASS
+#include "iree/compiler/Dialect/Stream/Transforms/Passes.h.inc"
+
 namespace {
 
 static std::optional<int64_t> matchConstant(Value value) {
@@ -106,13 +108,13 @@ verifyAsyncAccessOp(IREE::Stream::AsyncAccessOpInterface accessOp) {
   return success(allSucceeded);
 }
 
-class VerifyAsyncAccessRangesPass
-    : public VerifyAsyncAccessRangesBase<VerifyAsyncAccessRangesPass> {
-public:
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<IREE::Stream::StreamDialect>();
-  }
+//===----------------------------------------------------------------------===//
+// --iree-stream-verify-async-access-ranges
+//===----------------------------------------------------------------------===//
 
+struct VerifyAsyncAccessRangesPass
+    : public IREE::Stream::impl::VerifyAsyncAccessRangesPassBase<
+          VerifyAsyncAccessRangesPass> {
   void runOnOperation() override {
     auto moduleOp = getOperation();
     // TODO(benvanik): do whole-program data flow analysis to get bounded sizes
@@ -130,10 +132,5 @@ public:
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createVerifyAsyncAccessRangesPass() {
-  return std::make_unique<VerifyAsyncAccessRangesPass>();
-}
 
 } // namespace mlir::iree_compiler::IREE::Stream

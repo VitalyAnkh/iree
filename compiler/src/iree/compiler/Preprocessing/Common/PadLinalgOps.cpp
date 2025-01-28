@@ -4,7 +4,6 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Preprocessing/Common/PassDetail.h"
 #include "iree/compiler/Preprocessing/Common/Passes.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -15,6 +14,9 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler::Preprocessing {
+
+#define GEN_PASS_DEF_PADLINALGOPSPASS
+#include "iree/compiler/Preprocessing/Common/Passes.h.inc" // IWYU pragma: export
 
 namespace {
 /// A pattern to pad statically shaped matmul operands to the next integer
@@ -153,26 +155,22 @@ private:
   int paddingSize;
 };
 
-class PadLinalgOpsPass : public PadLinalgOpsBase<PadLinalgOpsPass> {
+class PadLinalgOpsPass
+    : public iree_compiler::Preprocessing::impl::PadLinalgOpsPassBase<
+          PadLinalgOpsPass> {
 public:
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<linalg::LinalgDialect>();
-  }
+  using iree_compiler::Preprocessing::impl::PadLinalgOpsPassBase<
+      PadLinalgOpsPass>::PadLinalgOpsPassBase;
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     patterns.insert<PadMatmulOp>(context, paddingSize);
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
   }
 };
 
 } // namespace
-
-std::unique_ptr<Pass> createPadLinalgOpsToIntegerMultiplePass() {
-  return std::make_unique<PadLinalgOpsPass>();
-}
 
 } // namespace mlir::iree_compiler::Preprocessing

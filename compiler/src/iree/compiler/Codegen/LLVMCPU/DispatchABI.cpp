@@ -13,7 +13,6 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Path.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 
@@ -73,7 +72,7 @@ static unsigned getDITypeSizeInBits(LLVM::DITypeAttr typeAttr) {
 }
 
 ExecutableLibraryDI::ExecutableLibraryDI(const LLVMTypeConverter *typeConverter)
-    : typeConverter(typeConverter), builder(&typeConverter->getContext()) {
+    : builder(&typeConverter->getContext()) {
   auto *context = builder.getContext();
   fileAttr = LLVM::DIFileAttr::get(
       context, "runtime/src/iree/hal/local/executable_library.h", ".");
@@ -126,7 +125,8 @@ ExecutableLibraryDI::getConstOf(LLVM::DITypeAttr typeAttr) {
   return LLVM::DIDerivedTypeAttr::get(
       builder.getContext(), llvm::dwarf::DW_TAG_const_type,
       /*name=*/nullptr, typeAttr, /*sizeInBits=*/0, /*alignInBits=*/0,
-      /*offsetInBits=*/0);
+      /*offsetInBits=*/0, /*dwarfAddressSpace=*/std::nullopt,
+      /*extraData=*/nullptr);
 }
 
 LLVM::DIDerivedTypeAttr
@@ -135,7 +135,9 @@ ExecutableLibraryDI::getPtrOf(LLVM::DITypeAttr typeAttr) {
       builder.getContext(), llvm::dwarf::DW_TAG_pointer_type,
       /*name=*/nullptr, typeAttr, /*sizeInBits=*/ptrBitwidth,
       /*alignInBits=*/0,
-      /*offsetInBits=*/0);
+      /*offsetInBits=*/0,
+      /*dwarfAddressSpace=*/std::nullopt,
+      /*extraData=*/nullptr);
 }
 
 LLVM::DICompositeTypeAttr
@@ -152,7 +154,9 @@ ExecutableLibraryDI::getArrayOf(LLVM::DITypeAttr typeAttr, int64_t count) {
               builder.getContext(), builder.getI64IntegerAttr(count),
               /*lowerBound=*/nullptr, /*upperBound=*/nullptr,
               /*stride=*/nullptr),
-      });
+      },
+      /*dataLocation=*/nullptr, /*rank=*/nullptr, /*allocated=*/nullptr,
+      /*associated=*/nullptr);
 }
 
 LLVM::DIDerivedTypeAttr
@@ -160,7 +164,8 @@ ExecutableLibraryDI::getTypedefOf(StringRef name, LLVM::DITypeAttr typeAttr) {
   return LLVM::DIDerivedTypeAttr::get(
       builder.getContext(), llvm::dwarf::DW_TAG_typedef,
       builder.getStringAttr(name), typeAttr, /*sizeInBits=*/0,
-      /*alignInBits=*/0, /*offsetInBits=*/0);
+      /*alignInBits=*/0, /*offsetInBits=*/0, /*dwarfAddressSpace=*/std::nullopt,
+      /*extraData=*/nullptr);
 }
 
 LLVM::DIDerivedTypeAttr
@@ -173,7 +178,8 @@ ExecutableLibraryDI::getMemberOf(StringRef name, LLVM::DITypeAttr typeAttr,
       builder.getContext(), llvm::dwarf::DW_TAG_member,
       builder.getStringAttr(name), typeAttr,
       /*sizeInBits=*/memberSizeInBits, /*alignInBits=*/0,
-      /*offsetInBits=*/memberOffsetInBits);
+      /*offsetInBits=*/memberOffsetInBits, /*dwarfAddressSpace=*/std::nullopt,
+      /*extraData=*/nullptr);
 }
 
 LLVM::DITypeAttr ExecutableLibraryDI::getBasicType(Type type) {
@@ -222,7 +228,9 @@ LLVM::DICompositeTypeAttr ExecutableLibraryDI::getProcessorV0T() {
       /*alignInBits=*/0,
       {
           getMemberOf("data", getArrayOf(getUint64T(), 8), &offsetInBits),
-      });
+      },
+      /*dataLocation=*/nullptr, /*rank=*/nullptr, /*allocated=*/nullptr,
+      /*associated=*/nullptr);
 }
 
 LLVM::DIDerivedTypeAttr ExecutableLibraryDI::getEnvironmentV0T() {
@@ -247,7 +255,10 @@ LLVM::DIDerivedTypeAttr ExecutableLibraryDI::getEnvironmentV0T() {
                           getPtrOf(getPtrOf(getConstOf(getVoidPtr()))),
                           &offsetInBits),
               getMemberOf("processor", getProcessorV0T(), &offsetInBits),
-          }));
+          },
+          /*dataLocation=*/nullptr,
+          /*rank=*/nullptr, /*allocated=*/nullptr,
+          /*associated=*/nullptr));
 }
 
 LLVM::DIDerivedTypeAttr ExecutableLibraryDI::getDispatchStateV0T() {
@@ -264,13 +275,13 @@ LLVM::DIDerivedTypeAttr ExecutableLibraryDI::getDispatchStateV0T() {
               getMemberOf("workgroup_size_x", getUint32T(), &offsetInBits),
               getMemberOf("workgroup_size_y", getUint32T(), &offsetInBits),
               getMemberOf("workgroup_size_z", getUint16T(), &offsetInBits),
-              getMemberOf("push_constant_count", getUint16T(), &offsetInBits),
+              getMemberOf("constant_count", getUint16T(), &offsetInBits),
               getMemberOf("workgroup_count_x", getUint32T(), &offsetInBits),
               getMemberOf("workgroup_count_y", getUint32T(), &offsetInBits),
               getMemberOf("workgroup_count_z", getUint16T(), &offsetInBits),
               getMemberOf("max_concurrency", getUint8T(), &offsetInBits),
               getMemberOf("binding_count", getUint8T(), &offsetInBits),
-              getMemberOf("push_constants",
+              getMemberOf("constants",
                           getPtrOf(getConstOf(getArrayOf(getUint32T(), 64))),
                           &offsetInBits),
               getMemberOf(
@@ -280,7 +291,9 @@ LLVM::DIDerivedTypeAttr ExecutableLibraryDI::getDispatchStateV0T() {
               getMemberOf("binding_lengths",
                           getPtrOf(getConstOf(getArrayOf(getSizeT(), 64))),
                           &offsetInBits),
-          }));
+          },
+          /*dataLocation=*/nullptr, /*rank=*/nullptr, /*allocated=*/nullptr,
+          /*associated=*/nullptr));
 }
 
 LLVM::DIDerivedTypeAttr ExecutableLibraryDI::getWorkgroupStateV0T() {
@@ -301,7 +314,9 @@ LLVM::DIDerivedTypeAttr ExecutableLibraryDI::getWorkgroupStateV0T() {
               getMemberOf("processor_id", getUint32T(), &offsetInBits),
               getMemberOf("local_memory", getVoidPtr(), &offsetInBits),
               getMemberOf("local_memory_size", getUint32T(), &offsetInBits),
-          }));
+          },
+          /*dataLocation=*/nullptr, /*rank=*/nullptr, /*allocated=*/nullptr,
+          /*associated=*/nullptr));
 }
 
 //------------------------------------------------------------------------------
@@ -394,7 +409,7 @@ HALDispatchABI::getDispatchStateType(MLIRContext *context,
   fieldTypes.push_back(uint32Type);
   fieldTypes.push_back(uint16Type);
 
-  // uint16_t push_constant_count;
+  // uint16_t constant_count;
   fieldTypes.push_back(uint16Type);
 
   // uint32_t workgroup_count_x;
@@ -410,7 +425,7 @@ HALDispatchABI::getDispatchStateType(MLIRContext *context,
   // uint8_t binding_count;
   fieldTypes.push_back(uint8Type);
 
-  // const uint32_t * push_constants;
+  // const uint32_t * constants;
   // void *const * binding_ptrs;
   // const size_t * binding_lengths;
   fieldTypes.push_back(opaquePtrType);
@@ -485,7 +500,8 @@ HALDispatchABI::getInputTypes(MLIRContext *context,
 
 // static
 LLVM::DISubprogramAttr
-HALDispatchABI::buildScopeAttr(mlir::ModuleOp moduleOp, StringRef funcName,
+HALDispatchABI::buildScopeAttr(mlir::ModuleOp moduleOp,
+                               LLVM::LLVMFuncOp llvmFuncOp,
                                const LLVMTypeConverter *typeConverter) {
   auto *context = &typeConverter->getContext();
   Builder builder(context);
@@ -499,9 +515,9 @@ HALDispatchABI::buildScopeAttr(mlir::ModuleOp moduleOp, StringRef funcName,
       LLVM::DIFileAttr::get(context, llvm::sys::path::filename(inputFilePath),
                             llvm::sys::path::parent_path(inputFilePath));
   auto compileUnitAttr = LLVM::DICompileUnitAttr::get(
-      context, llvm::dwarf::DW_LANG_C17, fileAttr,
-      builder.getStringAttr("IREE"), /*isOptimized=*/true,
-      LLVM::DIEmissionKind::Full);
+      DistinctAttr::create(UnitAttr::get(context)), llvm::dwarf::DW_LANG_C17,
+      fileAttr, builder.getStringAttr("IREE"),
+      /*isOptimized=*/true, LLVM::DIEmissionKind::Full);
 
   auto int32TypeAttr =
       LLVM::DIBasicTypeAttr::get(context, llvm::dwarf::DW_TAG_base_type, "int",
@@ -516,13 +532,18 @@ HALDispatchABI::buildScopeAttr(mlir::ModuleOp moduleOp, StringRef funcName,
           di.getPtrOf(di.getConstOf(di.getWorkgroupStateV0T())),
       });
 
-  auto funcNameAttr = builder.getStringAttr(funcName);
+  auto funcNameAttr = builder.getStringAttr(llvmFuncOp.getName());
+  DistinctAttr id;
+  if (!llvmFuncOp.isExternal()) {
+    id = DistinctAttr::create(UnitAttr::get(context));
+  }
   return LLVM::DISubprogramAttr::get(
-      context, compileUnitAttr, fileAttr, funcNameAttr, funcNameAttr, fileAttr,
+      context, id, compileUnitAttr, fileAttr, funcNameAttr, funcNameAttr,
+      fileAttr,
       /*line=*/1,
       /*scopeline=*/1,
       LLVM::DISubprogramFlags::Definition | LLVM::DISubprogramFlags::Optimized,
-      subroutineTypeAttr);
+      subroutineTypeAttr, /*retainedNodes =*/{}, /*annotations =*/{});
 }
 
 // Returns the most local DISubprogramAttr starting from |forOp|.
@@ -585,10 +606,10 @@ static Value buildArgDI(Operation *forOp, int argNum, Value value, Twine name,
   auto scopeAttr = getLocalScopeAttr(forOp);
   builder.create<LLVM::DbgValueOp>(
       loc, value,
-      LLVM::DILocalVariableAttr::get(scopeAttr, builder.getStringAttr(name),
-                                     scopeAttr.getFile(),
-                                     /*line=*/1, /*arg=*/argNum + 1,
-                                     /*alignInBits=*/0, type));
+      LLVM::DILocalVariableAttr::get(
+          scopeAttr, builder.getStringAttr(name), scopeAttr.getFile(),
+          /*line=*/1, /*arg=*/argNum + 1,
+          /*alignInBits=*/0, type, LLVM::DIFlags::Zero));
   return value;
 }
 
@@ -602,10 +623,10 @@ static Value buildValueDI(Operation *forOp, Value value, Twine name,
   auto scopeAttr = getLocalScopeAttr(forOp);
   builder.create<LLVM::DbgValueOp>(
       loc, value,
-      LLVM::DILocalVariableAttr::get(scopeAttr, builder.getStringAttr(name),
-                                     scopeAttr.getFile(),
-                                     /*line=*/1, /*arg=*/0,
-                                     /*alignInBits=*/0, type));
+      LLVM::DILocalVariableAttr::get(
+          scopeAttr, builder.getStringAttr(name), scopeAttr.getFile(),
+          /*line=*/1, /*arg=*/0,
+          /*alignInBits=*/0, type, LLVM::DIFlags::Zero));
   return value;
 }
 
@@ -674,11 +695,11 @@ Value HALDispatchABI::loadWorkgroupLocalMemoryPtr(Operation *forOp,
 Value HALDispatchABI::loadPushConstantCount(Operation *forOp,
                                             OpBuilder &builder) {
   auto countValue =
-      loadFieldValue(forOp, DispatchStateField::push_constant_count, builder);
+      loadFieldValue(forOp, DispatchStateField::constant_count, builder);
   auto resultValue = castValueToType(
       forOp->getLoc(), countValue,
       typeConverter->convertType(builder.getIndexType()), builder);
-  return buildValueDI(forOp, resultValue, "push_constant_count", di.getSizeT(),
+  return buildValueDI(forOp, resultValue, "constant_count", di.getSizeT(),
                       builder);
 }
 
@@ -686,7 +707,7 @@ Value HALDispatchABI::loadPushConstant(Operation *forOp, int64_t offset,
                                        Type resultType, OpBuilder &builder) {
   auto loc = forOp->getLoc();
   auto constantsPtrValue =
-      loadFieldValue(forOp, DispatchStateField::push_constants, builder);
+      loadFieldValue(forOp, DispatchStateField::constants, builder);
   auto pushConstantType = IntegerType::get(context, 32);
   Value constantPtrValue = builder.create<LLVM::GEPOp>(
       loc, constantsPtrValue.getType(), pushConstantType, constantsPtrValue,
@@ -695,8 +716,7 @@ Value HALDispatchABI::loadPushConstant(Operation *forOp, int64_t offset,
       builder.create<LLVM::LoadOp>(loc, pushConstantType, constantPtrValue);
   auto resultValue = castValueToType(loc, constantValue, resultType, builder);
   return buildValueDI(forOp, resultValue,
-                      StringRef("push_constant[") + std::to_string(offset) +
-                          "]",
+                      StringRef("constant[") + std::to_string(offset) + "]",
                       di.getBasicType(resultType), builder);
 }
 
@@ -761,7 +781,7 @@ MemRefDescriptor HALDispatchABI::loadBinding(Operation *forOp, int64_t ordinal,
   // Construct the MemRefDescriptor type based on the information we have.
   // NOTE: we could use the binding length to clamp this/check that the
   // requested range is valid.
-  auto [strides, offset] = getStridesAndOffset(memRefType);
+  auto [strides, offset] = memRefType.getStridesAndOffset();
   if (memRefType.hasStaticShape() &&
       !llvm::any_of(strides, ShapedType::isDynamic) &&
       !ShapedType::isDynamic(offset)) {
@@ -823,12 +843,12 @@ MemRefDescriptor HALDispatchABI::loadBinding(Operation *forOp, int64_t ordinal,
             currentStrideVal = builder.create<LLVM::ConstantOp>(
                 loc, llvmIndexType, currentStrideInt.value());
           } else {
-            currentStrideVal = currentStride.get<Value>();
+            currentStrideVal = cast<Value>(currentStride);
           }
           currentStride =
               builder.create<LLVM::MulOp>(loc, currentStrideVal, dim)
                   .getResult();
-          desc.setStride(builder, loc, i - 1, currentStride.get<Value>());
+          desc.setStride(builder, loc, i - 1, cast<Value>(currentStride));
         } else {
           currentStride = builder.getIndexAttr(strides[i - 1]);
           desc.setConstantStride(builder, loc, i - 1, strides[i - 1]);
@@ -1100,15 +1120,18 @@ Value HALDispatchABI::callImport(Operation *forOp, StringRef importName,
 
   Value nullPtrValue = builder.create<LLVM::ZeroOp>(
       loc, LLVM::LLVMPointerType::get(builder.getContext()));
+  SmallVector<Value> args = {
+      /*thunk_func_ptr=*/thunkPtrValue,
+      /*import_func_ptr=*/importFunc.first,
+      /*params=*/params,
+      /*context=*/importFunc.second,
+      /*reserved=*/nullPtrValue,
+  };
   auto callOp =
-      builder.create<LLVM::CallOp>(loc, TypeRange{builder.getI32Type()},
-                                   ValueRange{
-                                       /*thunk_func_ptr=*/thunkPtrValue,
-                                       /*import_func_ptr=*/importFunc.first,
-                                       /*params=*/params,
-                                       /*context=*/importFunc.second,
-                                       /*reserved=*/nullPtrValue,
-                                   });
+      builder.create<LLVM::CallOp>(loc, TypeRange{builder.getI32Type()}, args);
+  callOp.getProperties().operandSegmentSizes = {
+      static_cast<int32_t>(args.size()), 0};
+  callOp.getProperties().op_bundle_sizes = builder.getDenseI32ArrayAttr({});
   return callOp.getResult();
 }
 
@@ -1208,9 +1231,6 @@ FailureOr<LLVM::LLVMFunctionType> HALDispatchABI::getABIFunctionType(
     allArgTypes.append(extraFieldsTypes.begin(), extraFieldsTypes.end());
     return LLVM::LLVMFunctionType::get(resultType, allArgTypes);
   }
-  case IREE::HAL::CallingConvention::ParameterStruct:
-    return LLVM::LLVMFunctionType::get(LLVM::LLVMVoidType::get(context),
-                                       LLVM::LLVMPointerType::get(context));
   default:
     llvm_unreachable("unhandled calling convention");
     return failure();
@@ -1279,27 +1299,13 @@ FailureOr<SmallVector<Value>> HALDispatchABI::materializeABI(
   if (cConv == IREE::HAL::CallingConvention::Default) {
     auto callOp = rewriter.create<LLVM::CallOp>(
         loc, abiFunctionType->getReturnTypes(), allArgsList, forOp->getAttrs());
+    callOp.getProperties().operandSegmentSizes = {
+        static_cast<int32_t>(allArgsList.size()), 0};
+    callOp.getProperties().op_bundle_sizes = rewriter.getDenseI32ArrayAttr({});
     return llvm::map_to_vector(callOp.getResults(),
                                [](OpResult v) -> Value { return v; });
   }
 
-  if (cConv == IREE::HAL::CallingConvention::ParameterStruct) {
-    auto [structType, paramsStructPtr] = packIntoParameterStruct(
-        forOp, resultTypes, args, extraFieldVals, rewriter);
-    rewriter.create<LLVM::CallOp>(loc, TypeRange{}, paramsStructPtr,
-                                  forOp->getAttrs());
-    SmallVector<Value> results;
-    if (!resultTypes.empty()) {
-      results.reserve(resultTypes.size());
-      Value structVal =
-          rewriter.create<LLVM::LoadOp>(loc, structType, paramsStructPtr);
-      for (int64_t i = 0, e = resultTypes.size(); i < e; ++i) {
-        results.push_back(
-            rewriter.create<LLVM::ExtractValueOp>(loc, structVal, i));
-      }
-    }
-    return results;
-  }
   return forOp->emitOpError("unhandled calling convention");
 }
 

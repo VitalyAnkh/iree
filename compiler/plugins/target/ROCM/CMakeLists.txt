@@ -28,6 +28,7 @@ iree_cc_library(
   DEPS
     LLVMAMDGPUCodeGen
     LLVMAnalysis
+    LLVMBitWriter
     LLVMCore
     LLVMIRReader
     LLVMLinker
@@ -42,6 +43,7 @@ iree_cc_library(
     MLIRAMDGPUTransforms
     MLIRAMDGPUUtils
     MLIRBuiltinToLLVMIRTranslation
+    MLIRIR
     MLIRLLVMDialect
     MLIRLLVMToLLVMIRTranslation
     MLIRPass
@@ -50,12 +52,24 @@ iree_cc_library(
     MLIRROCDLToLLVMIRTranslation
     MLIRSupport
     MLIRTargetLLVMIRExport
-    iree::compiler::Codegen::Dialect::IREECodegenDialect
+    iree::compiler::Codegen::Common
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::GPU::IR::IREEGPUDialect
+    iree::compiler::Codegen::Dialect::GPU::TargetUtils::KnownTargets
+    iree::compiler::Codegen::Dialect::VectorExt::IR::IREEVectorExtDialect
     iree::compiler::Codegen::LLVMGPU
+    iree::compiler::Codegen::Utils
+    iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::HAL::Target
+    iree::compiler::Dialect::HAL::Utils::ExecutableDebugInfoUtils
+    iree::compiler::Dialect::HAL::Utils::LLVMLinkerUtils
     iree::compiler::PluginAPI
     iree::compiler::Utils
-    iree::schemas::rocm_executable_def_c_fbs
+    iree::compiler::plugins::target::ROCM::builtins::tuning::iree_default_tuning_specs_amdgpu
+    iree::compiler::plugins::target::ROCM::builtins::ukernel::iree_uk_amdgpu_bitcode
+    iree::schemas::amdgpu_executable_def_c_fbs
+    iree::schemas::executable_debug_info_c_fbs
+    iree::schemas::hip_executable_def_c_fbs
   PUBLIC
 )
 
@@ -66,7 +80,7 @@ iree_cc_library(
 # there. We default to downloading as it is a better use experience
 # by default.
 # See: https://github.com/shark-infra/amdgpu-device-libs
-set(_amd_required_libs "ocml.bc" "ockl.bc" "opencl.bc")
+set(_amd_required_libs "ocml.bc" "ockl.bc")
 set(_amd_device_bc_url
     "https://github.com/shark-infra/amdgpu-device-libs/releases/download/v20231101/amdgpu-device-libs-llvm-6086c272a3a59eb0b6b79dcbe00486bf4461856a.tgz")
 set(_amd_device_bc_sha256 "336362416c68fdd8bb80328f65ca7ebaa0c119ea19c95df6df30c832a4df39b9")
@@ -138,8 +152,7 @@ endforeach()
 add_custom_command(
   OUTPUT ${_all_device_bc_files}
   DEPENDS ${_all_device_bc_deps}
-  POST_BUILD
-    ${_all_device_bc_copy_commands}
+  COMMAND ${_all_device_bc_copy_commands}
 )
 add_custom_target(iree_compiler_plugins_target_ROCM_GenDeviceLibs
   DEPENDS
@@ -147,7 +160,7 @@ add_custom_target(iree_compiler_plugins_target_ROCM_GenDeviceLibs
 )
 
 # Ensure that the device libs are built when the compiler dylib is built.
-set_property(GLOBAL APPEND PROPERTY IREE_COMPILER_DYLIB_DEPENDS
+set_property(GLOBAL APPEND PROPERTY IREE_COMPILER_DEPENDS
   iree_compiler_plugins_target_ROCM_GenDeviceLibs)
 
 # Install.

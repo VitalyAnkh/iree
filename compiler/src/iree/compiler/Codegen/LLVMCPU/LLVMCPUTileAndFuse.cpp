@@ -4,7 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/LLVMCPU/PassDetail.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.h"
 #include "iree/compiler/Codegen/LLVMCPU/Passes.h"
 #include "iree/compiler/Codegen/LLVMCPU/Utils.h"
 #include "llvm/Support/CommandLine.h"
@@ -24,6 +25,9 @@
 #define DEBUG_TYPE "iree-llvmcpu-tile-and-fuse"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_LLVMCPUTILEANDFUSEPASS
+#include "iree/compiler/Codegen/LLVMCPU/Passes.h.inc"
 
 namespace {
 
@@ -80,9 +84,12 @@ foldIfGeneratedFromPadding(RewriterBase &rewriter, tensor::PadOp untiledPadOp,
 /// This pass starts with the last TilingInterface operation, tiles the op and
 /// fuses its producers recursively. The `tilingLevel` must be specified. It
 /// picks the `tilingLevel`-th list as tiling sizes from lowering_config.
-struct LLVMCPUTileAndFusePass : LLVMCPUTileAndFuseBase<LLVMCPUTileAndFusePass> {
-  LLVMCPUTileAndFusePass(int64_t tilingLevel = -1) {
-    this->tilingLevel.setValue(tilingLevel);
+struct LLVMCPUTileAndFusePass
+    : impl::LLVMCPUTileAndFusePassBase<LLVMCPUTileAndFusePass> {
+  using impl::LLVMCPUTileAndFusePassBase<
+      LLVMCPUTileAndFusePass>::LLVMCPUTileAndFusePassBase;
+  explicit LLVMCPUTileAndFusePass(int64_t tilingLevel) {
+    this->tilingLevel = tilingLevel;
   }
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, affine::AffineDialect,
@@ -98,8 +105,10 @@ LogicalResult applyTileAndFuse(RewriterBase &rewriter, Operation *rootOp,
                                scf::SCFTilingOptions options) {
   llvm::SmallDenseSet<Operation *> origTiledAndFusedOps;
   collectTiledAndFusedOps(rootOp, origTiledAndFusedOps);
-  auto isIgnoredUser = [&](Operation *user, scf::ForOp outerMostTiledLoop) {
-    return origTiledAndFusedOps.count(user) || isa<tensor::DimOp>(user);
+  auto isIgnoredUser = [&](Operation *user,
+                           LoopLikeOpInterface outerMostTiledLoop) {
+    return origTiledAndFusedOps.count(user) ||
+           isa<tensor::DimOp, IREE::Codegen::UKernelGenericOp>(user);
   };
 
   // The rest of this method is similar to
@@ -111,12 +120,10 @@ LogicalResult applyTileAndFuse(RewriterBase &rewriter, Operation *rootOp,
   SmallVector<OpResult> yieldedValuesToOrigValues;
   SmallVector<Operation *> tiledOps;
   FailureOr<scf::SCFTilingResult> tilingResult =
-      scf::tileUsingSCFForOp(rewriter, cast<TilingInterface>(rootOp), options);
+      scf::tileUsingSCF(rewriter, cast<TilingInterface>(rootOp), options);
   if (failed(tilingResult)) {
     return failure();
   }
-  auto forLoops = llvm::to_vector(llvm::map_range(
-      tilingResult->loops, [](Operation *op) { return cast<scf::ForOp>(op); }));
   yieldedValuesToOrigValues.append(rootOp->result_begin(),
                                    rootOp->result_end());
   // A map from untiled value to scf.for iter_arg. The iter_arg is used for DPS
@@ -135,7 +142,8 @@ LogicalResult applyTileAndFuse(RewriterBase &rewriter, Operation *rootOp,
   } else if (auto dpsOp = dyn_cast<DestinationStyleOpInterface>(rootOp)) {
     for (auto [init, iterArg] : llvm::zip_equal(
              dpsOp.getDpsInits(),
-             cast<scf::ForOp>(forLoops.back()).getRegionIterArgs())) {
+             cast<scf::ForOp>(tilingResult->loops.back().getOperation())
+                 .getRegionIterArgs())) {
       mapToIterArg[init] = iterArg;
     }
   }
@@ -160,10 +168,10 @@ LogicalResult applyTileAndFuse(RewriterBase &rewriter, Operation *rootOp,
 
           if (dpsOp.isDpsInit(&operand) &&
               mapToIterArg.contains(sliceOp.getSource())) {
-            rewriter.startRootUpdate(sliceOp);
+            rewriter.startOpModification(sliceOp);
             sliceOp.getSourceMutable().assign(
                 mapToIterArg[sliceOp.getSource()]);
-            rewriter.finalizeRootUpdate(sliceOp);
+            rewriter.finalizeOpModification(sliceOp);
           }
         }
       };
@@ -175,10 +183,14 @@ LogicalResult applyTileAndFuse(RewriterBase &rewriter, Operation *rootOp,
     // Traverse the slices in BFS fashion.
     tensor::ExtractSliceOp candidateSliceOp = candidates.front();
     candidates.pop_front();
+    if (candidateSliceOp.getSource().getDefiningOp<tensor::PadOp>()) {
+      continue;
+    }
 
     // Materialize the slice of the producer in place.
     std::optional<scf::SCFFuseProducerOfSliceResult> fusedProducer =
-        tileAndFuseProducerOfSlice(rewriter, candidateSliceOp, forLoops);
+        scf::tileAndFuseProducerOfSlice(rewriter, candidateSliceOp,
+                                        tilingResult->loops);
     if (!fusedProducer)
       continue;
 
@@ -186,12 +198,15 @@ LogicalResult applyTileAndFuse(RewriterBase &rewriter, Operation *rootOp,
     // to be yielded from within the tiled loop.
     OpResult untiledProducer = fusedProducer->origProducer;
     if (llvm::any_of(untiledProducer.getUsers(), [&](Operation *user) {
-          return !isIgnoredUser(user, forLoops.front()) &&
-                 !forLoops.front()->isAncestor(user);
+          return !isIgnoredUser(user, tilingResult->loops.front()) &&
+                 !tilingResult->loops.front()->isAncestor(user);
           ;
         })) {
-      yieldReplacementForFusedProducer(rewriter, candidateSliceOp,
-                                       fusedProducer.value(), forLoops);
+      if (failed(scf::yieldReplacementForFusedProducer(
+              rewriter, candidateSliceOp, fusedProducer.value(),
+              tilingResult->loops))) {
+        return failure();
+      }
       yieldedValuesToOrigValues.push_back(untiledProducer);
     }
 
@@ -202,7 +217,7 @@ LogicalResult applyTileAndFuse(RewriterBase &rewriter, Operation *rootOp,
     }
   }
 
-  scf::ForOp outermostLoop = forLoops.front();
+  auto outermostLoop = cast<scf::ForOp>(tilingResult->loops.front());
   for (auto [index, origVal] : llvm::enumerate(yieldedValuesToOrigValues)) {
     Value replacement = outermostLoop.getResult(index);
     rewriter.replaceUsesWithIf(origVal, replacement, [&](OpOperand &use) {
@@ -238,12 +253,14 @@ void LLVMCPUTileAndFusePass::runOnOperation() {
   // fallback to find a lowering_config from other operations.
   SmallVector<int64_t> tileSizes;
   SmallVector<bool> tileScalableFlags;
-  if (auto loweringConfig = getLoweringConfig(consumerOp)) {
+  if (auto loweringConfig =
+          getLoweringConfig<IREE::Codegen::LoweringConfigAttr>(consumerOp)) {
     tileSizes = loweringConfig.getTileSizeVals(tilingLevel);
     tileScalableFlags = loweringConfig.getScalableTileFlagVals(tilingLevel);
   } else {
     FailureOr<IREE::Codegen::LoweringConfigAttr> maybeLoweringConfig =
-        getLoweringConfig(getComputeOps(funcOp));
+        getFirstLoweringConfig<IREE::Codegen::LoweringConfigAttr>(
+            getComputeOps(funcOp));
     if (failed(maybeLoweringConfig)) {
       LLVM_DEBUG(llvm::dbgs()
                  << "can't find lowering_config, skip TileAndFuse");
@@ -279,14 +296,14 @@ void LLVMCPUTileAndFusePass::runOnOperation() {
   // into producers when possible.
   context->getLoadedDialect<tensor::TensorDialect>()
       ->getCanonicalizationPatterns(patterns);
-  if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+  if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
     LLVM_DEBUG(llvm::dbgs() << "----- cleanup failed -----\n");
     return signalPassFailure();
   }
 }
 } // namespace
 
-std::unique_ptr<OperationPass<func::FuncOp>>
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 createLLVMCPUTileAndFusePass(int64_t tilingLevel) {
   return std::make_unique<LLVMCPUTileAndFusePass>(tilingLevel);
 }

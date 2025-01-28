@@ -4,21 +4,36 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#ifndef IREE_COMPILER_DIALECT_HAL_TARGET_ROCM_ROCMTARGETUTILS_H_
-#define IREE_COMPILER_DIALECT_HAL_TARGET_ROCM_ROCMTARGETUTILS_H_
+#ifndef IREE_COMPILER_PLUGINS_TARGET_ROCM_ROCMTARGETUTILS_H_
+#define IREE_COMPILER_PLUGINS_TARGET_ROCM_ROCMTARGETUTILS_H_
 
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Target/TargetMachine.h"
 
 namespace mlir::iree_compiler::IREE::HAL {
 
-// Links LLVM module to ROC Device Library Bit Code
-void linkROCDLIfNecessary(llvm::Module *module, std::string targetChip,
-                          std::string bitCodeDir);
+// Sets HIP platform globals based on the target architecture.
+LogicalResult setHIPGlobals(Location loc, llvm::Module *module,
+                            StringRef targetChip);
 
-// Compiles ISAToHsaco Code
-std::string createHsaco(Location loc, const std::string isa, StringRef name);
+// Links HIP device bitcode if the module uses any symbols from it.
+LogicalResult linkHIPBitcodeIfNeeded(Location loc, llvm::Module *module,
+                                     StringRef targetChip,
+                                     StringRef bitcodePath);
+
+// Links optimized Ukernel module.
+LogicalResult linkUkernelBitcodeFiles(Location loc, llvm::Module *module,
+                                      StringRef enabledUkernelsStr,
+                                      StringRef targetChip,
+                                      StringRef bitcodePath,
+                                      unsigned linkerFlags,
+                                      llvm::TargetMachine &targetMachine);
+
+// Compiles the `isa` to the HSA Code Object format. Returns the object file as
+// a blob.
+std::string createHsaco(Location loc, StringRef isa, StringRef name);
 
 } // namespace mlir::iree_compiler::IREE::HAL
 
-#endif // IREE_COMPILER_DIALECT_HAL_TARGET_ROCM_ROCMTARGETUTILS_H_
+#endif // IREE_COMPILER_PLUGINS_TARGET_ROCM_ROCMTARGETUTILS_H_

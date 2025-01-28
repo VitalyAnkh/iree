@@ -7,15 +7,16 @@
 #include <utility>
 
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
-#include "iree/compiler/Dialect/Flow/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::iree_compiler::IREE::Flow {
+
+#define GEN_PASS_DEF_INJECTDISPATCHTRACINGPASS
+#include "iree/compiler/Dialect/Flow/Transforms/Passes.h.inc"
 
 static SmallVector<Value> filterTensorValues(ValueRange &&range) {
   SmallVector<Value> result;
@@ -26,11 +27,11 @@ static SmallVector<Value> filterTensorValues(ValueRange &&range) {
   return result;
 }
 
-class InjectDispatchTracingPass
-    : public InjectDispatchTracingBase<InjectDispatchTracingPass> {
-public:
-  InjectDispatchTracingPass() = default;
+namespace {
 
+struct InjectDispatchTracingPass
+    : public IREE::Flow::impl::InjectDispatchTracingPassBase<
+          InjectDispatchTracingPass> {
   void runOnOperation() override {
     auto funcOp = getOperation();
     for (auto dispatchOp : funcOp.getFunctionBody().getOps<DispatchOp>()) {
@@ -53,9 +54,6 @@ public:
   }
 };
 
-std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
-createInjectDispatchTracingPass() {
-  return std::make_unique<InjectDispatchTracingPass>();
-}
+} // namespace
 
 } // namespace mlir::iree_compiler::IREE::Flow

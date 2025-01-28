@@ -66,7 +66,7 @@ Use [Git](https://git-scm.com/) to clone the IREE repository and initialize its
 submodules:
 
 ``` shell
-git clone https://github.com/openxla/iree.git
+git clone https://github.com/iree-org/iree.git
 cd iree
 git submodule update --init
 ```
@@ -157,28 +157,70 @@ settings can improve compile and link times substantially.
 
 ### :octicons-gear-16: Optional components
 
+Enabled components and other configurations can be changed via
+[CMake options](../developers/building/cmake-options.md), listed in the root
+[`CMakeLists.txt`](https://github.com/iree-org/iree/blob/main/CMakeLists.txt).
+We also maintain a few
+[CMake presets](https://cmake.org/cmake/help/latest/manual/cmake-presets.7.html)
+at
+[`build_tools/cmake/presets`](https://github.com/iree-org/iree/tree/main/build_tools/cmake/presets)
+for common configurations.
+
 By default, the CMake build includes:
 
-* All compiler targets (`llvm-cpu`, `cuda`, `vulkan-spirv`, etc.)
-* All runtime HAL drivers (`local-task`, `cuda`, `vulkan`, etc.)
-* All compiler input formats (StableHLO, TOSA, etc.)
+* All small to medium size [compiler targets](../developers/building/cmake-options.md#iree_target_backend_)
+  (`llvm-cpu`, `vulkan-spirv`, etc.)
+* All [runtime HAL drivers](../developers/building/cmake-options.md#iree_hal_driver_)
+  (`local-task`, `cuda`, `vulkan`, etc.)
+* All [compiler input formats](../developers/building/cmake-options.md#iree_input_)
+  (PyTorch, StableHLO, TOSA, etc.)
 * All compiler output formats (VM bytecode, C)
 
 The default build does _not_ include:
 
-* Compiler or runtime bindings (Python, TFLite, etc.)
+* CUDA and ROCM/HIP targets
+* Python and other language bindings for the compiler or runtime
 * Advanced features like AddressSanitizer or tracing instrumentation
 * Experimental components
 
-These can be changed via the `IREE_` CMake options listed in the root
-[`CMakeLists.txt`](https://github.com/openxla/iree/blob/main/CMakeLists.txt).
+!!! example "Configuration examples"
+
+    === "Disable all backends except CPU"
+
+        This configure command will
+
+        * Disable all compiler target backends then enable just `llvm-cpu`
+        * Disable all runtime HAL drivers then enable just the CPU "local" runtime
+          HAL drivers
+
+        ``` shell
+        cmake -G Ninja -B ../iree-build/ -S . \
+            -DIREE_TARGET_BACKEND_DEFAULTS=OFF \
+            -DIREE_TARGET_BACKEND_LLVM_CPU=ON \
+            -DIREE_HAL_DRIVER_DEFAULTS=OFF \
+            -DIREE_HAL_DRIVER_LOCAL_SYNC=ON \
+            -DIREE_HAL_DRIVER_LOCAL_TASK=ON
+        ```
+
+    === "Enable CUDA"
+
+        This configure command will
+
+        * Enable the CUDA compiler target backend
+        * Enable the CUDA runtime HAL driver
+
+        ``` shell
+        cmake -G Ninja -B ../iree-build/ -S . \
+            -DIREE_TARGET_BACKEND_CUDA=ON \
+            -DIREE_HAL_DRIVER_CUDA=ON
+        ```
 
 ### Extensions and integrations
 
 When using IREE within other projects, you can register compiler plugins and
 runtime HAL drivers. You can also bring your own copy of LLVM and some other
 tools. See the root
-[`CMakeLists.txt`](https://github.com/openxla/iree/blob/main/CMakeLists.txt)
+[`CMakeLists.txt`](https://github.com/iree-org/iree/blob/main/CMakeLists.txt)
 for details.
 
 ## :octicons-code-16: Tests and samples
@@ -220,7 +262,7 @@ cmake --build ../iree-build --target iree-run-tests
 ```
 
 To run only certain tests, we have a
-[helper script](https://github.com/openxla/iree/blob/main/build_tools/cmake/ctest_all.sh)
+[helper script](https://github.com/iree-org/iree/blob/main/build_tools/cmake/ctest_all.sh)
 that converts environment variables into ctest filters:
 
 ``` shell
@@ -345,7 +387,7 @@ Python executable to use with `Python3_EXECUTABLE`:
 # Configure (including other options as discussed above)
 cmake -G Ninja -B ../iree-build/ \
   -DIREE_BUILD_PYTHON_BINDINGS=ON  \
-  -DPython3_EXECUTABLE="$(which python)" \
+  -DPython3_EXECUTABLE="$(which python3)" \
   .
 
 # Build
@@ -353,6 +395,43 @@ cmake --build ../iree-build/
 ```
 
 ### Using the Python bindings
+
+There are two available methods for installing the Python bindings, either
+through creating an editable wheel or through extending `PYTHONPATH`.
+
+#### Option A: Installing the bindings as editable wheels
+
+This method links the files in your build tree into your Python package directory
+as an editable wheel.
+
+=== ":fontawesome-brands-linux: Linux"
+
+    ``` shell
+    CMAKE_INSTALL_METHOD=ABS_SYMLINK python -m pip install -e ../iree-build/compiler
+    CMAKE_INSTALL_METHOD=ABS_SYMLINK python -m pip install -e ../iree-build/runtime
+    ```
+
+=== ":fontawesome-brands-apple: macOS"
+
+    ``` shell
+    CMAKE_INSTALL_METHOD=ABS_SYMLINK python -m pip install -e ../iree-build/compiler
+    CMAKE_INSTALL_METHOD=ABS_SYMLINK python -m pip install -e ../iree-build/runtime
+    ```
+
+=== ":fontawesome-brands-windows: Windows"
+
+    ``` powershell
+    $env:CMAKE_INSTALL_MODE="ABS_SYMLINK"
+    python -m pip install -e ..\iree-build\compiler
+    python -m pip install -e ..\iree-build\runtime
+    $env:CMAKE_INSTALL_MODE=null
+    ```
+
+#### Option B: Extending PYTHONPATH
+
+This method more effectively captures the state of your build directory,
+but is prone to errors arising from forgetting to source the environment
+variables.
 
 Extend your `PYTHONPATH` with IREE's `bindings/python` paths and try importing:
 
@@ -389,13 +468,16 @@ Extend your `PYTHONPATH` with IREE's `bindings/python` paths and try importing:
     python -c "import iree.runtime; help(iree.runtime)"
     ```
 
-Using IREE's ML framework importers requires a few extra steps:
+#### Tensorflow/TFLite bindings
+
+Using IREE's TensorFlow/TFLite importers requires a few extra steps:
 
 ``` shell
 # Install test requirements
 python -m pip install -r integrations/tensorflow/test/requirements.txt
 
 # Install pure Python packages (no build required)
+# You may use `pip install -e` here to create an editable wheel.
 python -m pip install integrations/tensorflow/python_projects/iree_tf
 python -m pip install integrations/tensorflow/python_projects/iree_tflite
 

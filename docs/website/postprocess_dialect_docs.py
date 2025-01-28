@@ -70,19 +70,22 @@ def main(args):
     dialect_sources_map = {
         "Check.md": "compiler/src/iree/compiler/Modules/Check/IR",
         "Flow.md": "compiler/src/iree/compiler/Dialect/Flow/IR",
+        "Encoding.md": "compiler/src/iree/compiler/Dialect/Encoding/IR",
         "HAL.md": "compiler/src/iree/compiler/Dialect/HAL/IR",
         "HALInline.md": "compiler/src/iree/compiler/Modules/HAL/Inline/IR",
         "HALLoader.md": "compiler/src/iree/compiler/Modules/HAL/Loader/IR",
         "IOParameters.md": "compiler/src/iree/compiler/Modules/IO/Parameters/IR",
+        "IREECodegen.md": "compiler/src/iree/compiler/Codegen/Dialect/Codegen/IR",
+        "IREEGPU.md": "compiler/src/iree/compiler/Codegen/Dialect/GPU/IR",
         "IREEInput.md": "llvm-external-projects/iree-dialects/include/iree-dialects/Dialect/Input",
-        "IREELinalgExt.md": "llvm-external-projects/iree-dialects/include/iree-dialects/Dialect/LinalgExt/IR",
-        "IREEVectorExt.md": "llvm-external-projects/iree-dialects/include/iree-dialects/Dialect/VectorExt/IR",
+        "IREEVectorExt.md": "compiler/src/iree/compiler/Codegen/Dialect/VectorExt/IR",
+        "LinalgExt.md": "compiler/src/iree/compiler/Dialect/LinalgExt/IR",
         "Stream.md": "compiler/src/iree/compiler/Dialect/Stream/IR",
         "Util.md": "compiler/src/iree/compiler/Dialect/Util/IR",
         "VM.md": "compiler/src/iree/compiler/Dialect/VM/IR",
         "VMVX.md": "compiler/src/iree/compiler/Dialect/VMVX/IR",
     }
-    base_url = "https://github.com/openxla/iree/tree/main/"
+    base_url = "https://github.com/iree-org/iree/tree/main/"
     for file in files:
         filename = pathlib.Path(file).name
         relative_path = dialect_sources_map.get(filename, None)

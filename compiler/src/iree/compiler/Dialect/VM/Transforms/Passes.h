@@ -48,6 +48,10 @@ createConversionPass(TargetOptions targetOptions);
 // Module layout
 //===----------------------------------------------------------------------===//
 
+// Reifies and pads vm.rodata.table.inline ops as two vm.rodata.inline ops.
+std::unique_ptr<OperationPass<IREE::VM::ModuleOp>>
+createReifyRodataTablesPass();
+
 // Hoists inline vm.rodata.inline values to module-level constant storage.
 std::unique_ptr<OperationPass<IREE::VM::ModuleOp>>
 createHoistInlinedRodataPass();
@@ -82,16 +86,12 @@ createOrdinalAllocationPass();
 std::unique_ptr<OperationPass<IREE::VM::ModuleOp>>
 createDropEmptyModuleInitializersPass();
 
+// Drops unused calls to functions marked as having no side effects.
+std::unique_ptr<OperationPass<IREE::VM::ModuleOp>> createDropUnusedCallsPass();
+
 // Sinks defining ops with few uses to their use-sites to reduce the total
 // number of live registers at the cost of additional storage requirements.
 std::unique_ptr<OperationPass<IREE::VM::ModuleOp>> createSinkDefiningOpsPass();
-
-//===----------------------------------------------------------------------===//
-// Test passes
-//===----------------------------------------------------------------------===//
-
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createConvertStandardToVMTestPass();
 
 //===----------------------------------------------------------------------===//
 // Register all Passes
@@ -104,15 +104,11 @@ inline void registerVMPasses() {
   createHoistInlinedRodataPass();
   createDeduplicateRodataPass();
   createDropEmptyModuleInitializersPass();
+  createDropUnusedCallsPass();
   createGlobalInitializationPass();
   createOrdinalAllocationPass();
   createResolveRodataLoadsPass();
   createSinkDefiningOpsPass();
-}
-
-inline void registerVMTestPasses() {
-  TargetOptions::FromFlags::get();
-  createConvertStandardToVMTestPass();
 }
 
 } // namespace mlir::iree_compiler::IREE::VM

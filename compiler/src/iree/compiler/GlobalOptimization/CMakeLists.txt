@@ -23,12 +23,12 @@ iree_cc_library(
   NAME
     PassHeaders
   HDRS
-    "PassDetail.h"
     "Passes.h"
     "Passes.h.inc"
   DEPS
     ::PassesIncGen
     MLIRPass
+    MLIRTransformUtils
     MLIRTransforms
   PUBLIC
 )
@@ -42,33 +42,37 @@ iree_cc_library(
   SRCS
     "CleanupNumericNarrowing.cpp"
     "Convert1X1FilterConv2DToMatmul.cpp"
+    "DataLayoutPropagation.cpp"
+    "DecomposeConcat.cpp"
+    "DemoteContractionInputsToBF16.cpp"
     "DetachElementwiseFromNamedOps.cpp"
     "EraseUnusedLinalgOperands.cpp"
     "ExpandTensorShapes.cpp"
-    "ExpandVectors.cpp"
     "FuseDequantizationMatmul.cpp"
     "FuseSiluHorizontalMatmul.cpp"
     "GeneralizeLinalgNamedOps.cpp"
+    "GlobalLoopInvariantCodeMotion.cpp"
     "InferNumericNarrowing.cpp"
-    "LiftGenericToTransposeBatchMatmul.cpp"
     "MaterializeHomogeneousEncodings.cpp"
     "OptimizeNumerics.cpp"
     "Passes.cpp"
+    "PropagateLinalgTranspose.cpp"
+    "QuantizedConvToConv.cpp"
+    "QuantizedMatmulToMatmul.cpp"
+    "RaiseSpecialOps.cpp"
     "RemoveZeroExtentTensors.cpp"
-    "SetEncoding.cpp"
+    "SimplifyPackUnpack.cpp"
     "Utils.cpp"
   DEPS
     ::PassHeaders
     ::PassesIncGen
-    IREELinalgExtDialect
-    IREELinalgExtTransforms
-    IREELinalgExtUtils
+    IREEDialectsTransforms
+    IREELinalgTransformDialect
     LLVMSupport
     MLIRAffineDialect
     MLIRArithDialect
     MLIRArithUtils
     MLIRControlFlowDialect
-    MLIRFuncDialect
     MLIRFunctionInterfaces
     MLIRIR
     MLIRLinalgDialect
@@ -79,23 +83,32 @@ iree_cc_library(
     MLIRMemRefTransforms
     MLIRPass
     MLIRSCFDialect
+    MLIRSCFTransforms
     MLIRSupport
     MLIRTensorDialect
     MLIRTensorTransforms
     MLIRTensorUtils
+    MLIRTransformUtils
     MLIRTransforms
     iree::compiler::Codegen::Common
-    iree::compiler::Codegen::Common::CPU::CommonCPUPasses
-    iree::compiler::Codegen::Dialect::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
+    iree::compiler::Dialect::Encoding::IR
+    iree::compiler::Dialect::Flow::Conversion::TensorToFlow
     iree::compiler::Dialect::Flow::IR
     iree::compiler::Dialect::Flow::Transforms
+    iree::compiler::Dialect::HAL::Analysis
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::HAL::IR::HALDialect
+    iree::compiler::Dialect::LinalgExt::IR
+    iree::compiler::Dialect::LinalgExt::Transforms
+    iree::compiler::Dialect::LinalgExt::Utils
     iree::compiler::Dialect::Util::Analysis
     iree::compiler::Dialect::Util::Analysis::Attributes
     iree::compiler::Dialect::Util::Analysis::DFX
     iree::compiler::Dialect::Util::IR
     iree::compiler::Dialect::Util::Transforms
+    iree::compiler::DispatchCreation
+    iree::compiler::Modules::IO::Parameters::Transforms
     iree::compiler::Pipelines::Options
     iree::compiler::Utils
   PUBLIC

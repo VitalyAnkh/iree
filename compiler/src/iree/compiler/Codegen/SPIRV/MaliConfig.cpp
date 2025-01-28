@@ -13,41 +13,40 @@
 #include <array>
 
 #include "iree/compiler/Codegen/SPIRV/KernelConfig.h"
-#include "llvm/ADT/TypeSwitch.h"
+#include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 
 namespace mlir::iree_compiler::detail {
 
 static LogicalResult setMaliMatmulConfig(linalg::LinalgOp op,
-                                         spirv::ResourceLimitsAttr limits) {
-  const int subgroupSize = limits.getSubgroupSize();
+                                         IREE::GPU::TargetAttr target) {
+  const int subgroupSize = target.getPreferredSubgroupSize();
   const std::array<int64_t, 2> workgroupXY = {subgroupSize / 2, 2};
   std::array<int64_t, 3> threadMNK;
   Type inputType = op.getDpsInputOperand(0)->get().getType();
   Type elementType = llvm::cast<ShapedType>(inputType).getElementType();
-  if (elementType.getIntOrFloatBitWidth() == 16) {
+  if (IREE::Util::getTypeBitWidth(elementType) == 16) {
     threadMNK = {2, 8, 8};
   } else if (elementType.isInteger(8)) {
     threadMNK = {4, 4, 16};
   } else {
     threadMNK = {6, 4, 4};
   }
-  return setMatmulOpConfig(limits, op, workgroupXY, threadMNK);
+  return setMatmulOpConfig(target, op, workgroupXY, threadMNK);
 }
 
 //===----------------------------------------------------------------------===//
 // Entry Point
 //===----------------------------------------------------------------------===//
 
-LogicalResult setMaliCodeGenConfig(const spirv::TargetEnv &targetEnv,
+LogicalResult setMaliCodeGenConfig(IREE::GPU::TargetAttr target,
                                    Operation *rootOp) {
-  spirv::ResourceLimitsAttr limits = targetEnv.getResourceLimits();
-  int subgroupSize = limits.getSubgroupSize();
+  const int subgroupSize = target.getPreferredSubgroupSize();
 
   if (auto linalgOp = dyn_cast<linalg::LinalgOp>(rootOp)) {
     if (isMatmulOrBatchMatmul(linalgOp))
-      return setMaliMatmulConfig(linalgOp, limits);
+      return setMaliMatmulConfig(linalgOp, target);
   }
 
   if (auto convOp = dyn_cast<linalg::ConvolutionOpInterface>(rootOp)) {

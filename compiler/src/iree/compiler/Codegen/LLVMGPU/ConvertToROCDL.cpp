@@ -6,12 +6,12 @@
 
 #include "iree/compiler/Codegen/Common/GPU/GPUPatterns.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUDialect.h"
 #include "iree/compiler/Codegen/LLVMGPU/ConvertToLLVM.h"
-#include "iree/compiler/Codegen/LLVMGPU/PassDetail.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
-#include "iree/compiler/Codegen/Utils/Utils.h"
-#include "iree/compiler/Dialect/Util/IR/UtilOps.h"
+#include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "mlir/Conversion/AMDGPUToROCDL/AMDGPUToROCDL.h"
+#include "mlir/Conversion/ArithToAMDGPU/ArithToAMDGPU.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
@@ -24,46 +24,31 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
+#include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Transforms/Passes.h"
+
+#define DEBUG_TYPE "iree-convert-to-rocdl"
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_CONVERTTOROCDLPASS
+#include "iree/compiler/Codegen/LLVMGPU/Passes.h.inc"
+
 static llvm::cl::opt<int>
-    clROCMIndexingBits("iree-rocm-index-bits",
+    clROCMIndexingBits("iree-hip-index-bits",
                        llvm::cl::desc("Set the bit width of indices in ROCm."),
                        llvm::cl::init(64));
 
 namespace {
-
-static StringRef getTargetArch(func::FuncOp entryPoint) {
-  if (auto variantOp =
-          entryPoint->getParentOfType<IREE::HAL::ExecutableVariantOp>()) {
-    IREE::HAL::ExecutableTargetAttr targetAttr = variantOp.getTarget();
-    if (auto config = targetAttr.getConfiguration()) {
-      if (auto attr = config.getAs<StringAttr>("target_arch")) {
-        return attr.getValue();
-      }
-    }
-  }
-  return "";
-}
-
-static StringRef getChipset(ModuleOp m) {
-  for (func::FuncOp funcOp : m.getOps<func::FuncOp>()) {
-    if (isEntryPoint(funcOp)) {
-      return getTargetArch(funcOp);
-    }
-  }
-  return "";
-}
 
 // Transform gpu.barrier -> amdgpu.lds_barrier
 // IREE code generation currently only ever needs to synchronize for
@@ -88,18 +73,43 @@ static void populateConvertGPUToAMDGPUPatterns(RewritePatternSet &patterns) {
 
 } // namespace
 
+// Function to check valid data types on the ROCm backend.
+static LogicalResult validateDataTypes(Operation *op) {
+  auto operandTypes = llvm::to_vector(op->getOperandTypes());
+  auto resultTypes = llvm::to_vector(op->getResultTypes());
+  if (llvm::any_of(llvm::concat<Type>(operandTypes, resultTypes),
+                   llvm::IsaPred<Float8E4M3FNType, Float8E5M2Type>)) {
+    op->emitOpError()
+        << "F8E5M2 and F8E4M3FN types are not supported on "
+           "the ROCm backend; try F8E5M2FNUZ or F8E4M3FNUZ instead.";
+    return failure();
+  }
+
+  return success();
+}
+
 /// A pass that replaces all occurrences of GPU device operations with their
 /// corresponding ROCDL equivalent.
 ///
 /// This pass only handles device code and is not meant to be run on GPU host
 /// code.
-struct ConvertToROCDLPass : public ConvertToROCDLBase<ConvertToROCDLPass> {
+struct ConvertToROCDLPass final
+    : impl::ConvertToROCDLPassBase<ConvertToROCDLPass> {
+  using impl::ConvertToROCDLPassBase<
+      ConvertToROCDLPass>::ConvertToROCDLPassBase;
+
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<LLVM::LLVMDialect, ROCDL::ROCDLDialect,
-                    amdgpu::AMDGPUDialect, gpu::GPUDialect>();
+    registry
+        .insert<IREE::GPU::IREEGPUDialect, LLVM::LLVMDialect,
+                ROCDL::ROCDLDialect, amdgpu::AMDGPUDialect, gpu::GPUDialect>();
   }
   void runOnOperation() override {
     ModuleOp m = getOperation();
+
+    m.walk([&](Operation *op) {
+      if (failed(validateDataTypes(op)))
+        return signalPassFailure();
+    });
 
     if (clROCMIndexingBits != 32 && clROCMIndexingBits != 64) {
       m.emitOpError() << "unsupported: ROCm index bit widths must either be "
@@ -132,12 +142,27 @@ struct ConvertToROCDLPass : public ConvertToROCDLBase<ConvertToROCDLPass> {
     // Run Vector -> Vector transformations ahead of conversion to LLVM.
     {
       RewritePatternSet patterns(&getContext());
+      // These patterns only convert a subset of arith that target specific
+      // rocdl intrinsics (e.g. fp8 conversions).
+      StringRef chipset = getGPUTargetAttr(m).getArch();
+      FailureOr<amdgpu::Chipset> maybeChipset = amdgpu::Chipset::parse(chipset);
+      if (failed(maybeChipset)) {
+        m.emitOpError() << "Invalid chipset name: " << chipset;
+        return signalPassFailure();
+      }
+      arith::populateArithToAMDGPUConversionPatterns(
+          patterns, /*convertFP8Arithmetic=*/true, /*saturateFP8Truncf=*/false,
+          /*allowPackedF16Rtz=*/false, /*chipset=*/*maybeChipset);
+      arith::populateCeilFloorDivExpandOpsPatterns(patterns);
       populateConvertGPUToAMDGPUPatterns(patterns);
+      populateConvertSharedMemoryAllocOps(patterns);
       populateDropSharedMemoryDeallocOpPatterns(patterns);
       populateScalarizeMathOps(patterns);
-      populateConvertSharedMemoryAllocOps(patterns);
       vector::populateVectorToVectorCanonicalizationPatterns(patterns);
+      vector::populateBubbleVectorBitCastOpPatterns(patterns);
       vector::populateVectorBroadcastLoweringPatterns(patterns);
+      vector::populateVectorInterleaveLoweringPatterns(patterns);
+      vector::populateVectorInterleaveToShufflePatterns(patterns);
       vector::populateVectorContractLoweringPatterns(
           patterns,
           vector::VectorTransformsOptions().setVectorTransformsOptions(
@@ -153,17 +178,24 @@ struct ConvertToROCDLPass : public ConvertToROCDLBase<ConvertToROCDLPass> {
       vector::populateVectorTransposeLoweringPatterns(
           patterns, vector::VectorTransformsOptions());
       vector::populateVectorTransferLoweringPatterns(patterns);
-      if (failed(applyPatternsAndFoldGreedily(m, std::move(patterns)))) {
+      arith::populateExpandBFloat16Patterns(patterns);
+      if (failed(applyPatternsGreedily(m, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
+
+    LDBG("After applying in-dialect conversions\n" << m);
+
     {
       RewritePatternSet patterns(&getContext());
       populateGpuRewritePatterns(patterns);
-      if (failed(applyPatternsAndFoldGreedily(m, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(m, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
+
+    LDBG("After applying GPU rewrite patterns\n" << m);
+
     {
       // Convert arith::maximumf/minimumf ops on AMD gpus since the lowering
       // is faulty for them.
@@ -171,26 +203,36 @@ struct ConvertToROCDLPass : public ConvertToROCDLBase<ConvertToROCDLPass> {
       // (https://github.com/llvm/llvm-project/issues/67815).
       RewritePatternSet patterns(&getContext());
       populateReplaceSlowMinMaxOpsPatterns(patterns);
-      if (failed(applyPatternsAndFoldGreedily(m, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(m, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
+
+    LDBG("After converting maximumf/minimumf ops\n" << m);
+
     {
       RewritePatternSet llvmPatterns(&getContext());
       populateLowerHALInterfaceOp(llvmPatterns);
       populateLLVMConversionPatterns(&getContext(), llvmPatterns, converter);
       populateComplexToLLVMConversionPatterns(converter, llvmPatterns);
       populateMathToLLVMConversionPatterns(converter, llvmPatterns);
-      memref::populateExpandStridedMetadataPatterns(llvmPatterns);
+      iree_compiler::populateIREEResolveExtractStridedMetadataPatterns(
+          llvmPatterns);
       populateFinalizeMemRefToLLVMConversionPatterns(converter, llvmPatterns);
       populateFuncToLLVMConversionPatterns(converter, llvmPatterns);
       cf::populateControlFlowToLLVMConversionPatterns(converter, llvmPatterns);
       arith::populateArithToLLVMConversionPatterns(converter, llvmPatterns);
-      StringRef chipset = getChipset(m);
+      StringRef chipset = getGPUTargetAttr(m).getArch();
       FailureOr<amdgpu::Chipset> maybeChipset = amdgpu::Chipset::parse(chipset);
-      populateAMDGPUToROCDLConversionPatterns(converter, llvmPatterns,
-                                              *maybeChipset);
+      populateAMDGPUToROCDLConversionPatterns(
+          converter, llvmPatterns, maybeChipset.value_or(amdgpu::Chipset()));
+      vector::populateVectorRankReducingFMAPattern(llvmPatterns);
+      vector::populateVectorInsertExtractStridedSliceTransforms(llvmPatterns);
+      vector::populateVectorStepLoweringPatterns(llvmPatterns);
+      vector::populateVectorBitCastLoweringPatterns(llvmPatterns);
       populateVectorToLLVMConversionPatterns(converter, llvmPatterns);
+      vector::populateVectorTransferLoweringPatterns(llvmPatterns,
+                                                     /*maxTransferRank=*/1);
       populateGpuToROCDLConversionPatterns(converter, llvmPatterns,
                                            gpu::amd::Runtime::Unknown);
       LLVMConversionTarget target(getContext());
@@ -199,12 +241,11 @@ struct ConvertToROCDLPass : public ConvertToROCDLBase<ConvertToROCDLPass> {
       if (failed(applyPartialConversion(m, target, std::move(llvmPatterns))))
         signalPassFailure();
     }
+
+    LDBG("After converting to rocdl\n" << m);
     ConvertToDynamicSharedMemory(m);
+
+    LDBG("After converting to dynamic shared memory\n" << m);
   }
 };
-
-std::unique_ptr<OperationPass<ModuleOp>> createConvertToROCDLPass() {
-  return std::make_unique<ConvertToROCDLPass>();
-}
-
 } // namespace mlir::iree_compiler

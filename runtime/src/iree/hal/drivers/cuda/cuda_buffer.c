@@ -1,4 +1,4 @@
-// Copyright 2021 The IREE Authors
+// Copyright 2023 The IREE Authors
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -14,6 +14,7 @@
 
 typedef struct iree_hal_cuda_buffer_t {
   iree_hal_buffer_t base;
+  iree_allocator_t host_allocator;
   iree_hal_cuda_buffer_type_t type;
   void* host_ptr;
   CUdeviceptr device_ptr;
@@ -35,7 +36,7 @@ static const iree_hal_cuda_buffer_t* iree_hal_cuda_buffer_const_cast(
 }
 
 iree_status_t iree_hal_cuda_buffer_wrap(
-    iree_hal_allocator_t* allocator, iree_hal_memory_type_t memory_type,
+    iree_hal_buffer_placement_t placement, iree_hal_memory_type_t memory_type,
     iree_hal_memory_access_t allowed_access,
     iree_hal_buffer_usage_t allowed_usage, iree_device_size_t allocation_size,
     iree_device_size_t byte_offset, iree_device_size_t byte_length,
@@ -56,10 +57,11 @@ iree_status_t iree_hal_cuda_buffer_wrap(
   iree_status_t status =
       iree_allocator_malloc(host_allocator, sizeof(*buffer), (void**)&buffer);
   if (iree_status_is_ok(status)) {
-    iree_hal_buffer_initialize(host_allocator, allocator, &buffer->base,
-                               allocation_size, byte_offset, byte_length,
-                               memory_type, allowed_access, allowed_usage,
+    iree_hal_buffer_initialize(placement, &buffer->base, allocation_size,
+                               byte_offset, byte_length, memory_type,
+                               allowed_access, allowed_usage,
                                &iree_hal_cuda_buffer_vtable, &buffer->base);
+    buffer->host_allocator = host_allocator;
     buffer->type = buffer_type;
     buffer->host_ptr = host_ptr;
     buffer->device_ptr = device_ptr;
@@ -73,7 +75,7 @@ iree_status_t iree_hal_cuda_buffer_wrap(
 
 static void iree_hal_cuda_buffer_destroy(iree_hal_buffer_t* base_buffer) {
   iree_hal_cuda_buffer_t* buffer = iree_hal_cuda_buffer_cast(base_buffer);
-  iree_allocator_t host_allocator = base_buffer->host_allocator;
+  iree_allocator_t host_allocator = buffer->host_allocator;
   IREE_TRACE_ZONE_BEGIN(z0);
   if (buffer->release_callback.fn) {
     buffer->release_callback.fn(buffer->release_callback.user_data,
@@ -88,6 +90,8 @@ static iree_status_t iree_hal_cuda_buffer_map_range(
     iree_hal_memory_access_t memory_access,
     iree_device_size_t local_byte_offset, iree_device_size_t local_byte_length,
     iree_hal_buffer_mapping_t* mapping) {
+  IREE_ASSERT_ARGUMENT(base_buffer);
+  IREE_ASSERT_ARGUMENT(mapping);
   iree_hal_cuda_buffer_t* buffer = iree_hal_cuda_buffer_cast(base_buffer);
 
   // TODO(benvanik): add upload/download for unmapped buffers.
@@ -119,21 +123,21 @@ static iree_status_t iree_hal_cuda_buffer_map_range(
 static iree_status_t iree_hal_cuda_buffer_unmap_range(
     iree_hal_buffer_t* base_buffer, iree_device_size_t local_byte_offset,
     iree_device_size_t local_byte_length, iree_hal_buffer_mapping_t* mapping) {
-  // Nothing to do (today).
+  // Nothing to do today.
   return iree_ok_status();
 }
 
 static iree_status_t iree_hal_cuda_buffer_invalidate_range(
     iree_hal_buffer_t* base_buffer, iree_device_size_t local_byte_offset,
     iree_device_size_t local_byte_length) {
-  // Nothing to do.
+  // Nothing to do today.
   return iree_ok_status();
 }
 
 static iree_status_t iree_hal_cuda_buffer_flush_range(
     iree_hal_buffer_t* base_buffer, iree_device_size_t local_byte_offset,
     iree_device_size_t local_byte_length) {
-  // Nothing to do.
+  // Nothing to do today.
   return iree_ok_status();
 }
 

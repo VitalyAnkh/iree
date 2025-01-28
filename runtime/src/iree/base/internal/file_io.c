@@ -466,7 +466,9 @@ iree_status_t iree_file_create_mapped(const char* path, uint64_t file_size,
   IREE_TRACE_ZONE_BEGIN(z0);
 
   iree_file_contents_t* contents = NULL;
-  iree_allocator_malloc(allocator, sizeof(*contents), (void**)&contents);
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0,
+      iree_allocator_malloc(allocator, sizeof(*contents), (void**)&contents));
   contents->allocator = allocator;
 
   iree_status_t status = iree_file_create_mapped_platform(
@@ -495,7 +497,7 @@ iree_status_t iree_file_write_contents(const char* path,
 
   iree_status_t status = iree_ok_status();
   if (content.data_length > 0) {
-    int ret = fwrite((char*)content.data, content.data_length, 1, file);
+    size_t ret = fwrite((char*)content.data, content.data_length, 1, file);
     if (ret != 1) {
       status = iree_make_status(IREE_STATUS_DATA_LOSS,
                                 "unable to write file contents of %" PRIhsz

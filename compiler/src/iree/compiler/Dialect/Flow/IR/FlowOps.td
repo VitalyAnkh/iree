@@ -11,10 +11,12 @@ include "iree/compiler/Dialect/Flow/IR/FlowBase.td"
 include "iree/compiler/Dialect/Flow/IR/FlowInterfaces.td"
 include "iree/compiler/Dialect/Util/IR/UtilInterfaces.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
+include "mlir/IR/BuiltinAttributeInterfaces.td"
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/CallInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/Interfaces/InferIntRangeInterface.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/ViewLikeInterface.td"
@@ -34,6 +36,7 @@ def OpGroupPartitionedRegionOps : OpDocGroup {
 let opDocGroup = OpGroupPartitionedRegionOps in {
 
 def FLOW_DispatchRegionOp : FLOW_PureOp<"dispatch.region", [
+    DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface>,
     Util_ShapeAwareOp,
     AttrSizedOperandSegments]> {
   let summary = [{a group of ops}];
@@ -76,6 +79,10 @@ def FLOW_DispatchWorkgroupsOp : FLOW_PureOp<"dispatch.workgroups", [
   IsolatedFromAbove,
   AttrSizedOperandSegments,
   DeclareOpInterfaceMethods<Util_ClosureOpInterface>,
+  DeclareOpInterfaceMethods<Util_HoistableOpInterface, [
+    "isAtomicallyHoistableOp",
+    "isOperandHoistable",
+  ]>,
   DeclareOpInterfaceMethods<Util_TiedOpInterface, [
     "getTiedOperandsIndexAndLength",
   ]>,
@@ -192,11 +199,11 @@ def FLOW_DispatchWorkgroupsOp : FLOW_PureOp<"dispatch.workgroups", [
     unsigned mapArgOperandToOpOperand(unsigned i) { return i + getWorkload().size(); };
 
     ValueRange getOperandDynamicDims(unsigned idx) {
-      return IREE::Util::findVariadicDynamicDims(idx - getWorkload().size(), getArguments(), getArgumentDims());
+      return IREE::Util::findDynamicDimsInList(idx - getWorkload().size(), getArguments(), getArgumentDims());
     }
 
     ValueRange getResultDynamicDims(unsigned idx) {
-      return IREE::Util::findVariadicDynamicDims(idx, getResults(), getResultDims());
+      return IREE::Util::findDynamicDimsInList(idx, getResults(), getResultDims());
     }
 
     /// Returns the BlockArguments corresponding to the inputs in the type
@@ -458,7 +465,7 @@ def FLOW_DispatchTensorLoadOp : FLOW_PureOp<"dispatch.tensor.load", [
     /// and `static_strides` attributes.
     std::array<unsigned, 3> getArrayAttrMaxRanks() {
       unsigned sourceRank =
-          getSource().getType().cast<DispatchTensorType>().asRankedTensorType().getRank();
+          cast<DispatchTensorType>(getSource().getType()).asRankedTensorType().getRank();
       return {sourceRank, sourceRank, sourceRank};
     }
 
@@ -483,12 +490,12 @@ def FLOW_DispatchTensorLoadOp : FLOW_PureOp<"dispatch.tensor.load", [
 
     /// Return the result type as a `RankedTensorType`.
     RankedTensorType getType() {
-      return getResult().getType().cast<RankedTensorType>();
+      return cast<RankedTensorType>(getResult().getType());
     }
 
     /// Return the type of the source as `IREE::Flow::DispatchTensorType`.
     IREE::Flow::DispatchTensorType getSourceType() {
-      return getSource().getType().cast<IREE::Flow::DispatchTensorType>();
+      return cast<IREE::Flow::DispatchTensorType>(getSource().getType());
     }
 
     ValueRange getOperandDynamicDims(unsigned idx) { return getSourceDims(); }
@@ -567,16 +574,16 @@ def FLOW_DispatchTensorStoreOp : FLOW_Op<"dispatch.tensor.store", [
     /// and `static_strides` attributes.
     std::array<unsigned, 3> getArrayAttrMaxRanks() {
       unsigned resultRank =
-           getTarget().getType().cast<DispatchTensorType>().asRankedTensorType().getRank();
+           cast<DispatchTensorType>(getTarget().getType()).asRankedTensorType().getRank();
       return {resultRank, resultRank, resultRank};
     }
 
     /// Return the type of the value type as a RankedTensorType.
-    RankedTensorType getValueType() { return getValue().getType().cast<RankedTensorType>(); }
+    RankedTensorType getValueType() { return cast<RankedTensorType>(getValue().getType()); }
 
     /// Return the type of the target.
     IREE::Flow::DispatchTensorType getTargetType() {
-      return getTarget().getType().cast<IREE::Flow::DispatchTensorType>();
+      return cast<IREE::Flow::DispatchTensorType>(getTarget().getType());
     }
 
     /// Return the number of leading operands before the `offsets`, `sizes` and
@@ -749,7 +756,6 @@ let opDocGroup = OpGroupDispatchOps in {
 
 def FLOW_DispatchOp : FLOW_PureOp<"dispatch", [
   AttrSizedOperandSegments,
-  FLOW_StreamableOp,
   DeclareOpInterfaceMethods<SymbolUserOpInterface>,
   DeclareOpInterfaceMethods<Util_TiedOpInterface, [
     "getTiedOperandsIndexAndLength",
@@ -840,14 +846,11 @@ def FLOW_DispatchOp : FLOW_PureOp<"dispatch", [
     // May not be unique or a valid reference to an executable.
     std::string getEntryPointName();
 
-    // StreamableOpInterface:
-    bool isTransfer() { return false; }
-
     ValueRange getOperandDynamicDims(unsigned idx) {
-      return IREE::Util::findVariadicDynamicDims(idx - getWorkload().size(), getArguments(), getArgumentDims());
+      return IREE::Util::findDynamicDimsInList(idx - getWorkload().size(), getArguments(), getArgumentDims());
     }
     ValueRange getResultDynamicDims(unsigned idx) {
-      return IREE::Util::findVariadicDynamicDims(idx, getResults(), getResultDims());
+      return IREE::Util::findDynamicDimsInList(idx, getResults(), getResultDims());
     }
   }];
 
@@ -936,7 +939,6 @@ def FLOW_FuncOp : FLOW_Op<"func", [
 def FLOW_CallOp : FLOW_Op<"call", [
   AttrSizedOperandSegments,
   CallOpInterface,
-  FLOW_StreamableOp,
   DeclareOpInterfaceMethods<SymbolUserOpInterface>,
   DeclareOpInterfaceMethods<Util_TiedOpInterface, [
     "getTiedOperandsIndexAndLength",
@@ -981,7 +983,7 @@ def FLOW_CallOp : FLOW_Op<"call", [
   let builders = [
     OpBuilder<(ins
       "SymbolRefAttr":$callee,
-      "TypeRange":$resultTypes,
+      "TypeRange":$resultTypes, "ValueRange":$resultDims,
       "ValueRange":$arguments,
       "ArrayAttr":$tiedOperands,
       CArg<"ArrayRef<NamedAttribute>", "{}">:$attributes)>,
@@ -1011,17 +1013,14 @@ def FLOW_CallOp : FLOW_Op<"call", [
 
     /// Set the callee for this operation.
     void setCalleeFromCallable(CallInterfaceCallable callee) {
-      (*this)->setAttr("callee", callee.get<SymbolRefAttr>());
+      (*this)->setAttr("callee", cast<SymbolRefAttr>(callee));
     }
-
-    // StreamableOpInterface:
-    bool isTransfer() { return false; }
 
     ValueRange getOperandDynamicDims(unsigned idx) {
-      return IREE::Util::findVariadicDynamicDims(idx, getArguments(), getArgumentDims());
+      return IREE::Util::findDynamicDimsInList(idx, getArguments(), getArgumentDims());
     }
     ValueRange getResultDynamicDims(unsigned idx) {
-      return IREE::Util::findVariadicDynamicDims(idx, getResults(), getResultDims());
+      return IREE::Util::findDynamicDimsInList(idx, getResults(), getResultDims());
     }
 
     /// Get the argument operands to the called function as a mutable range, this is
@@ -1047,24 +1046,58 @@ def OpGroupTensorOps : OpDocGroup {
 
 let opDocGroup = OpGroupTensorOps in {
 
-// TODO(benvanik): make this behave like std.constant if not dynamic.
-def FLOW_TensorConstantOp : FLOW_Op<"tensor.constant"> {
+def FLOW_TensorConstantOp : FLOW_PureOp<"tensor.constant", [
+  ConstantLike,
+  AllTypesMatch<["value", "result"]>,
+]> {
   let summary = [{tensor constant that can have dynamic dimensions}];
   let description = [{
-    Allows specifying a constant where the return value can erase shape
-    information. This operation is declared as having side effects and has no
-    folder, so will not be optimized away by the compiler. The underlying shape
-    information should be hidden from the compiler and resolved at runtime.
+    Allows specifying a tensor constant of IREE-specific types/attributes.
 
     ```mlir
-    %c = flow.tensor.constant tensor<2x2xf32> -> tensor<?x?xf32>
-    %res = math.absf %c : tensor<?x?xf32>
+    %cst = flow.tensor.constant #something_tensor_like : tensor<2x2xf32>
+    %res = math.absf %cst : tensor<2x2xf32>
     ```
   }];
-  let arguments = (ins ElementsAttr:$value);
+  let arguments = (ins TypedAttrInterface:$value);
   let results = (outs AnyTensor:$result);
+
   let assemblyFormat = [{
-    $value attr-dict `->` type($result)
+    attr-dict $value
+  }];
+
+  let extraClassDeclaration = [{
+    // Returns true if the constant op can be built with the given attribute.
+    static bool isBuildableWith(Attribute value, Type type);
+  }];
+
+  let hasFolder = 1;
+}
+
+def FLOW_TensorDynamicConstantOp : FLOW_Op<"tensor.dynamic_constant"> {
+  let summary = [{tensor constant that can have dynamic dimensions}];
+  let description = [{
+    Allows specifying a tensor constant of IREE-specific types/attributes with
+    a dynamic shape that approximates a value as passed from the user. This
+    disables many optimizations and should only be used when testing or
+    benchmarking and wanting to ensure that dynamic dimension behavior is
+    preserved.
+
+    ```mlir
+    %cst = flow.tensor.dynamic_constant #something_tensor_like : tensor<2x2xf32> -> tensor<?x2xf32>
+    %res = math.absf %cst : tensor<?x2xf32>
+    ```
+  }];
+  let arguments = (ins TypedAttrInterface:$value);
+  let results = (outs AnyTensor:$result);
+
+  let assemblyFormat = [{
+    attr-dict $value `->` type($result)
+  }];
+
+  let extraClassDeclaration = [{
+    // Returns true if the constant op can be built with the given attribute.
+    static bool isBuildableWith(Attribute value, Type type);
   }];
 
   let hasFolder = 1;
@@ -1108,9 +1141,9 @@ def FLOW_TensorTieShapeOp : FLOW_PureOp<"tensor.tie_shape", [
 }
 
 def FLOW_TensorReshapeOp : FLOW_PureOp<"tensor.reshape", [
-  FLOW_StreamableOp,
   AllElementTypesMatch<["source", "result"]>,
   AttrSizedOperandSegments,
+  DeclareOpInterfaceMethods<Util_HoistableOpInterface>,
   DeclareOpInterfaceMethods<Util_TiedOpInterface, [
       "getTiedResult",
       "getTiedResultOperandIndex",
@@ -1152,8 +1185,7 @@ def FLOW_TensorReshapeOp : FLOW_PureOp<"tensor.reshape", [
   ];
 
   let extraClassDeclaration = [{
-    // StreamableOpInterface:
-    bool isTransfer() { return true; }
+    bool isHoistableLeafOp() { return false; }
 
     ValueRange getOperandDynamicDims(unsigned idx) { return getSourceDims(); }
     ValueRange getResultDynamicDims(unsigned idx) { return getResultDims(); }
@@ -1165,8 +1197,8 @@ def FLOW_TensorReshapeOp : FLOW_PureOp<"tensor.reshape", [
 }
 
 def FLOW_TensorBitCastOp : FLOW_PureOp<"tensor.bitcast", [
-  FLOW_StreamableOp,
   AttrSizedOperandSegments,
+  DeclareOpInterfaceMethods<Util_HoistableOpInterface>,
   DeclareOpInterfaceMethods<Util_TiedOpInterface, [
       "getTiedResult",
       "getTiedResultOperandIndex",
@@ -1208,8 +1240,7 @@ def FLOW_TensorBitCastOp : FLOW_PureOp<"tensor.bitcast", [
   ];
 
   let extraClassDeclaration = [{
-    // StreamableOpInterface:
-    bool isTransfer() { return true; }
+    bool isHoistableLeafOp() { return false; }
 
     ValueRange getOperandDynamicDims(unsigned idx) { return getSourceDims(); }
     ValueRange getResultDynamicDims(unsigned idx) { return getResultDims(); }
@@ -1223,7 +1254,7 @@ def FLOW_TensorBitCastOp : FLOW_PureOp<"tensor.bitcast", [
 def FLOW_TensorLoadOp : FLOW_PureOp<"tensor.load", [
   TypesMatchWith<"value type matches element type of target operand",
                   "source", "result",
-                  "$_self.cast<ShapedType>().getElementType()">,
+                  "cast<ShapedType>($_self).getElementType()">,
   AttrSizedOperandSegments,
   Util_ShapeAwareOp,
 ]> {
@@ -1238,7 +1269,7 @@ def FLOW_TensorLoadOp : FLOW_PureOp<"tensor.load", [
     Variadic<FLOW_Dim>:$indices
   );
   let results = (outs
-    AnyTypeOf<[FLOW_PrimitiveType, AnyVector]>:$result
+    AnyTypeOf<[FLOW_PrimitiveType, AnyVectorOfNonZeroRank]>:$result
   );
 
   let assemblyFormat = [{
@@ -1274,7 +1305,7 @@ def FLOW_TensorStoreOp : FLOW_PureOp<"tensor.store", [
   AllTypesMatch<["target", "result"]>,
   TypesMatchWith<"value type matches element type of target operand",
                   "target", "value",
-                  "$_self.cast<ShapedType>().getElementType()">,
+                  "cast<ShapedType>($_self).getElementType()">,
   AttrSizedOperandSegments,
   Util_ShapeAwareOp,
 ]> {
@@ -1284,7 +1315,7 @@ def FLOW_TensorStoreOp : FLOW_PureOp<"tensor.store", [
   }];
 
   let arguments = (ins
-    AnyTypeOf<[FLOW_PrimitiveType, AnyVector]>:$value,
+    AnyTypeOf<[FLOW_PrimitiveType, AnyVectorOfNonZeroRank]>:$value,
     FLOW_Tensor:$target,
     FLOW_ShapeDynamicDims:$target_dims,
     Variadic<FLOW_Dim>:$indices
@@ -1358,7 +1389,7 @@ def FLOW_TensorAllocaOp : FLOW_Op<"tensor.alloca", [
 }
 
 def FLOW_TensorEmptyOp : FLOW_PureOp<"tensor.empty", [
-  FLOW_StreamableOp,
+  DeclareOpInterfaceMethods<Util_HoistableOpInterface>,
   Util_ShapeAwareOp,
 ]> {
   let summary = [{an empty tensor carrying metadata but no contents}];
@@ -1380,8 +1411,7 @@ def FLOW_TensorEmptyOp : FLOW_PureOp<"tensor.empty", [
   }];
 
   let extraClassDeclaration = [{
-    // StreamableOpInterface:
-    bool isTransfer() { return true; }
+    bool isHoistableLeafOp() { return false; }
 
     ValueRange getOperandDynamicDims(unsigned idx) { return ValueRange{}; }
     ValueRange getResultDynamicDims(unsigned idx) { return getResultDims(); }
@@ -1392,10 +1422,10 @@ def FLOW_TensorEmptyOp : FLOW_PureOp<"tensor.empty", [
 }
 
 def FLOW_TensorSplatOp : FLOW_PureOp<"tensor.splat", [
-  FLOW_StreamableOp,
   TypesMatchWith<"value type matches element type of result",
                   "result", "value",
-                  "$_self.cast<ShapedType>().getElementType()">,
+                  "cast<ShapedType>($_self).getElementType()">,
+  DeclareOpInterfaceMethods<Util_HoistableOpInterface>,
   Util_ShapeAwareOp,
 ]> {
   let summary = [{splats a value into a shaped tensor}];
@@ -1417,8 +1447,7 @@ def FLOW_TensorSplatOp : FLOW_PureOp<"tensor.splat", [
   }];
 
   let extraClassDeclaration = [{
-    // StreamableOpInterface:
-    bool isTransfer() { return true; }
+    bool isHoistableLeafOp() { return false; }
 
     ValueRange getOperandDynamicDims(unsigned idx) { return ValueRange{}; }
     ValueRange getResultDynamicDims(unsigned idx) { return getResultDims(); }
@@ -1429,8 +1458,8 @@ def FLOW_TensorSplatOp : FLOW_PureOp<"tensor.splat", [
 }
 
 def FLOW_TensorCloneOp : FLOW_PureOp<"tensor.clone", [
-  FLOW_StreamableOp,
   AllTypesMatch<["operand", "result"]>,
+  DeclareOpInterfaceMethods<Util_HoistableOpInterface>,
   Util_ShapeAwareOp,
 ]> {
   let summary = [{performs a full tensor clone operation}];
@@ -1462,8 +1491,7 @@ def FLOW_TensorCloneOp : FLOW_PureOp<"tensor.clone", [
   ];
 
   let extraClassDeclaration = [{
-    // StreamableOpInterface:
-    bool isTransfer() { return true; }
+    bool isHoistableLeafOp() { return false; }
 
     ValueRange getOperandDynamicDims(unsigned idx) { return getArgumentDims(); }
     ValueRange getResultDynamicDims(unsigned idx) { return getArgumentDims(); }
@@ -1474,10 +1502,107 @@ def FLOW_TensorCloneOp : FLOW_PureOp<"tensor.clone", [
   let hasFolder = 1;
 }
 
+def FLOW_TensorBarrierOp : FLOW_PureOp<"tensor.barrier", [
+  AllTypesMatch<["operand", "result"]>,
+  DeclareOpInterfaceMethods<Util_HoistableOpInterface>,
+  Util_ShapeAwareOp,
+]> {
+  let summary = [{}];
+  let description = [{
+  }];
+
+  let arguments = (ins
+    FLOW_Tensor:$operand,
+    FLOW_ShapeDynamicDims:$argument_dims,
+    AnyAttr:$target
+  );
+  let results = (outs
+    FLOW_Tensor:$result
+  );
+
+  let assemblyFormat = [{
+    $operand `:` type($result) (`{` $argument_dims^ `}`)?
+    `on` $target
+    attr-dict-with-keyword
+  }];
+
+  let builders = [
+    OpBuilder<(ins "Value":$operand, "Attribute":$target),
+    [{
+      build($_builder, $_state,
+          operand.getType(),
+          operand,
+          IREE::Util::buildDynamicDimsForValue($_state.location, operand, $_builder),
+          target);
+    }]>,
+  ];
+
+  let extraClassDeclaration = [{
+    bool isHoistableLeafOp() { return false; }
+
+    ValueRange getOperandDynamicDims(unsigned idx) { return getArgumentDims(); }
+    ValueRange getResultDynamicDims(unsigned idx) { return getArgumentDims(); }
+  }];
+
+  let hasVerifier = 1;
+  let hasCanonicalizer = 1;
+}
+
+def FLOW_TensorTransferOp : FLOW_PureOp<"tensor.transfer", [
+  AllTypesMatch<["operand", "result"]>,
+  DeclareOpInterfaceMethods<Util_HoistableOpInterface>,
+  Util_ShapeAwareOp,
+]> {
+  let summary = [{transfers a tensor to a target by copying if needed}];
+  let description = [{
+    Transfers the tensor from whichever context it may be in to the specified
+    target context. If the contexts are compatible and can access each others
+    memory the operation may be elided and otherwise will become one or more
+    copies to transfer the tensor in cases where staging through an intermediate
+    context is required.
+  }];
+
+  let arguments = (ins
+    FLOW_Tensor:$operand,
+    FLOW_ShapeDynamicDims:$argument_dims,
+    AnyAttr:$target
+  );
+  let results = (outs
+    FLOW_Tensor:$result
+  );
+
+  let assemblyFormat = [{
+    $operand `:` type($result) (`{` $argument_dims^ `}`)?
+    `to` $target
+    attr-dict-with-keyword
+  }];
+
+  let builders = [
+    OpBuilder<(ins "Value":$operand, "Attribute":$target),
+    [{
+      build($_builder, $_state,
+          operand.getType(),
+          operand,
+          IREE::Util::buildDynamicDimsForValue($_state.location, operand, $_builder),
+          target);
+    }]>,
+  ];
+
+  let extraClassDeclaration = [{
+    bool isHoistableLeafOp() { return false; }
+
+    ValueRange getOperandDynamicDims(unsigned idx) { return getArgumentDims(); }
+    ValueRange getResultDynamicDims(unsigned idx) { return getArgumentDims(); }
+  }];
+
+  let hasVerifier = 1;
+  let hasCanonicalizer = 1;
+}
+
 def FLOW_TensorSliceOp : FLOW_PureOp<"tensor.slice", [
-  FLOW_StreamableOp,
   AllRanksMatch<["source", "result"]>,
   AllElementTypesMatch<["source", "result"]>,
+  DeclareOpInterfaceMethods<Util_HoistableOpInterface>,
   AttrSizedOperandSegments,
   Util_ShapeAwareOp,
 ]> {
@@ -1505,8 +1630,7 @@ def FLOW_TensorSliceOp : FLOW_PureOp<"tensor.slice", [
   }];
 
   let extraClassDeclaration = [{
-    // StreamableOpInterface:
-    bool isTransfer() { return true; }
+    bool isHoistableLeafOp() { return false; }
 
     ValueRange getOperandDynamicDims(unsigned idx) { return getSourceDims(); }
     ValueRange getResultDynamicDims(unsigned idx) { return getResultDims(); }
@@ -1518,11 +1642,11 @@ def FLOW_TensorSliceOp : FLOW_PureOp<"tensor.slice", [
 }
 
 def FLOW_TensorUpdateOp : FLOW_PureOp<"tensor.update", [
-  FLOW_StreamableOp,
   AllRanksMatch<["update", "target", "result"]>,
   AllTypesMatch<["target", "result"]>,
   AllElementTypesMatch<["update", "target", "result"]>,
   AttrSizedOperandSegments,
+  DeclareOpInterfaceMethods<Util_HoistableOpInterface>,
   DeclareOpInterfaceMethods<Util_TiedOpInterface, [
       "getTiedResult",
       "getTiedResultOperandIndex",
@@ -1562,8 +1686,7 @@ def FLOW_TensorUpdateOp : FLOW_PureOp<"tensor.update", [
   ];
 
   let extraClassDeclaration = [{
-    // StreamableOpInterface:
-    bool isTransfer() { return true; }
+    bool isHoistableLeafOp() { return false; }
 
     ValueRange getOperandDynamicDims(unsigned idx) {
       return idx == 0 ? getTargetDims() : getUpdateDims();
@@ -1665,7 +1788,11 @@ def FLOW_DispatchWorkgroupCountFromSliceOp :
 }
 
 def FLOW_DispatchWorkloadOrdinalOp :
-    FLOW_PureOp<"dispatch.workload.ordinal"> {
+    FLOW_PureOp<"dispatch.workload.ordinal", [
+      DeclareOpInterfaceMethods<InferIntDivisibilityOpInterface>,
+      DeclareOpInterfaceMethods<InferIntRangeInterface,
+        ["inferResultRanges"]>
+    ]> {
   let arguments = (ins
     Index:$operand,
     IndexAttr:$ordinal
@@ -1732,6 +1859,11 @@ def FLOW_ChannelDefaultOp : FLOW_PureOp<"channel.default", [
     `:` type($result)
     attr-dict-with-keyword
   }];
+
+  let builders = [
+    OpBuilder<(ins "StringRef":$group)>,
+    OpBuilder<(ins)>
+  ];
 }
 
 def FLOW_ChannelSplitOp : FLOW_Op<"channel.split", [

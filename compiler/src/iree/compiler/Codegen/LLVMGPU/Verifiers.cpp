@@ -4,11 +4,11 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/Dialect/IREECodegenAttrs.h"
-#include "iree/compiler/Codegen/LLVMGPU/PassDetail.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Interfaces/PartitionableLoopsInterface.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
-#include "mlir/Dialect/Linalg/Passes.h"
+#include "iree/compiler/Codegen/Utils/Utils.h"
 
 namespace mlir::iree_compiler {
 
@@ -38,10 +38,6 @@ getInstructionShape(Operation *op, CodeGenPipeline pipeline,
                     Type inputElementType,
                     SmallVector<int64_t> &instructionShape) {
   switch (pipeline) {
-  case CodeGenPipeline::LLVMGPUMatmulSimt:
-    // SIMT Pipeline / CUDA Cores
-    instructionShape = {1, 1, 1};
-    break;
   case CodeGenPipeline::LLVMGPUMatmulTensorCore:
     // Tensor Core Pipeline / WMMA API
     if (inputElementType.isF16() || inputElementType.isBF16()) {
@@ -81,8 +77,7 @@ verifyGPUMatmulPipeline(Operation *op,
                         ArrayRef<int64_t> workgroupSize) {
   // This verifier only applies to matmul.
   CodeGenPipeline pipeline = translationInfo.getDispatchLoweringPassPipeline();
-  if (pipeline != CodeGenPipeline::LLVMGPUMatmulSimt &&
-      pipeline != CodeGenPipeline::LLVMGPUMatmulTensorCore &&
+  if (pipeline != CodeGenPipeline::LLVMGPUMatmulTensorCore &&
       pipeline != CodeGenPipeline::LLVMGPUMatmulTensorCoreMmaSync) {
     return success();
   }
@@ -96,22 +91,29 @@ verifyGPUMatmulPipeline(Operation *op,
     return op->emitOpError("expected workgroup size for GPU pipelines");
   }
 
-  assert(translationInfo.getSoftwarePipelineStoreStage() == 1 &&
-         "Store to workgroup memory currently expected to happen in stage 1 of "
-         "software pipeline.");
+  FailureOr<int64_t> maybeDepth =
+      getSoftwarePipelineDepth(translationInfo.getConfiguration());
+  FailureOr<int64_t> maybeStage =
+      getSoftwarePipelineStoreStage(translationInfo.getConfiguration());
+  if (failed(maybeDepth) || failed(maybeStage)) {
+    return op->emitOpError(
+        "invalid matmul configuration without pipelining config");
+  }
+
+  if (*maybeStage != 1) {
+    return op->emitError(
+        "store to workgroup memory currently expected to happen in stage 1 of "
+        "software pipeline.");
+  }
 
   // Get compilation pipeline.
   StringRef pipelineName = stringifyEnum(pipeline);
 
-  assert(translationInfo.getSoftwarePipelineStoreStage() == 1 &&
-         "Store to workgroup memory currently expected to happen in stage 1 of "
-         "software pipeline.");
-
   // Get Operand/Result types.
   mlir::Type lhsType = op->getOperand(0).getType();
   mlir::Type rhsType = op->getOperand(1).getType();
-  assert(lhsType.cast<ShapedType>().getElementType() ==
-             rhsType.cast<ShapedType>().getElementType() &&
+  assert(cast<ShapedType>(lhsType).getElementType() ==
+             cast<ShapedType>(rhsType).getElementType() &&
          "expected lhs and rhs to have same type. Mixed input types are not "
          "supported yet in IREE Codegen.");
 
@@ -172,10 +174,6 @@ verifyGPUMatmulPipeline(Operation *op,
            << workgroupSize[kDimZ] << " with compilation pipeline "
            << pipelineName;
   }
-
-  // Return success for SIMT/CUDA cores.
-  if (pipeline == CodeGenPipeline::LLVMGPUMatmulSimt)
-    return success();
 
   //
   // Additional verification Tensor Core pipelines.

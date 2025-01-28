@@ -14,9 +14,8 @@ iree_lit_test_suite(
   NAME
     lit
   SRCS
-    "llvmcpu_materialize_encoding.mlir"
     "lower_to_ukernel_ops.mlir"
-    "vmvx_materialize_encoding.mlir"
+    "prepare_ukernels.mlir"
   TOOLS
     FileCheck
     iree-opt

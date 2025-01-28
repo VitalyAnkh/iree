@@ -5,45 +5,57 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/EncodingUtils.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenTypes.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/Utils/Utils.h"
+#include "iree/compiler/Dialect/Encoding/IR/EncodingTypes.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/IndexingUtils.h"
+#include "mlir/IR/BuiltinAttributes.h"
+
+#include <numeric>
 
 namespace mlir::iree_compiler {
 
-using IREE::LinalgExt::EncodingAttr;
-using IREE::LinalgExt::EncodingRole;
-using IREE::LinalgExt::EncodingUser;
-
-/// For a given tensor type with an encoding, return the materialized
-/// type to use for it. If no encoding is set, then return the tensor type
-/// itself.
-static RankedTensorType
-getMaterializedType(RankedTensorType tensorType,
-                    MaterializeEncodingFn materializeEncodingFn) {
-  FailureOr<MaterializeEncodingInfo> materializeEncodingInfo =
-      materializeEncodingFn(tensorType);
-  if (failed(materializeEncodingInfo)) {
-    return dropEncoding(tensorType);
-  }
-  return tensor::PackOp::inferPackedType(
-             getOriginalTypeWithEncoding(tensorType)
-                 .clone(tensorType.getElementType()),
-             materializeEncodingInfo->innerTileSizes,
-             materializeEncodingInfo->innerDimsPos,
-             materializeEncodingInfo->outerDimsPerm)
-      .cast<RankedTensorType>();
-}
+using IREE::Codegen::MaterializeEncodingInfo;
+using IREE::Encoding::EncodingAttr;
+using IREE::Encoding::getEncodingAttr;
+using IREE::Encoding::getEncodingContractionDims;
 
 MaterializeEncodingTypeConverter::MaterializeEncodingTypeConverter(
-    MaterializeEncodingFn materializeEncodingFn)
-    : materializeEncodingFn(materializeEncodingFn) {
+    IREE::Codegen::LayoutAttrInterface layoutAttr)
+    : layoutAttr(layoutAttr) {
   addConversion([](IntegerType intType) { return intType; });
   addConversion([](IndexType indexType) { return indexType; });
   addConversion([](FloatType floatType) { return floatType; });
   addConversion([](MemRefType memrefType) { return memrefType; });
-  addConversion(
-      [materializeEncodingFn](RankedTensorType t) -> RankedTensorType {
-        return getMaterializedType(t, materializeEncodingFn);
-      });
+  addConversion([=](RankedTensorType type) -> RankedTensorType {
+    // For a given tensor type with an encoding, return the materialized
+    // type to use for it. If no encoding is set, then return the tensor type
+    // itself.
+    MaterializeEncodingInfo encodingInfo = getEncodingInfo(type);
+    if (IREE::Codegen::isIdentityLayout(encodingInfo)) {
+      return dropEncoding(type);
+    }
+    auto packedType = cast<RankedTensorType>(tensor::PackOp::inferPackedType(
+        type, encodingInfo.innerTileSizes, encodingInfo.innerDimsPos,
+        encodingInfo.outerDimsPerm));
+
+    // There is no swizzle, we are already done. Typically the case on CPU.
+    if (!encodingInfo.swizzle) {
+      return packedType;
+    }
+
+    // There is a swizzle, we need to handle it. Typically the case on GPU.
+    auto swizzle = *encodingInfo.swizzle;
+    SmallVector<int64_t> newShape(
+        packedType.getShape().drop_back(encodingInfo.innerTileSizes.size()));
+    SmallVector<int64_t> swizzledTileShape =
+        IREE::Codegen::getExpandedTileShape(swizzle.expandShape);
+    applyPermutationToVector(swizzledTileShape, swizzle.permutation);
+    newShape.append(swizzledTileShape);
+    return RankedTensorType::get(newShape, packedType.getElementType());
+  });
 }
 
 MaterializeEncodingConversionTarget::MaterializeEncodingConversionTarget(
@@ -52,137 +64,51 @@ MaterializeEncodingConversionTarget::MaterializeEncodingConversionTarget(
   // Mark any operation that has operands/results with encoding as
   // illegal.
   markUnknownOpDynamicallyLegal([](Operation *op) {
-    auto typeHasEncoding = [](Type t) -> bool {
-      auto tensorType = t.dyn_cast<RankedTensorType>();
-      return tensorType && tensorType.getEncoding();
+    auto typeHasDataTilingEncoding = [](Type t) -> bool {
+      auto tensorType = dyn_cast<RankedTensorType>(t);
+      if (!tensorType)
+        return false;
+      return getEncodingAttr(tensorType) != nullptr;
     };
-    auto valueHasEncoding = [=](Value v) -> bool {
-      return typeHasEncoding(v.getType());
+    auto valueHasDataTilingEncoding = [=](Value v) -> bool {
+      return typeHasDataTilingEncoding(v.getType());
     };
     bool hasOperandOrResultsWithEncoding =
-        llvm::any_of(op->getOperands(), valueHasEncoding) ||
-        llvm::any_of(op->getResultTypes(), typeHasEncoding);
+        llvm::any_of(op->getOperands(), valueHasDataTilingEncoding) ||
+        llvm::any_of(op->getResultTypes(), typeHasDataTilingEncoding);
     return !hasOperandOrResultsWithEncoding;
   });
 }
 
-EncodingAttr getEncodingAttr(RankedTensorType type) {
-  return type.getEncoding().dyn_cast_or_null<EncodingAttr>();
-}
-
-RankedTensorType getOriginalTypeWithEncoding(RankedTensorType type) {
-  auto encoding = getEncodingAttr(type);
-  if (!encoding) {
-    return type;
+IREE::Codegen::MaterializeEncodingInfo
+MaterializeEncodingTypeConverter::getEncodingInfo(RankedTensorType type) const {
+  // If the layout is present in the encoding, use it directly. It means that
+  // the layout is already resolved and some information could be dropped during
+  // the lowering. Thus, we prioritize the resolved layout.
+  if (auto maybeEncodingInfo = getEncodingInfoFromLayouts(type)) {
+    return maybeEncodingInfo.value();
   }
-  RankedTensorType originalType = type;
-  if (auto originalTypeAttr = encoding.getOriginalType()) {
-    originalType = originalTypeAttr.getValue().cast<RankedTensorType>();
-  }
-  return RankedTensorType::get(originalType.getShape(),
-                               originalType.getElementType(), encoding);
+  return layoutAttr.getEncodingInfo(type);
 }
 
 RankedTensorType dropEncoding(RankedTensorType type) {
   return RankedTensorType::get(type.getShape(), type.getElementType());
 }
 
-bool isMatmulEncodingUser(EncodingUser user) {
-  return user == EncodingUser::MATMUL;
-}
-
-bool isBatchMatmulEncodingUser(EncodingUser user) {
-  return user == EncodingUser::BATCH_MATMUL;
-}
-
-int64_t getIntOrZero(IntegerAttr a) {
-  return a == IntegerAttr() ? 0 : a.getInt();
-}
-
-bool isVecmatEncoding(EncodingAttr encoding) {
-  return encoding.getUser().getValue() == EncodingUser::MATMUL &&
-         getIntOrZero(encoding.getMatmulNarrow_M()) == 1;
-}
-
-bool isMatvecEncoding(EncodingAttr encoding) {
-  return encoding.getUser().getValue() == EncodingUser::MATMUL &&
-         getIntOrZero(encoding.getMatmulNarrow_N()) == 1;
-}
-
-bool isBatchVecmatEncoding(EncodingAttr encoding) {
-  return encoding.getUser().getValue() == EncodingUser::BATCH_MATMUL &&
-         getIntOrZero(encoding.getMatmulNarrow_M()) == 1;
-}
-
-bool isBatchMatvecEncoding(EncodingAttr encoding) {
-  return encoding.getUser().getValue() == EncodingUser::BATCH_MATMUL &&
-         getIntOrZero(encoding.getMatmulNarrow_N()) == 1;
-}
-
-bool isVectorEncoding(int64_t rank, EncodingUser user) {
-  return rank == 1 || (isBatchMatmulEncodingUser(user) && rank == 2);
-}
-
-MaterializeEncodingInfo getEncodingInfoForMatmul(EncodingAttr encoding,
-                                                 int64_t rank,
-                                                 TileMxNxK tileMxNxK) {
-  EncodingUser user = encoding.getUser().getValue();
-  EncodingRole role = encoding.getRole().getValue();
-  bool isVector = isVectorEncoding(rank, user);
-  bool isVecmatVector = (isVector && (isVecmatEncoding(encoding) ||
-                                      isBatchVecmatEncoding(encoding)));
-  bool isMatvecVector = (isVector && (isMatvecEncoding(encoding) ||
-                                      isBatchMatvecEncoding(encoding)));
-  // Start dim of the MxK (LHS), KxN (RHS), or MxN (RESULT) 2D matrix.
-  int64_t matmulDimBase = isBatchMatmulEncodingUser(user) ? 1 : 0;
-
-  MaterializeEncodingInfo encodingInfo;
-  if (isVector) {
-    encodingInfo.innerDimsPos = {matmulDimBase};
-  } else {
-    encodingInfo.innerDimsPos = {matmulDimBase, matmulDimBase + 1};
+std::optional<IREE::Codegen::MaterializeEncodingInfo>
+getEncodingInfoFromLayouts(RankedTensorType type) {
+  auto encodingAttr = IREE::Encoding::getEncodingAttr(type);
+  if (!encodingAttr) {
+    return std::nullopt;
   }
-
-  switch (role) {
-  case (EncodingRole::LHS): {
-    if (isVecmatVector) {
-      encodingInfo.innerTileSizes = {tileMxNxK.K};
-      break;
-    }
-    encodingInfo.innerTileSizes = {tileMxNxK.M, tileMxNxK.K};
-    break;
+  auto layoutsAttr = encodingAttr.getLayouts();
+  if (!layoutsAttr) {
+    return std::nullopt;
   }
-  case (EncodingRole::RHS): {
-    if (isMatvecVector) {
-      encodingInfo.innerTileSizes = {tileMxNxK.K};
-      break;
-    }
-    encodingInfo.innerTileSizes = {tileMxNxK.N, tileMxNxK.K};
-    encodingInfo.innerDimsPos = {matmulDimBase + 1, matmulDimBase};
-    encodingInfo.outerDimsPerm =
-        llvm::to_vector(llvm::seq<int64_t>(0, matmulDimBase));
-    encodingInfo.outerDimsPerm.push_back(matmulDimBase + 1);
-    encodingInfo.outerDimsPerm.push_back(matmulDimBase);
-    break;
-  }
-  case (EncodingRole::RESULT): {
-    if (isVecmatVector) {
-      encodingInfo.innerTileSizes = {tileMxNxK.N};
-      break;
-    }
-    if (isMatvecVector) {
-      encodingInfo.innerTileSizes = {tileMxNxK.M};
-      break;
-    }
-    encodingInfo.innerTileSizes = {tileMxNxK.M, tileMxNxK.N};
-    break;
-  }
-  default: {
-    assert(false);
-    return {};
-  }
-  }
-  return encodingInfo;
+  ArrayRef<Attribute> layouts = layoutsAttr.getValue();
+  assert(layouts.size() == 1 && "only single layout is supported");
+  return cast<IREE::Codegen::LayoutAttrInterface>(layouts[0])
+      .getEncodingInfo(type);
 }
 
 } // namespace mlir::iree_compiler

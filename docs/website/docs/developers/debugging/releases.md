@@ -6,12 +6,13 @@ icon: octicons/package-16
 
 ## Tools and Locations
 
-* `.github/workflows/build_package.yml`: Release packaging jobs
-* `build_tools/github_actions/build_dist.py`: Main script to build various
-  release packages (for all platforms). We usually use this when reproing to
-  approximate exactly what the CI does. Assumes a subdirectory of `c`
-  and writes builds to `iree-build` and `iree-install` as a peer of it. To use
-  locally, just symlink your source dir as `c` in an empty
+* [`.github/workflows/build_package.yml`](https://github.com/iree-org/iree/blob/main/.github/workflows/build_package.yml):
+  Release packaging jobs
+* [`build_tools/github_actions/build_dist.py`](https://github.com/iree-org/iree/blob/main/build_tools/github_actions/build_dist.py):
+  Main script to build various release packages (for all platforms). We usually
+  use this when reproing to approximate exactly what the CI does. Assumes a
+  subdirectory of `c` and writes builds to `iree-build` and `iree-install` as a
+  peer of it. To use locally, just symlink your source dir as `c` in an empty
   directory (versus checking out).
 
 ## Mapping releases back to git commits
@@ -36,16 +37,20 @@ f1cb2692a086738d7f16274b9b3af6d2c15ef133
 
 ## Manylinux releases
 
-The Linux releases are done in a manylinux2014 docker container. At the time of
-this writing, it has gcc 9.3.1 and Python versions 3.5 - 3.9 under `/opt/python`.
-Note that this docker image approximates a 2014 era RHEL distro, patched with
-backported (newer) dev packages. It builds with gcc and BFD linker unless if
-you arrange otherwise. `yum` can be used to get some packages.
+The Linux releases are done in a manylinux2014 docker container defined in the
+[`manylinux_x86_64.Dockerfile`](https://github.com/iree-org/base-docker-images/blob/main/dockerfiles/manylinux_x86_64.Dockerfile)
+file within the
+[iree-org/base-docker-images repository](https://github.com/iree-org/base-docker-images/).
+At the time of this writing, it has gcc 9.3.1 and Python versions 3.5 - 3.9
+under `/opt/python`. Note that this docker image approximates a 2014 era RHEL
+distro, patched with backported (newer) dev packages. It builds with gcc and
+BFD linker unless if you arrange otherwise. `yum` can be used to get some
+packages.
 
 Get a docker shell (see exact docker image in build_package.yml workflow):
 
 ```shell
-docker run --rm -it -v $(pwd):/work/c stellaraccident/manylinux2014_x86_64-bazel-4.2.2:latest /bin/bash
+docker run --rm -it -v $(pwd):/work/c ghcr.io/iree-org/manylinux_x86_64:main /bin/bash
 ```
 
 Remember that docker runs as root unless if you take steps otherwise. Don't
@@ -116,29 +121,29 @@ required before these github actions will work on your fork and development
 branch.
 
 You can run
-[`schedule_candidate_release.yml`](https://github.com/openxla/iree/blob/main/.github/workflows/schedule_candidate_release.yml)
+[`schedule_candidate_release.yml`](https://github.com/iree-org/iree/blob/main/.github/workflows/schedule_candidate_release.yml)
 with a workflow dispatch from the actions tab. If you want to test using a
 commit other than the latest green on your `main` branch, modify the section
 that
-[identifies the latest green commit](https://github.com/openxla/iree/blob/c7b29123f8bd80c1346d2a9e6c5227b372b75616/.github/workflows/schedule_candidate_release.yml#L25)
+[identifies the latest green commit](https://github.com/iree-org/iree/blob/c7b29123f8bd80c1346d2a9e6c5227b372b75616/.github/workflows/schedule_candidate_release.yml#L25)
 to search from another commit or just hardcode one.
 
 To speed up
-[`build_package.yml`](https://github.com/openxla/iree/blob/main/.github/workflows/build_package.yml),
+[`build_package.yml`](https://github.com/iree-org/iree/blob/main/.github/workflows/build_package.yml),
 you may want to comment out some of the builds
-[here](https://github.com/openxla/iree/blob/392449e986493bf710e3da637ebf807715da9ffe/.github/workflows/build_package.yml#L34-L87).
+[here](https://github.com/iree-org/iree/blob/392449e986493bf710e3da637ebf807715da9ffe/.github/workflows/build_package.yml#L34-L87).
 The
-[`py-pure-pkgs`](https://github.com/openxla/iree/blob/392449e986493bf710e3da637ebf807715da9ffe/.github/workflows/build_package.yml#L52)
+[`py-pure-pkgs`](https://github.com/iree-org/iree/blob/392449e986493bf710e3da637ebf807715da9ffe/.github/workflows/build_package.yml#L52)
 build takes only ~2 minutes and the
-[`py-runtime-pkg`](https://github.com/openxla/iree/blob/392449e986493bf710e3da637ebf807715da9ffe/.github/workflows/build_package.yml#L39)
+[`py-runtime-pkg`](https://github.com/iree-org/iree/blob/392449e986493bf710e3da637ebf807715da9ffe/.github/workflows/build_package.yml#L39)
 build takes ~5, while the others can take several hours.
 
 From your development branch, you can manually run the
-[Schedule Snapshot Release](https://github.com/openxla/iree/actions/workflows/schedule_snapshot_release.yml)
+[Schedule Snapshot Release](https://github.com/iree-org/iree/actions/workflows/schedule_snapshot_release.yml)
 action, which invokes the
-[Build Release Packages](https://github.com/openxla/iree/actions/workflows/build_package.yml)
+[Build Release Packages](https://github.com/iree-org/iree/actions/workflows/build_package.yml)
 action, which finally invokes the
-[Validate and Publish Release](https://github.com/openxla/iree/actions/workflows/validate_and_publish_release.yml)
+[Validate and Publish Release](https://github.com/iree-org/iree/actions/workflows/validate_and_publish_release.yml)
 action.  If you already have a draft release and know the release id, package
 version, and run ID from a previous Build Release Packages run, you can
 also manually run just the Validate and Publish Release action.

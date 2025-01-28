@@ -23,14 +23,13 @@ iree_cc_library(
   NAME
     PassHeaders
   HDRS
-    "PassDetail.h"
     "Passes.h"
     "Passes.h.inc"
   DEPS
     ::PassesIncGen
     MLIRPass
     MLIRTransforms
-    iree::compiler::Codegen::Dialect::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Utils
   PUBLIC
@@ -43,14 +42,11 @@ iree_cc_library(
     "Passes.h"
   SRCS
     "CPULowerToUKernels.cpp"
-    "CPUMaterializeEncodingPass.cpp"
+    "CPUPrepareUkernels.cpp"
     "Passes.cpp"
   DEPS
     ::PassHeaders
     ::PassesIncGen
-    IREELinalgExtDialect
-    IREELinalgExtTransforms
-    IREELinalgExtUtils
     LLVMSupport
     MLIRAffineDialect
     MLIRAffineTransforms
@@ -59,8 +55,10 @@ iree_cc_library(
     MLIRBufferizationDialect
     MLIRDestinationStyleOpInterface
     MLIRFuncDialect
+    MLIRFunctionInterfaces
     MLIRIR
     MLIRLinalgDialect
+    MLIRLinalgTransforms
     MLIRLinalgUtils
     MLIRMemRefDialect
     MLIRMemRefTransforms
@@ -72,16 +70,19 @@ iree_cc_library(
     MLIRSupport
     MLIRTensorDialect
     MLIRTensorTransforms
+    MLIRTransformUtils
     MLIRTransforms
     MLIRVectorDialect
     MLIRVectorToSCF
     MLIRVectorTransforms
     iree::builtins::ukernel::exported_bits
     iree::compiler::Codegen::Common
-    iree::compiler::Codegen::Dialect::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::Codegen::Utils
     iree::compiler::Codegen::Interfaces::UKernelOpInterface
     iree::compiler::Codegen::Transforms
     iree::compiler::Codegen::Utils
+    iree::compiler::Dialect::Encoding::IR
     iree::compiler::Dialect::HAL::IR
   PUBLIC
 )

@@ -33,6 +33,13 @@
 
 namespace mlir::iree_compiler::IREE::HAL {
 
+class DeviceTargetAttr;
+class TargetRegistry;
+
+using BuildDeviceTargetMatchFn = std::function<Value(
+    Location loc, Value device, IREE::HAL::DeviceTargetAttr targetAttr,
+    OpBuilder &builder)>;
+
 #include "iree/compiler/Dialect/HAL/IR/HALAttrInterfaces.h.inc" // IWYU pragma: export
 #include "iree/compiler/Dialect/HAL/IR/HALOpInterfaces.h.inc" // IWYU pragma: export
 #include "iree/compiler/Dialect/HAL/IR/HALTypeInterfaces.h.inc" // IWYU pragma: export
@@ -40,14 +47,6 @@ namespace mlir::iree_compiler::IREE::HAL {
 //===----------------------------------------------------------------------===//
 // Utilities
 //===----------------------------------------------------------------------===//
-
-// Returns a stable identifier for the MLIR element type or nullopt if the
-// type is unsupported in the ABI.
-std::optional<int32_t> getElementTypeValue(Type type);
-
-// Returns a stable identifier for the MLIR encoding type or 0 (opaque) if the
-// type is unsupported in the ABI.
-std::optional<int32_t> getEncodingTypeValue(Attribute attr);
 
 template <typename T>
 inline bool allEnumBitsSet(T value, T required) {
@@ -112,19 +111,19 @@ struct CommandBufferType
   static constexpr StringLiteral name = "hal.command_buffer";
 };
 
-struct DescriptorSetLayoutType
-    : public Type::TypeBase<DescriptorSetLayoutType, Type, TypeStorage> {
-  using Base::Base;
-
-  static constexpr StringLiteral name = "hal.descriptor_set_layout";
-};
-
 struct DeviceType
     : public Type::TypeBase<DeviceType, Type, TypeStorage,
-                            mlir::OpTrait::IREE::Util::ImplicitlyCaptured> {
+                            mlir::OpTrait::IREE::Util::ImplicitlyCaptured,
+                            IREE::Util::ReferenceTypeInterface::Trait> {
   using Base::Base;
 
   static constexpr StringLiteral name = "hal.device";
+
+  // Resolves to any device at runtime.
+  // This is unlikely to be what any particular caller wants and should be
+  // avoided outside of testing/debugging passes that don't care about
+  // multi-targeting.
+  static Value resolveAny(Location loc, OpBuilder &builder);
 };
 
 struct EventType : public Type::TypeBase<EventType, Type, TypeStorage> {
@@ -152,13 +151,6 @@ struct FileType : public Type::TypeBase<FileType, Type, TypeStorage> {
   static constexpr StringLiteral name = "hal.file";
 };
 
-struct PipelineLayoutType
-    : public Type::TypeBase<PipelineLayoutType, Type, TypeStorage> {
-  using Base::Base;
-
-  static constexpr StringLiteral name = "hal.pipeline_layout";
-};
-
 struct SemaphoreType : public Type::TypeBase<SemaphoreType, Type, TypeStorage> {
   using Base::Base;
 
@@ -172,8 +164,17 @@ struct SemaphoreType : public Type::TypeBase<SemaphoreType, Type, TypeStorage> {
 // A tuple containing runtime values for a descriptor set binding.
 // The buffer specified may be either a !hal.buffer or an index of a binding
 // table slot to source the buffer from.
-struct DescriptorSetBindingValue {
+struct PipelineBindingValue {
   Value ordinal;
+  Value buffer;
+  Value byteOffset;
+  Value byteLength;
+};
+
+// A tuple containing runtime values for a binding.
+// The buffer specified may be either a !hal.buffer or an index of a binding
+// table slot to source the buffer from.
+struct BindingValue {
   Value buffer;
   Value byteOffset;
   Value byteLength;
@@ -189,95 +190,17 @@ struct StaticRange {
 
 } // namespace mlir::iree_compiler::IREE::HAL
 
-// It's unfortunate this is required.
-namespace mlir {
-
-template <>
-struct FieldParser<
-    std::optional<mlir::iree_compiler::IREE::HAL::CollectiveReductionOp>> {
-  static FailureOr<mlir::iree_compiler::IREE::HAL::CollectiveReductionOp>
-  parse(AsmParser &parser) {
-    std::string value;
-    if (parser.parseKeywordOrString(&value))
-      return failure();
-    auto result = mlir::iree_compiler::IREE::HAL::symbolizeEnum<
-        mlir::iree_compiler::IREE::HAL::CollectiveReductionOp>(value);
-    if (!result.has_value())
-      return failure();
-    return result.value();
-  }
-};
-static inline AsmPrinter &
-operator<<(AsmPrinter &printer,
-           std::optional<mlir::iree_compiler::IREE::HAL::CollectiveReductionOp>
-               param) {
-  printer << (param.has_value()
-                  ? mlir::iree_compiler::IREE::HAL::stringifyEnum(param.value())
-                  : StringRef{""});
-  return printer;
-}
-
-template <>
-struct FieldParser<
-    std::optional<mlir::iree_compiler::IREE::HAL::DescriptorSetLayoutFlags>> {
-  static FailureOr<mlir::iree_compiler::IREE::HAL::DescriptorSetLayoutFlags>
-  parse(AsmParser &parser) {
-    std::string value;
-    if (parser.parseKeywordOrString(&value))
-      return failure();
-    auto result = mlir::iree_compiler::IREE::HAL::symbolizeEnum<
-        mlir::iree_compiler::IREE::HAL::DescriptorSetLayoutFlags>(value);
-    if (!result.has_value())
-      return failure();
-    return result.value();
-  }
-};
-static inline AsmPrinter &operator<<(
-    AsmPrinter &printer,
-    std::optional<mlir::iree_compiler::IREE::HAL::DescriptorSetLayoutFlags>
-        param) {
-  printer << (param.has_value()
-                  ? mlir::iree_compiler::IREE::HAL::stringifyEnum(param.value())
-                  : StringRef{""});
-  return printer;
-}
-
-template <>
-struct FieldParser<
-    std::optional<mlir::iree_compiler::IREE::HAL::DescriptorFlags>> {
-  static FailureOr<mlir::iree_compiler::IREE::HAL::DescriptorFlags>
-  parse(AsmParser &parser) {
-    std::string value;
-    if (parser.parseKeywordOrString(&value))
-      return failure();
-    auto result = mlir::iree_compiler::IREE::HAL::symbolizeEnum<
-        mlir::iree_compiler::IREE::HAL::DescriptorFlags>(value);
-    if (!result.has_value())
-      return failure();
-    return result.value();
-  }
-};
-static inline AsmPrinter &operator<<(
-    AsmPrinter &printer,
-    std::optional<mlir::iree_compiler::IREE::HAL::DescriptorFlags> param) {
-  printer << (param.has_value()
-                  ? mlir::iree_compiler::IREE::HAL::stringifyEnum(param.value())
-                  : StringRef{""});
-  return printer;
-}
-
-static inline AsmPrinter &
-operator<<(AsmPrinter &printer,
-           mlir::iree_compiler::IREE::HAL::DescriptorType param) {
-  printer << mlir::iree_compiler::IREE::HAL::stringifyEnum(param);
-  return printer;
-}
-
-} // namespace mlir
-
 // clang-format off: must be included after all LLVM/MLIR headers.
 #define GET_ATTRDEF_CLASSES
 #include "iree/compiler/Dialect/HAL/IR/HALAttrs.h.inc" // IWYU pragma: keep
 // clang-format on
+
+//===----------------------------------------------------------------------===//
+// Utilities
+//===----------------------------------------------------------------------===//
+
+namespace mlir::iree_compiler::IREE::HAL {
+
+} // namespace mlir::iree_compiler::IREE::HAL
 
 #endif // IREE_COMPILER_DIALECT_HAL_IR_HALTYPES_H_

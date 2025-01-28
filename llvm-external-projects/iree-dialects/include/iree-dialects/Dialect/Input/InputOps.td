@@ -535,7 +535,7 @@ def IREEInput_TensorBitCastOp : IREEInput_PureOp<"tensor.bitcast", [
 def IREEInput_TensorLoadOp : IREEInput_PureOp<"tensor.load", [
     TypesMatchWith<"value type matches element type of target operand",
                    "source", "result",
-                   "$_self.cast<ShapedType>().getElementType()">,
+                   "cast<ShapedType>($_self).getElementType()">,
     AttrSizedOperandSegments,
   ]> {
   let summary = [{loads a value from a tensor element}];
@@ -549,7 +549,7 @@ def IREEInput_TensorLoadOp : IREEInput_PureOp<"tensor.load", [
     Variadic<IREEInput_Dim>:$indices
   );
   let results = (outs
-    AnyTypeOf<[IREEInput_PrimitiveType, AnyVector]>:$result
+    AnyTypeOf<[IREEInput_PrimitiveType, AnyVectorOfNonZeroRank]>:$result
   );
 
   let assemblyFormat = [{
@@ -564,7 +564,7 @@ def IREEInput_TensorStoreOp : IREEInput_PureOp<"tensor.store", [
     AllTypesMatch<["target", "result"]>,
     TypesMatchWith<"value type matches element type of target operand",
                    "target", "value",
-                   "$_self.cast<ShapedType>().getElementType()">,
+                   "cast<ShapedType>($_self).getElementType()">,
     AttrSizedOperandSegments,
   ]> {
   let summary = [{stores a value into a tensor element}];
@@ -573,7 +573,7 @@ def IREEInput_TensorStoreOp : IREEInput_PureOp<"tensor.store", [
   }];
 
   let arguments = (ins
-    AnyTypeOf<[IREEInput_PrimitiveType, AnyVector]>:$value,
+    AnyTypeOf<[IREEInput_PrimitiveType, AnyVectorOfNonZeroRank]>:$value,
     IREEInput_Tensor:$target,
     IREEInput_ShapeDynamicDims:$target_dims,
     Variadic<IREEInput_Dim>:$indices
@@ -592,7 +592,7 @@ def IREEInput_TensorStoreOp : IREEInput_PureOp<"tensor.store", [
 def IREEInput_TensorSplatOp : IREEInput_PureOp<"tensor.splat", [
     TypesMatchWith<"value type matches element type of result",
                    "result", "value",
-                   "$_self.cast<ShapedType>().getElementType()">,
+                   "cast<ShapedType>($_self).getElementType()">,
   ]> {
   let summary = [{splats a value into a shaped tensor}];
   let description = [{
@@ -873,12 +873,12 @@ def IREEInput_AlignOp : IREEInput_PureOp<"align", [
   }];
 
   let arguments = (ins
-    SignlessIntegerLike:$value,
-    SignlessIntegerLike:$alignment
+    SignlessIntegerOrIndexLike:$value,
+    SignlessIntegerOrIndexLike:$alignment
   );
 
   let results = (outs
-    SignlessIntegerLike:$result
+    SignlessIntegerOrIndexLike:$result
   );
 
   let assemblyFormat = [{

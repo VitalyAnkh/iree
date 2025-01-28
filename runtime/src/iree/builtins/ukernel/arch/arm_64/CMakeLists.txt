@@ -15,54 +15,53 @@ if(_IREE_UKERNEL_BITCODE_BUILD_ARM_64)
 
 iree_bitcode_library(
   NAME
-    ukernel_bitcode_arm_64_entry_points
+    ukernel_bitcode_arch_arm_64_entry_points
   ARCH
-    wasm_64
+    arm_64
   INTERNAL_HDRS
     "${PROJECT_BINARY_DIR}/runtime/src/iree/builtins/ukernel/internal_headers_filegroup.stamp"
     "${PROJECT_BINARY_DIR}/runtime/src/iree/schemas/cpu_data_headers_filegroup.stamp"
     "common_arm_64.h"
-    "common_arm_64_entry_point.h"
     "mmt4d_arm_64_internal.h"
+    "mmt4d_arm_64_tiles.inl"
     "pack_arm_64_internal.h"
     "unpack_arm_64_internal.h"
   SRCS
     "mmt4d_arm_64_entry_point.c"
     "pack_arm_64_entry_point.c"
-    "query_tile_sizes_arm_64_entry_point.c"
     "unpack_arm_64_entry_point.c"
 )
 
 iree_bitcode_library(
   NAME
-    ukernel_bitcode_arm_64_base
+    ukernel_bitcode_arch_arm_64_base
   ARCH
     arm_64
   INTERNAL_HDRS
     "${PROJECT_BINARY_DIR}/runtime/src/iree/builtins/ukernel/internal_headers_filegroup.stamp"
     "${PROJECT_BINARY_DIR}/runtime/src/iree/schemas/cpu_data_headers_filegroup.stamp"
     "common_arm_64.h"
-    "common_arm_64_entry_point.h"
     "mmt4d_arm_64_internal.h"
+    "mmt4d_arm_64_tiles.inl"
     "pack_arm_64_internal.h"
     "unpack_arm_64_internal.h"
   SRCS
-    "mmt4d_arm_64.c"
-    "pack_arm_64.c"
-    "unpack_arm_64.c"
+    "mmt4d_arm_64_base.c"
+    "pack_arm_64_base.c"
+    "unpack_arm_64_base.c"
 )
 
 iree_bitcode_library(
   NAME
-    ukernel_bitcode_arm_64_fullfp16
+    ukernel_bitcode_arch_arm_64_fullfp16
   ARCH
     arm_64
   INTERNAL_HDRS
     "${PROJECT_BINARY_DIR}/runtime/src/iree/builtins/ukernel/internal_headers_filegroup.stamp"
     "${PROJECT_BINARY_DIR}/runtime/src/iree/schemas/cpu_data_headers_filegroup.stamp"
     "common_arm_64.h"
-    "common_arm_64_entry_point.h"
     "mmt4d_arm_64_internal.h"
+    "mmt4d_arm_64_tiles.inl"
     "pack_arm_64_internal.h"
     "unpack_arm_64_internal.h"
   SRCS
@@ -73,15 +72,15 @@ iree_bitcode_library(
 
 iree_bitcode_library(
   NAME
-    ukernel_bitcode_arm_64_fp16fml
+    ukernel_bitcode_arch_arm_64_fp16fml
   ARCH
     arm_64
   INTERNAL_HDRS
     "${PROJECT_BINARY_DIR}/runtime/src/iree/builtins/ukernel/internal_headers_filegroup.stamp"
     "${PROJECT_BINARY_DIR}/runtime/src/iree/schemas/cpu_data_headers_filegroup.stamp"
     "common_arm_64.h"
-    "common_arm_64_entry_point.h"
     "mmt4d_arm_64_internal.h"
+    "mmt4d_arm_64_tiles.inl"
     "pack_arm_64_internal.h"
     "unpack_arm_64_internal.h"
   SRCS
@@ -92,15 +91,15 @@ iree_bitcode_library(
 
 iree_bitcode_library(
   NAME
-    ukernel_bitcode_arm_64_bf16
+    ukernel_bitcode_arch_arm_64_bf16
   ARCH
     arm_64
   INTERNAL_HDRS
     "${PROJECT_BINARY_DIR}/runtime/src/iree/builtins/ukernel/internal_headers_filegroup.stamp"
     "${PROJECT_BINARY_DIR}/runtime/src/iree/schemas/cpu_data_headers_filegroup.stamp"
     "common_arm_64.h"
-    "common_arm_64_entry_point.h"
     "mmt4d_arm_64_internal.h"
+    "mmt4d_arm_64_tiles.inl"
     "pack_arm_64_internal.h"
     "unpack_arm_64_internal.h"
   SRCS
@@ -111,15 +110,15 @@ iree_bitcode_library(
 
 iree_bitcode_library(
   NAME
-    ukernel_bitcode_arm_64_dotprod
+    ukernel_bitcode_arch_arm_64_dotprod
   ARCH
     arm_64
   INTERNAL_HDRS
     "${PROJECT_BINARY_DIR}/runtime/src/iree/builtins/ukernel/internal_headers_filegroup.stamp"
     "${PROJECT_BINARY_DIR}/runtime/src/iree/schemas/cpu_data_headers_filegroup.stamp"
     "common_arm_64.h"
-    "common_arm_64_entry_point.h"
     "mmt4d_arm_64_internal.h"
+    "mmt4d_arm_64_tiles.inl"
     "pack_arm_64_internal.h"
     "unpack_arm_64_internal.h"
   SRCS
@@ -130,15 +129,15 @@ iree_bitcode_library(
 
 iree_bitcode_library(
   NAME
-    ukernel_bitcode_arm_64_i8mm
+    ukernel_bitcode_arch_arm_64_i8mm
   ARCH
     arm_64
   INTERNAL_HDRS
     "${PROJECT_BINARY_DIR}/runtime/src/iree/builtins/ukernel/internal_headers_filegroup.stamp"
     "${PROJECT_BINARY_DIR}/runtime/src/iree/schemas/cpu_data_headers_filegroup.stamp"
     "common_arm_64.h"
-    "common_arm_64_entry_point.h"
     "mmt4d_arm_64_internal.h"
+    "mmt4d_arm_64_tiles.inl"
     "pack_arm_64_internal.h"
     "unpack_arm_64_internal.h"
   SRCS
@@ -149,20 +148,20 @@ iree_bitcode_library(
 
 iree_link_bitcode(
   NAME
-    ukernel_bitcode_arm_64
+    ukernel_bitcode_arch_arm_64
   SRCS
-    "ukernel_bitcode_arm_64_base.bc"
-    "ukernel_bitcode_arm_64_bf16.bc"
-    "ukernel_bitcode_arm_64_dotprod.bc"
-    "ukernel_bitcode_arm_64_fp16fml.bc"
-    "ukernel_bitcode_arm_64_fullfp16.bc"
-    "ukernel_bitcode_arm_64_i8mm.bc"
+    "ukernel_bitcode_arch_arm_64_base.bc"
+    "ukernel_bitcode_arch_arm_64_bf16.bc"
+    "ukernel_bitcode_arch_arm_64_dotprod.bc"
+    "ukernel_bitcode_arch_arm_64_entry_points.bc"
+    "ukernel_bitcode_arch_arm_64_fp16fml.bc"
+    "ukernel_bitcode_arch_arm_64_fullfp16.bc"
+    "ukernel_bitcode_arch_arm_64_i8mm.bc"
 
 )
 
 elseif(IREE_BUILD_COMPILER AND IREE_TARGET_BACKEND_LLVM_CPU)
-iree_make_empty_file("${CMAKE_CURRENT_BINARY_DIR}/ukernel_bitcode_arm_64.bc")
-iree_make_empty_file("${CMAKE_CURRENT_BINARY_DIR}/ukernel_bitcode_arm_64_entry_points.bc")
+iree_make_empty_file("${CMAKE_CURRENT_BINARY_DIR}/ukernel_bitcode_arch_arm_64.bc")
 endif()  # _IREE_UKERNEL_BITCODE_BUILD_ARM_64
 
 ### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###
@@ -290,12 +289,12 @@ iree_cc_library(
     arm_64
   SRCS
     "mmt4d_arm_64_entry_point.c"
-    "mmt4d_arm_64.c"
+    "mmt4d_arm_64_base.c"
     "pack_arm_64_entry_point.c"
-    "pack_arm_64.c"
+    "pack_arm_64_base.c"
     "query_tile_sizes_arm_64_entry_point.c"
     "unpack_arm_64_entry_point.c"
-    "unpack_arm_64.c"
+    "unpack_arm_64_base.c"
   DEPS
     ::common_arm_64
     iree::base::core_headers

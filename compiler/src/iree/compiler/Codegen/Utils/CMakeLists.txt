@@ -28,8 +28,6 @@ iree_cc_library(
     "MarkerUtils.cpp"
     "Utils.cpp"
   DEPS
-    IREELinalgExtDialect
-    IREELinalgExtPasses
     LLVMSupport
     LLVMTargetParser
     MLIRAffineDialect
@@ -37,25 +35,51 @@ iree_cc_library(
     MLIRArithDialect
     MLIRArithUtils
     MLIRFuncDialect
+    MLIRFunctionInterfaces
     MLIRGPUDialect
     MLIRIR
     MLIRLinalgDialect
     MLIRLinalgTransforms
     MLIRLinalgUtils
     MLIRMemRefDialect
+    MLIRMemRefTransforms
     MLIRSCFDialect
+    MLIRSCFTransforms
     MLIRSideEffectInterfaces
     MLIRSupport
     MLIRTensorDialect
     MLIRTilingInterface
     MLIRTransformUtils
     MLIRVectorDialect
+    MLIRVectorTransforms
     MLIRViewLikeInterface
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::GPU::IR::IREEGPUDialect
+    iree::compiler::Codegen::Dialect::GPU::TargetUtils::KnownTargets
     iree::compiler::Codegen::Interfaces::PartitionableLoopsInterface
     iree::compiler::Codegen::Interfaces::ProcessorOpInterfaces
     iree::compiler::Codegen::Interfaces::UKernelOpInterface
     iree::compiler::Dialect::Flow::IR
     iree::compiler::Dialect::HAL::IR
+    iree::compiler::Dialect::LinalgExt::IR
+    iree::compiler::Dialect::LinalgExt::Transforms
+    iree::compiler::Utils
+  PUBLIC
+)
+
+iree_cc_library(
+  NAME
+    VectorOpUtils
+  HDRS
+    "VectorOpUtils.h"
+  SRCS
+    "VectorOpUtils.cpp"
+  DEPS
+    LLVMSupport
+    MLIRIR
+    MLIRLinalgDialect
+    MLIRSupport
+    MLIRVectorDialect
   PUBLIC
 )
 

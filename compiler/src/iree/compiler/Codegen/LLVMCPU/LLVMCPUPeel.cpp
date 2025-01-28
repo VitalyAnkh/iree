@@ -4,8 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/LLVMCPU/PassDetail.h"
 #include "iree/compiler/Codegen/LLVMCPU/Passes.h"
+#include "iree/compiler/Codegen/Utils/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
@@ -19,6 +19,9 @@
 #define DEBUG_TYPE "iree-llvmcpu-peel"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_LLVMCPUPEELPASS
+#include "iree/compiler/Codegen/LLVMCPU/Passes.h.inc"
 
 namespace {
 
@@ -48,7 +51,7 @@ void collectLoopsToPeel(Operation *op,
   }
 }
 
-class LLVMCPUPeelPass : public LLVMCPUPeelBase<LLVMCPUPeelPass> {
+class LLVMCPUPeelPass : public impl::LLVMCPUPeelPassBase<LLVMCPUPeelPass> {
 public:
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<tensor::TensorDialect, linalg::LinalgDialect,
@@ -85,16 +88,10 @@ void LLVMCPUPeelPass::runOnOperation() {
   memref::populateResolveRankedShapedTypeResultDimsPatterns(patterns);
   context->getLoadedDialect<tensor::TensorDialect>()
       ->getCanonicalizationPatterns(patterns);
-  if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+  if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
     LLVM_DEBUG(llvm::dbgs() << "----- cleanup failed -----\n");
     return signalPassFailure();
   }
 }
-
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>> createLLVMCPUPeelPass() {
-  return std::make_unique<LLVMCPUPeelPass>();
-}
-
 } // namespace mlir::iree_compiler

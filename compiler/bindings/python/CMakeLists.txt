@@ -59,6 +59,7 @@ declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT IREEPythonSources.Dialects
   ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/iree/compiler"
   TD_FILE dialects/FlowBinding.td
+  GEN_ENUM_BINDINGS
   SOURCES dialects/flow.py
   DIALECT_NAME flow
 )
@@ -67,6 +68,7 @@ declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT IREEPythonSources.Dialects
   ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/iree/compiler"
   TD_FILE dialects/HALBinding.td
+  GEN_ENUM_BINDINGS
   SOURCES dialects/hal.py
   DIALECT_NAME hal
 )
@@ -75,6 +77,7 @@ declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT IREEPythonSources.Dialects
   ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/iree/compiler"
   TD_FILE dialects/StreamBinding.td
+  GEN_ENUM_BINDINGS
   SOURCES dialects/stream.py
   DIALECT_NAME stream
 )
@@ -83,6 +86,7 @@ declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT IREEPythonSources.Dialects
   ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/iree/compiler"
   TD_FILE dialects/UtilBinding.td
+  GEN_ENUM_BINDINGS
   SOURCES dialects/util.py
   DIALECT_NAME util
 )
@@ -91,22 +95,77 @@ declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT IREEPythonSources.Dialects
   ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/iree/compiler"
   TD_FILE dialects/VMBinding.td
+  GEN_ENUM_BINDINGS
   SOURCES dialects/vm.py
   DIALECT_NAME vm
 )
 
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT IREEPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/iree/compiler"
+  TD_FILE dialects/IREECodegenBinding.td
+  GEN_ENUM_BINDINGS
+  SOURCES dialects/iree_codegen.py
+  DIALECT_NAME iree_codegen
+)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT IREEPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/iree/compiler"
+  TD_FILE dialects/IREEGPUBinding.td
+  GEN_ENUM_BINDINGS
+  SOURCES dialects/iree_gpu.py
+  DIALECT_NAME iree_gpu
+)
+
+declare_mlir_python_sources(IREECompilerAPIPythonCore
+  ADD_TO_PARENT IREEPythonSources
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/iree/compiler"
+  SOURCES
+    _package_test.py
+    api/__init__.py
+    api/ctypes_dl.py
+)
+
+# Note that some tools rely on optional features but we unconditionally
+# include them because they are referenced from console scripts and
+# other package metadata. They will detect mis-configuration and error
+# accordingly at runtime.
 declare_mlir_python_sources(IREECompilerAPIPythonTools
+  ADD_TO_PARENT IREEPythonSources
   ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/iree/compiler"
   SOURCES
     __init__.py
     tf.py
     tflite.py
-    xla.py
-  SOURCES_GLOB
-    api/*.py
-    tools/*.py
-    tools/ir_tool/*.py
+    tools/__init__.py
+    tools/binaries.py
+    tools/core.py
+    tools/debugging.py
+    tools/tf.py
+    tools/tflite.py
+    tools/import_onnx/__main__.py
+    tools/import_onnx/importer_externalization_overrides.py
+    tools/ir_tool/__main__.py
+    tools/scripts/iree_compile/__main__.py
+    tools/scripts/iree_opt/__main__.py
 )
+
+# The Python bindings are monolithic and we don't have a good way for the
+# torch plugin to contribute Python sources, so we just gate it here
+# versus having more complicated indirection. May want to rethink this
+# if others need it.
+if(IREE_INPUT_TORCH)
+
+  declare_mlir_python_sources(IREEPythonSources.Torch.Importers
+    ADD_TO_PARENT IREEPythonSources
+    ROOT_DIR "${IREE_SOURCE_DIR}/third_party/torch-mlir/python/torch_mlir"
+    SOURCES
+      extras/fx_importer.py
+      extras/onnx_importer.py
+  )
+
+endif()
 
 ################################################################################
 # Extensions
@@ -117,8 +176,21 @@ declare_mlir_python_sources(IREECompilerPythonExtensions)
 declare_mlir_python_extension(IREECompilerPythonExtensions.Registration
   MODULE_NAME _site_initialize_0
   ADD_TO_PARENT IREECompilerPythonExtensions
+  PYTHON_BINDINGS_LIBRARY nanobind
   SOURCES
     IREECompilerRegistration.cpp
+  EMBED_CAPI_LINK_LIBS
+    iree_compiler_API_SharedImpl
+  PRIVATE_LINK_LIBS
+    LLVMSupport
+)
+
+declare_mlir_python_extension(IREECompilerPythonExtensions.CompilerDialects
+  MODULE_NAME _ireeCompilerDialects
+  ADD_TO_PARENT IREECompilerPythonExtensions
+  PYTHON_BINDINGS_LIBRARY nanobind
+  SOURCES
+    IREECompilerDialectsModule.cpp
   EMBED_CAPI_LINK_LIBS
     iree_compiler_API_SharedImpl
   PRIVATE_LINK_LIBS
@@ -137,21 +209,28 @@ set(_SOURCE_COMPONENTS
 
   MLIRPythonSources.Core
 
-  # Core dialects (constrained to IREE input dialects).
+  # Core dialects.
+  MLIRPythonSources.Dialects.amdgpu
   MLIRPythonSources.Dialects.arith
   MLIRPythonSources.Dialects.builtin
   MLIRPythonSources.Dialects.cf
   MLIRPythonSources.Dialects.complex
   MLIRPythonSources.Dialects.func
+  MLIRPythonSources.Dialects.gpu
   MLIRPythonSources.Dialects.linalg
+  MLIRPythonSources.Dialects.llvm
   MLIRPythonSources.Dialects.math
   MLIRPythonSources.Dialects.memref
   MLIRPythonSources.Dialects.pdl
+  MLIRPythonSources.Dialects.rocdl
+  MLIRPythonSources.Dialects.scf
   MLIRPythonSources.Dialects.shape
   MLIRPythonSources.Dialects.structured_transform
   MLIRPythonSources.Dialects.tensor
   MLIRPythonSources.Dialects.tosa
   MLIRPythonSources.Dialects.transform
+  MLIRPythonSources.Dialects.transform.extras
+  MLIRPythonSources.Dialects.transform.interpreter
   MLIRPythonSources.Dialects.vector
 
   # iree-dialects project.
@@ -167,6 +246,43 @@ add_mlir_python_modules(IREECompilerPythonModules
     iree_compiler_API_SharedImpl
   )
 
+
+################################################################################
+# iree.build package
+# This is a pure Python part of the namespace, not rooted under iree.compiler
+# like the above. It is only using the same build support for compatibility
+# with the existing development flow.
+# If the build system for Python code is ever redone, this can just be
+# source namespace in the project definition.
+################################################################################
+
+# The iree.build package.
+declare_mlir_python_sources(IREECompilerBuildPythonPackage
+ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/iree/build"
+SOURCES
+  __init__.py
+  __main__.py
+  args.py
+  compile_actions.py
+  console.py
+  executor.py
+  lang.py
+  main.py
+  metadata.py
+  net_actions.py
+  onnx_actions.py
+  target_machine.py
+  test_actions.py
+)
+
+add_mlir_python_modules(IREECompilerBuildPythonModules
+  ROOT_PREFIX "${_PYTHON_BUILD_PREFIX}/iree/build"
+  INSTALL_PREFIX "${_PYTHON_INSTALL_PREFIX}/iree/build"
+  DECLARED_SOURCES
+    IREECompilerBuildPythonPackage
+)
+
+add_dependencies(IREECompilerPythonModules IREECompilerBuildPythonModules)
 
 ################################################################################
 # Tools linked against the shared CAPI library
@@ -205,6 +321,13 @@ add_iree_compiler_busybox_tool(
     IREECompileTool.c
 )
 
+add_iree_compiler_busybox_tool(
+  IREECompilerIREEOptTool
+  OUTPUT_NAME iree-opt
+  SRCS
+    IREEOptTool.c
+)
+
 if(TARGET lld)
   add_iree_compiler_busybox_tool(
     IREECompilerLldTool
@@ -223,7 +346,7 @@ endif()
 # against the project level library, so this is just cosmetic, but it does
 # have the side effect of making the Python build tree relocatable and making
 # logic that expects to find the compiler libraries in a consistent place
-# simple. Since a symlink is used on Unix and it is not the versioned dylib, 
+# simple. Since a symlink is used on Unix and it is not the versioned dylib,
 # the realpath will still be the build-tree wide shared library. This also means
 # that any tools or files that must be colocated with the dylib will come from
 # the project-wide location.
@@ -255,8 +378,7 @@ endforeach()
 add_custom_command(
   OUTPUT ${_dylib_target_files}
   DEPENDS ${_dylib_src_files}
-  POST_BUILD
-    ${_dylib_copy_commands}
+  COMMAND ${_dylib_copy_commands}
 )
 
 add_custom_target(IREECompilerPythonDylibFiles

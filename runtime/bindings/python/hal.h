@@ -7,12 +7,17 @@
 #ifndef IREE_BINDINGS_PYTHON_IREE_RT_HAL_H_
 #define IREE_BINDINGS_PYTHON_IREE_RT_HAL_H_
 
+#include <nanobind/intrusive/counter.h>
+
+#include <functional>
 #include <vector>
 
 #include "./binding.h"
 #include "./status_utils.h"
 #include "./vm.h"
+#include "iree/base/string_view.h"
 #include "iree/hal/api.h"
+#include "iree/modules/hal/debugging.h"
 
 namespace iree {
 namespace python {
@@ -111,6 +116,12 @@ struct ApiPtrAdapter<iree_hal_command_buffer_t> {
 class HalBuffer;
 class HalSemaphore;
 
+class HalBufferView
+    : public ApiRefCounted<HalBufferView, iree_hal_buffer_view_t> {
+ public:
+  py::str Repr();
+};
+
 class HalDevice : public ApiRefCounted<HalDevice, iree_hal_device_t> {
  public:
   iree_hal_allocator_t* allocator() {
@@ -130,11 +141,33 @@ class HalDevice : public ApiRefCounted<HalDevice, iree_hal_device_t> {
                     py::handle signal_semaphores);
   void QueueCopy(HalBuffer& src_buffer, HalBuffer& dst_buffer,
                  py::handle wait_semaphores, py::handle signal_semaphores);
+  HalBufferView FromDLPackCapsule(py::object capsule);
+  py::object CreateDLPackCapsule(HalBufferView& bufferView,
+                                 int device_type_code, int device_id);
 };
 
 class HalDriver : public ApiRefCounted<HalDriver, iree_hal_driver_t> {
+  // Object that holds the components of a device URI string.
+  struct DeviceUri {
+    iree_string_view_t driver_name;
+    iree_string_view_t device_path;
+    iree_string_view_t params_str;
+
+    DeviceUri(const std::string& device_uri);
+  };
+
+  // Create a stand-alone driver (not residing in a cache) given the name,
+  // path, and params components of a device URI.
+  static py::object Create(const DeviceUri& device_uri);
+
  public:
   static std::vector<std::string> Query();
+
+  // Create a stand-alone driver (not residing in a cache) given a device URI.
+  static py::object Create(const std::string& device_uri);
+
+  // Returns a driver from the given cache, creating it and placing it in
+  // the cache if not already found there.
   static py::object Create(const std::string& device_uri,
                            py::dict& driver_cache);
 
@@ -151,9 +184,9 @@ class HalAllocator : public ApiRefCounted<HalAllocator, iree_hal_allocator_t> {
   py::dict QueryStatistics();
   py::str FormattedStatistics();
 
-  py::object AllocateBufferCopy(
-      int memory_type, int allowed_usage, HalDevice& device, py::object buffer,
-      std::optional<iree_hal_element_types_t> element_type);
+  py::object AllocateBufferCopy(int memory_type, int allowed_usage,
+                                HalDevice& device, py::object buffer,
+                                std::optional<uint64_t> element_type);
   HalBuffer AllocateHostStagingBufferCopy(HalDevice& device, py::handle buffer);
 };
 
@@ -164,12 +197,6 @@ struct HalShape {
   }
 
   std::vector<iree_hal_dim_t> s;
-};
-
-class HalBufferView
-    : public ApiRefCounted<HalBufferView, iree_hal_buffer_view_t> {
- public:
-  py::str Repr();
 };
 
 class HalBuffer : public ApiRefCounted<HalBuffer, iree_hal_buffer_t> {
@@ -265,6 +292,33 @@ class HalMappedMemory {
 
 class HalCommandBuffer
     : public ApiRefCounted<HalCommandBuffer, iree_hal_command_buffer_t> {};
+
+using HalModuleBufferViewTraceCallback =
+    std::function<void(const std::string&, const std::vector<HalBufferView>&)>;
+
+// HAL debug sinks need ot live as long as the HAL module. This means the
+// underlying native object, not just the HAL module Python object.
+// This is necessary since here we hold a reference to a callback to a Python
+// function. This function needs to live after the destruction of the HAL module
+// Python object if it is registered into the VM context.
+// The HAL module and VM context Python objects are owners of the debug sink.
+class HalModuleDebugSink : public py::intrusive_base {
+ public:
+  HalModuleDebugSink(
+      HalModuleBufferViewTraceCallback buffer_view_trace_callback);
+  iree_hal_module_debug_sink_t AsIreeHalModuleDebugSink() const;
+  HalModuleBufferViewTraceCallback& GetHalModuleBufferViewTraceCallback();
+
+ private:
+  HalModuleBufferViewTraceCallback buffer_view_trace_callback_;
+
+  static iree_status_t DestroyCallback(void* user_data);
+
+  static iree_status_t IreeHalModuleBufferViewTrace(
+      void* user_data, iree_string_view_t key,
+      iree_host_size_t buffer_view_count, iree_hal_buffer_view_t** buffer_views,
+      iree_allocator_t host_allocator);
+};
 
 void SetupHalBindings(nanobind::module_ m);
 

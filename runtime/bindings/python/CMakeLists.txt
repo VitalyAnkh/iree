@@ -4,22 +4,6 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-if(NOT nanobind_FOUND)
-  find_package(nanobind CONFIG QUIET)
-  if(NOT nanobind_FOUND)
-    execute_process(
-      COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
-      OUTPUT_STRIP_TRAILING_WHITESPACE
-      OUTPUT_VARIABLE NB_DIR
-      RESULT_VARIABLE RC)
-    if(RC AND NOT RC EQUAL 0)
-      message(WARNING "Probing for nanobind failed. Please install the project's Python dependencies or '${Python_EXECUTABLE} -m pip install nanobind'")
-    endif()
-    list(APPEND CMAKE_PREFIX_PATH "${NB_DIR}")
-  endif()
-  find_package(nanobind CONFIG REQUIRED)
-endif()
-
 set(_EXTRA_INSTALL_TOOL_TARGETS)
 set(_TRACY_ENABLED OFF)
 
@@ -59,7 +43,7 @@ iree_select_compiler_opts(_RTTI_AND_EXCEPTION_COPTS
 )
 
 nanobind_add_module(iree_runtime_bindings_python_PyExtRt
-  NB_STATIC LTO
+  NB_STATIC LTO FREE_THREADED
   "binding.h"
   "initialize_module.cc"
   "invoke.h"
@@ -68,6 +52,9 @@ nanobind_add_module(iree_runtime_bindings_python_PyExtRt
   "io.cc"
   "hal.h"
   "hal.cc"
+  "local_dlpack.h"
+  "loop.h"
+  "loop.cc"
   "numpy_interop.h"
   "numpy_interop.cc"
   "py_module.h"
@@ -88,15 +75,15 @@ target_link_libraries(iree_runtime_bindings_python_PyExtRt
   iree::base::internal::file_io
   iree::base::internal::path
   iree::io::file_handle
-  iree::io::formats::gguf
   iree::io::formats::irpa
-  iree::io::formats::safetensors
+  iree::io::formats::parser_registry
   iree::io::parameter_index
   iree::io::parameter_index_provider
   iree::io::parameter_provider
   iree::io::scope_map
   iree::modules::io::parameters
   iree::modules::hal
+  iree::schemas::parameter_archive
   iree::tooling::device_util
   iree::tooling::modules
   iree::vm
@@ -110,10 +97,6 @@ target_compile_options(iree_runtime_bindings_python_PyExtRt
   ${IREE_DEFAULT_COPTS}
   # Default COPTS disable exceptions/rtti. Re-enable them.
   ${_RTTI_AND_EXCEPTION_COPTS}
-)
-target_compile_definitions(iree_runtime_bindings_python_PyExtRt
-  PRIVATE
-  IREE_TRACING_HOOK_CPP_NEW_DELETE=0
 )
 
 set_target_properties(
@@ -132,20 +115,22 @@ iree_py_library(
     "iree/runtime/benchmark.py"
     "iree/runtime/flags.py"
     "iree/runtime/function.py"
+    "iree/runtime/io.py"
     "iree/runtime/system_api.py"
     "iree/runtime/system_setup.py"
-    "iree/runtime/tracing.py"
+    "iree/runtime/typing.py"
     "iree/runtime/version.py"
     "iree/_runtime/__init__.py"
     "iree/_runtime/libs.py"
-    "iree/_runtime/scripts/iree_benchmark_trace/__main__.py"
+    "iree/_runtime/scripts/iree_benchmark_executable/__main__.py"
     "iree/_runtime/scripts/iree_benchmark_module/__main__.py"
+    "iree/_runtime/scripts/iree_c_embed_data/__main__.py"
     "iree/_runtime/scripts/iree_cpuinfo/__main__.py"
     "iree/_runtime/scripts/iree_convert_parameters/__main__.py"
     "iree/_runtime/scripts/iree_create_parameters/__main__.py"
     "iree/_runtime/scripts/iree_dump_module/__main__.py"
     "iree/_runtime/scripts/iree_dump_parameters/__main__.py"
-    "iree/_runtime/scripts/iree_run_trace/__main__.py"
+    "iree/_runtime/scripts/iree_flatcc_cli/__main__.py"
     "iree/_runtime/scripts/iree_run_module/__main__.py"
     "iree/_runtime/scripts/iree_tracy_capture/__main__.py"
   PYEXT_DEPS
@@ -154,14 +139,20 @@ iree_py_library(
 
 iree_symlink_tool(
   TARGET runtime
-  FROM_TOOL_TARGET iree-benchmark-module
-  TO_EXE_NAME iree/_runtime_libs/iree-benchmark-module
+  FROM_TOOL_TARGET iree-c-embed-data
+  TO_EXE_NAME iree/_runtime_libs/iree-c-embed-data
 )
 
 iree_symlink_tool(
   TARGET runtime
-  FROM_TOOL_TARGET iree-benchmark-trace
-  TO_EXE_NAME iree/_runtime_libs/iree-benchmark-trace
+  FROM_TOOL_TARGET iree-benchmark-executable
+  TO_EXE_NAME iree/_runtime_libs/iree-benchmark-executable
+)
+
+iree_symlink_tool(
+  TARGET runtime
+  FROM_TOOL_TARGET iree-benchmark-module
+  TO_EXE_NAME iree/_runtime_libs/iree-benchmark-module
 )
 
 iree_symlink_tool(
@@ -196,8 +187,8 @@ iree_symlink_tool(
 
 iree_symlink_tool(
   TARGET runtime
-  FROM_TOOL_TARGET iree-run-trace
-  TO_EXE_NAME iree/_runtime_libs/iree-run-trace
+  FROM_TOOL_TARGET iree-flatcc-cli
+  TO_EXE_NAME iree/_runtime_libs/iree-flatcc-cli
 )
 
 iree_symlink_tool(
@@ -241,9 +232,9 @@ iree_py_test(
 
 iree_py_test(
   NAME
-    hal_test
+    io_test
   SRCS
-    "tests/hal_test.py"
+    "tests/io_test.py"
 )
 
 iree_py_test(
@@ -253,9 +244,11 @@ iree_py_test(
     "tests/system_setup_test.py"
 )
 
+# These tests use compiler APIs as well as runtime APIs.
+#
 # These tests perform linking via the Compiler API, which is only supported
 # in bundled-LLVM builds at the moment (#14086).
-if(IREE_BUILD_BUNDLED_LLVM)
+if(IREE_BUILD_COMPILER AND IREE_BUILD_BUNDLED_LLVM)
   iree_py_test(
     NAME
       benchmark_test
@@ -265,9 +258,16 @@ if(IREE_BUILD_BUNDLED_LLVM)
 
   iree_py_test(
     NAME
-      io_test
+      hal_test
     SRCS
-      "tests/io_test.py"
+      "tests/hal_test.py"
+  )
+
+  iree_py_test(
+    NAME
+      io_runtime_test
+    SRCS
+      "tests/io_runtime_test.py"
   )
 
   iree_py_test(
@@ -309,6 +309,14 @@ install(
   FILES_MATCHING PATTERN "*.py"
 )
 
+# Install iree/runtime/*.py files verbatim into the tree.
+install(
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/iree/_runtime/"
+  COMPONENT "${_INSTALL_COMPONENT}"
+  DESTINATION "${_INSTALL_DIR}/iree/_runtime/"
+  FILES_MATCHING PATTERN "*.py"
+)
+
 # _runtime.so -> python_packages/iree_runtime/iree/_runtime.so
 install(
   TARGETS iree_runtime_bindings_python_PyExtRt
@@ -328,14 +336,15 @@ cmake_language(DEFER DIRECTORY \"${IREE_SOURCE_DIR}\"
   CALL install
   TARGETS
     iree-cpuinfo
+    iree-benchmark-executable
     iree-benchmark-module
-    iree-benchmark-trace
+    iree-c-embed-data
     iree-convert-parameters
     iree-create-parameters
     iree-dump-module
     iree-dump-parameters
+    iree-flatcc-cli
     iree-run-module
-    iree-run-trace
     ${_EXTRA_INSTALL_TOOL_TARGETS}
   DESTINATION \"${_INSTALL_DIR}/iree/_runtime_libs\"
   COMPONENT \"${_INSTALL_COMPONENT}\"

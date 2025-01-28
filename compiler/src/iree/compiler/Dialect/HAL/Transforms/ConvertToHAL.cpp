@@ -14,6 +14,7 @@
 #include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
+#include "iree/compiler/Dialect/HAL/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamDialect.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
 #include "iree/compiler/Dialect/Util/Conversion/ConversionPatterns.h"
@@ -34,34 +35,21 @@
 #include "mlir/Transforms/DialectConversion.h"
 
 namespace mlir::iree_compiler::IREE::HAL {
+
+#define GEN_PASS_DEF_CONVERTTOHALPASS
+#include "iree/compiler/Dialect/HAL/Transforms/Passes.h.inc"
+
 namespace {
 
-// A pass converting the IREE flow dialect into the IREE HAL dialect.
-class ConvertToHALPass
-    : public PassWrapper<ConvertToHALPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertToHALPass)
+//===----------------------------------------------------------------------===//
+// --iree-hal-conversion
+//===----------------------------------------------------------------------===//
 
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<mlir::arith::ArithDialect>();
-    registry.insert<mlir::func::FuncDialect>();
-    registry.insert<mlir::scf::SCFDialect>();
-    registry.insert<IREE::HAL::HALDialect>();
-    registry.insert<IREE::Stream::StreamDialect>();
-    registry.insert<IREE::Util::UtilDialect>();
-
-    // TODO(benvanik): add a registration system for extra dialects?
-    registry.insert<IREE::IO::Parameters::IOParametersDialect>();
-  }
-
-  StringRef getArgument() const override { return "iree-hal-conversion"; }
-
-  StringRef getDescription() const override {
-    return "Convert input stream/std/etc dialects to the IREE HAL dialect.";
-  }
-
+struct ConvertToHALPass
+    : public IREE::HAL::impl::ConvertToHALPassBase<ConvertToHALPass> {
   void runOnOperation() override {
     auto *context = &getContext();
+    auto moduleOp = getOperation();
 
     // Gather all interfaces from registered dialects.
     // These will perform the tensor->buffer mapping for their ops.
@@ -77,8 +65,7 @@ public:
     HALTypeConverter typeConverter(conversionInterfaces);
     HALConversionTarget conversionTarget(context, typeConverter);
 
-    RewritePatternSet patterns(&getContext());
-
+    RewritePatternSet patterns(context);
     populateHALToHALPatterns(context, conversionTarget, typeConverter,
                              patterns);
     populateUtilToHALPatterns(context, conversionTarget, typeConverter,
@@ -97,19 +84,16 @@ public:
 
     // NOTE: we allow ops that we don't know about to allow custom dialects
     // that don't need anything HAL-specific to pass through.
-    if (failed(applyPartialConversion(getOperation(), conversionTarget,
+    if (failed(applyPartialConversion(moduleOp, conversionTarget,
                                       std::move(patterns)))) {
       return signalPassFailure();
     }
+
+    // Cleanup conversion attributes used for spooky action at a distance.
+    moduleOp->removeAttr("stream.affinity.default");
   }
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<ModuleOp>> createConvertToHALPass() {
-  return std::make_unique<ConvertToHALPass>();
-}
-
-static PassRegistration<ConvertToHALPass> pass;
 
 } // namespace mlir::iree_compiler::IREE::HAL

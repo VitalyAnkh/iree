@@ -22,11 +22,11 @@
 
 namespace mlir::iree_compiler {
 
-// NOTE: HALDispatchABI and the associated conversion patterns should live under
-// iree/compiler/Dialect/HAL/Target/LLVMCPU/ instead of here as they have
-// nothing to do with linalg. If we need to use the patterns in this conversion
-// we can expose a populate*Patterns() function to access them without needing
-// them defined here.
+// NOTE: HALDispatchABI and the associated conversion patterns should maybe live
+// under compiler/plugins/target/LLVMCPU/ instead of here as they have nothing
+// to do with linalg. If we need to use the patterns in this conversion we can
+// expose a populate*Patterns() function to access them without needing them
+// defined here.
 
 //------------------------------------------------------------------------------
 // ExecutableLibraryDI
@@ -95,7 +95,6 @@ public:
   LLVM::DIDerivedTypeAttr getWorkgroupStateV0T();
 
 private:
-  const LLVMTypeConverter *typeConverter;
   Builder builder;
   LLVM::DIFileAttr fileAttr;
   unsigned ptrBitwidth;
@@ -157,13 +156,13 @@ public:
     /*uint32_t*/ workgroup_size_x,
     /*uint32_t*/ workgroup_size_y,
     /*uint16_t*/ workgroup_size_z,
-    /*uint16_t*/ push_constant_count,
+    /*uint16_t*/ constant_count,
     /*uint32_t*/ workgroup_count_x,
     /*uint32_t*/ workgroup_count_y,
     /*uint16_t*/ workgroup_count_z,
     /*uint8_t*/ max_concurrency,
     /*uint8_t*/ binding_count,
-    /*intptr_t*/ push_constants,
+    /*intptr_t*/ constants,
     /*intptr_t*/ binding_ptrs,
     /*intptr_t*/ binding_lengths,
   };
@@ -200,13 +199,13 @@ public:
   static SmallVector<Type, 5>
   getInputTypes(MLIRContext *context, const LLVMTypeConverter *typeConverter);
 
-  // Builds a DISubprogram for a function in |moduleOp| named |funcName|.
+  // Builds a DISubprogram for |llvmFuncOp| function in |moduleOp|.
   // This is required in order to get any debug information (including line
   // tables) from MLIR into LLVM IR. It does not need to match the exact
   // definition but the closer we can make it to the real thing the more useful
   // downstream tools will be.
   static LLVM::DISubprogramAttr
-  buildScopeAttr(mlir::ModuleOp moduleOp, StringRef funcName,
+  buildScopeAttr(mlir::ModuleOp moduleOp, LLVM::LLVMFuncOp llvmFuncOp,
                  const LLVMTypeConverter *typeConverter);
 
   explicit HALDispatchABI(LLVMTypeConverter *typeConverter)

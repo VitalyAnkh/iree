@@ -11,100 +11,8 @@ import unittest
 
 import configure_ci
 
-SORTED_DEFAULT_BENCHMARK_PRESETS_STR = ",".join(
-    sorted(configure_ci.DEFAULT_BENCHMARK_PRESET_GROUP)
-)
-
 
 class ConfigureCITest(unittest.TestCase):
-    def test_get_benchmark_presets_no_preset(self):
-        presets_str = configure_ci.get_benchmark_presets(
-            trailers={},
-            labels=["unrelated-labels"],
-            is_pr=True,
-            is_llvm_integrate_pr=False,
-        )
-
-        self.assertEqual(presets_str, "")
-
-    def test_get_benchmark_presets_from_pr_labels(self):
-        presets_str = configure_ci.get_benchmark_presets(
-            trailers={},
-            labels=["benchmarks:x86_64", "benchmarks:cuda"],
-            is_pr=True,
-            is_llvm_integrate_pr=False,
-        )
-
-        self.assertEqual(presets_str, "comp-stats,cuda,x86_64")
-
-    def test_get_benchmark_presets_from_trailers_and_labels(self):
-        presets_str = configure_ci.get_benchmark_presets(
-            trailers={"benchmark-extra": "android-cpu,cuda-large,x86_64-large"},
-            labels=["benchmarks:vulkan-nvidia"],
-            is_pr=True,
-            is_llvm_integrate_pr=False,
-        )
-
-        self.assertEqual(
-            presets_str, "android-cpu,comp-stats,cuda-large,vulkan-nvidia,x86_64-large"
-        )
-
-    def test_get_benchmark_presets_from_default_group(self):
-        presets_str = configure_ci.get_benchmark_presets(
-            trailers={"benchmark-extra": "default"},
-            labels=[],
-            is_pr=True,
-            is_llvm_integrate_pr=False,
-        )
-
-        self.assertEqual(presets_str, SORTED_DEFAULT_BENCHMARK_PRESETS_STR)
-        # Sanity check to ensure no `*-large` preset in the default group.
-        self.assertNotIn("-large", presets_str)
-
-    def test_get_benchmark_presets_for_non_pr(self):
-        presets_str = configure_ci.get_benchmark_presets(
-            trailers={}, labels=[], is_pr=False, is_llvm_integrate_pr=False
-        )
-
-        self.assertEqual(presets_str, SORTED_DEFAULT_BENCHMARK_PRESETS_STR)
-
-    def test_get_benchmark_presets_for_llvm_integrate_pr(self):
-        presets_str = configure_ci.get_benchmark_presets(
-            trailers={}, labels=[], is_pr=True, is_llvm_integrate_pr=True
-        )
-
-        self.assertEqual(presets_str, SORTED_DEFAULT_BENCHMARK_PRESETS_STR)
-
-    # Sample PR description:
-    # ```
-    # PR Title
-    #
-    # PR body...
-    #
-    # skip-llvm-integrate-benchmark: some good reasons
-    # ```
-    # Result: No benchmark is automatically enabled on the LLVM integrate PR.
-    def test_get_benchmark_presets_skip_llvm_integrate_benchmark(self):
-        presets_str = configure_ci.get_benchmark_presets(
-            trailers={"skip-llvm-integrate-benchmark": "some good reasons"},
-            labels=[],
-            is_pr=True,
-            is_llvm_integrate_pr=True,
-        )
-
-        self.assertEqual(presets_str, "")
-
-    def test_get_benchmark_presets_unknown_preset(self):
-        self.assertRaises(
-            ValueError,
-            lambda: configure_ci.get_benchmark_presets(
-                trailers={"benchmark-extra": "unknown"},
-                labels=[],
-                is_pr=True,
-                is_llvm_integrate_pr=False,
-            ),
-        )
-
     def test_parse_jobs_trailer(self):
         trailers = {"key": "job1,job2"}
         key = "key"
@@ -145,162 +53,160 @@ class ConfigureCITest(unittest.TestCase):
         trailers = {}
         all_jobs = {"job1", "job2", "job3"}
         is_pr = True
+        is_llvm_integrate_pr = False
         modified_paths = ["runtime/file"]
         jobs = configure_ci.get_enabled_jobs(
             trailers,
             all_jobs,
             modified_paths=modified_paths,
             is_pr=is_pr,
+            is_llvm_integrate_pr=is_llvm_integrate_pr,
         )
         self.assertCountEqual(jobs, all_jobs)
 
+    @unittest.skip("skipped while there are no postsubmit only jobs")
     def test_get_enabled_jobs_postsubmit(self):
         trailers = {}
         default_jobs = {"job1", "job2", "job3"}
         postsubmit_job = next(iter(configure_ci.DEFAULT_POSTSUBMIT_ONLY_JOBS))
         all_jobs = default_jobs | {postsubmit_job}
         is_pr = False
+        is_llvm_integrate_pr = False
         modified_paths = ["runtime/file"]
         jobs = configure_ci.get_enabled_jobs(
             trailers,
             all_jobs,
             modified_paths=modified_paths,
             is_pr=is_pr,
+            is_llvm_integrate_pr=is_llvm_integrate_pr,
         )
         self.assertCountEqual(jobs, all_jobs)
 
+    @unittest.skip("skipped while there are no postsubmit only jobs")
     def test_get_enabled_jobs_no_postsubmit(self):
         trailers = {}
         default_jobs = {"job1", "job2", "job3"}
         postsubmit_job = next(iter(configure_ci.DEFAULT_POSTSUBMIT_ONLY_JOBS))
         all_jobs = default_jobs | {postsubmit_job}
         is_pr = True
+        is_llvm_integrate_pr = False
         modified_paths = ["runtime/file"]
         jobs = configure_ci.get_enabled_jobs(
             trailers,
             all_jobs,
             modified_paths=modified_paths,
             is_pr=is_pr,
+            is_llvm_integrate_pr=is_llvm_integrate_pr,
         )
         self.assertCountEqual(jobs, default_jobs)
 
+    @unittest.skip("skipped while there are no postsubmit only jobs")
+    def test_get_enabled_jobs_llvm_integrate(self):
+        trailers = {}
+        default_jobs = {"job1", "job2", "job3"}
+        postsubmit_job = next(iter(configure_ci.DEFAULT_POSTSUBMIT_ONLY_JOBS))
+        all_jobs = default_jobs | {postsubmit_job}
+        is_pr = True
+        is_llvm_integrate_pr = True
+        modified_paths = ["runtime/file"]
+        jobs = configure_ci.get_enabled_jobs(
+            trailers,
+            all_jobs,
+            modified_paths=modified_paths,
+            is_pr=is_pr,
+            is_llvm_integrate_pr=is_llvm_integrate_pr,
+        )
+        self.assertCountEqual(jobs, all_jobs)
+
+    @unittest.skip("skipped while there are no postsubmit only jobs")
     def test_get_enabled_jobs_no_modifies(self):
         trailers = {}
         default_jobs = {"job1", "job2", "job3"}
         postsubmit_job = next(iter(configure_ci.DEFAULT_POSTSUBMIT_ONLY_JOBS))
         all_jobs = default_jobs | {postsubmit_job}
         is_pr = True
+        is_llvm_integrate_pr = False
         modified_paths = ["experimental/file"]
         jobs = configure_ci.get_enabled_jobs(
             trailers,
             all_jobs,
             modified_paths=modified_paths,
             is_pr=is_pr,
+            is_llvm_integrate_pr=is_llvm_integrate_pr,
         )
         self.assertCountEqual(jobs, {})
 
+    @unittest.skip("skipped while there are no postsubmit only jobs")
     def test_get_enabled_jobs_skip(self):
         trailers = {configure_ci.Trailer.SKIP_JOBS: "job1,job2"}
         default_jobs = {"job1", "job2", "job3"}
         postsubmit_job = next(iter(configure_ci.DEFAULT_POSTSUBMIT_ONLY_JOBS))
         all_jobs = default_jobs | {postsubmit_job}
         is_pr = True
+        is_llvm_integrate_pr = False
         modified_paths = ["runtime/file"]
         jobs = configure_ci.get_enabled_jobs(
             trailers,
             all_jobs,
             modified_paths=modified_paths,
             is_pr=is_pr,
+            is_llvm_integrate_pr=is_llvm_integrate_pr,
         )
         self.assertCountEqual(jobs, {"job3"})
 
+    @unittest.skip("skipped while there are no postsubmit only jobs")
     def test_get_enabled_jobs_skip_all(self):
         trailers = {configure_ci.Trailer.SKIP_JOBS: "all"}
         default_jobs = {"job1", "job2", "job3"}
         postsubmit_job = next(iter(configure_ci.DEFAULT_POSTSUBMIT_ONLY_JOBS))
         all_jobs = default_jobs | {postsubmit_job}
         is_pr = True
+        is_llvm_integrate_pr = False
         modified_paths = ["runtime/file"]
         jobs = configure_ci.get_enabled_jobs(
             trailers,
             all_jobs,
             modified_paths=modified_paths,
             is_pr=is_pr,
+            is_llvm_integrate_pr=is_llvm_integrate_pr,
         )
         self.assertCountEqual(jobs, {})
 
+    @unittest.skip("skipped while there are no postsubmit only jobs")
     def test_get_enabled_jobs_extra(self):
         postsubmit_job = next(iter(configure_ci.DEFAULT_POSTSUBMIT_ONLY_JOBS))
         trailers = {configure_ci.Trailer.EXTRA_JOBS: postsubmit_job}
         default_jobs = {"job1", "job2", "job3"}
         all_jobs = default_jobs | {postsubmit_job}
         is_pr = True
+        is_llvm_integrate_pr = False
         modified_paths = ["runtime/file"]
         jobs = configure_ci.get_enabled_jobs(
             trailers,
             all_jobs,
             modified_paths=modified_paths,
             is_pr=is_pr,
+            is_llvm_integrate_pr=is_llvm_integrate_pr,
         )
         self.assertCountEqual(jobs, all_jobs)
 
+    @unittest.skip("skipped while there are no postsubmit only jobs")
     def test_get_enabled_jobs_exactly(self):
         postsubmit_job = next(iter(configure_ci.DEFAULT_POSTSUBMIT_ONLY_JOBS))
         trailers = {configure_ci.Trailer.EXACTLY_JOBS: postsubmit_job}
         default_jobs = {"job1", "job2", "job3"}
         all_jobs = default_jobs | {postsubmit_job}
         is_pr = True
+        is_llvm_integrate_pr = False
         modified_paths = ["runtime/file"]
         jobs = configure_ci.get_enabled_jobs(
             trailers,
             all_jobs,
             modified_paths=modified_paths,
             is_pr=is_pr,
+            is_llvm_integrate_pr=is_llvm_integrate_pr,
         )
         self.assertCountEqual(jobs, {postsubmit_job})
-
-    def test_get_enabled_jobs_metal(self):
-        trailers = {}
-        all_jobs = {"job1"}
-        is_pr = True
-        modified_paths = ["runtime/src/iree/hal/drivers/metal/file"]
-        jobs = configure_ci.get_enabled_jobs(
-            trailers,
-            all_jobs,
-            modified_paths=modified_paths,
-            is_pr=is_pr,
-        )
-        expected_jobs = {"job1", "build_test_all_macos_arm64"}
-        self.assertCountEqual(jobs, expected_jobs)
-
-    def test_get_enabled_jobs_windows(self):
-        trailers = {}
-        all_jobs = {"job1"}
-        is_pr = True
-        modified_paths = ["runtime/src/iree/base/internal/threading_win32.c"]
-        jobs = configure_ci.get_enabled_jobs(
-            trailers,
-            all_jobs,
-            modified_paths=modified_paths,
-            is_pr=is_pr,
-        )
-        expected_jobs = {"job1", "build_test_all_windows"}
-        self.assertCountEqual(jobs, expected_jobs)
-
-    def test_get_enabled_jobs_windows_docs(self):
-        # docs/ directory is excluded from CI, superceding "windows" inclusion
-        trailers = {}
-        all_jobs = {"job1"}
-        is_pr = True
-        modified_paths = ["docs/windows.md"]
-        jobs = configure_ci.get_enabled_jobs(
-            trailers,
-            all_jobs,
-            modified_paths=modified_paths,
-            is_pr=is_pr,
-        )
-        expected_jobs = {}
-        self.assertCountEqual(jobs, expected_jobs)
 
     def test_parse_path_from_workflow_ref(self):
         path = configure_ci.parse_path_from_workflow_ref(
@@ -316,6 +222,59 @@ class ConfigureCITest(unittest.TestCase):
                 "octocat/example", "squid/unknown/.github/test.yml@1234"
             ),
         )
+
+    def test_parse_trailer_map_no_trailers(self):
+        trailer_map = configure_ci.parse_trailer_map_from_description("""No trailers""")
+        self.assertDictEqual(trailer_map, {})
+
+    def test_parse_trailer_map_one_trailer(self):
+        trailer_map = configure_ci.parse_trailer_map_from_description(
+            """First line
+
+key: value"""
+        )
+        self.assertDictEqual(trailer_map, {"key": "value"})
+
+    def test_parse_trailer_map_text_after_trailers(self):
+        trailer_map = configure_ci.parse_trailer_map_from_description(
+            """First line
+
+key: value
+
+More non-trailer text here"""
+        )
+        # Trailers can't appear in the middle of the description.
+        self.assertDictEqual(trailer_map, {})
+
+    def test_parse_trailer_map_two_trailers(self):
+        trailer_map = configure_ci.parse_trailer_map_from_description(
+            """First line
+
+key1: value1
+key2: value2"""
+        )
+        self.assertDictEqual(trailer_map, {"key1": "value1", "key2": "value2"})
+
+    def test_parse_trailer_map_multiline_trailer(self):
+        trailer_map = configure_ci.parse_trailer_map_from_description(
+            """First line
+
+key: value line 1
+  value line 2"""
+        )
+        # Note: Only using the first non-empty line of the trailer.
+        self.assertDictEqual(trailer_map, {"key": "value line 1"})
+
+    def test_parse_trailer_map_multiline_trailer_skip_first(self):
+        trailer_map = configure_ci.parse_trailer_map_from_description(
+            """First line
+
+key:
+  value line 2
+  value line 3"""
+        )
+        # Note: Only using the first non-empty line of the trailer.
+        self.assertDictEqual(trailer_map, {"key": "value line 2"})
 
 
 if __name__ == "__main__":

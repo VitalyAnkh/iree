@@ -6,33 +6,28 @@
 
 #include "FlowExtensions.h"
 
-#include "iree-dialects/Dialect/LinalgTransform/SimplePatternRewriter.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/Flow/Transforms/ConvertRegionToWorkgroups.h"
-#include "iree/compiler/Dialect/Flow/Transforms/FormDispatchRegions.h"
 #include "iree/compiler/Dialect/Flow/Transforms/RegionOpUtils.h"
+#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Transforms/RegionUtils.h"
-#include "mlir/Transforms/TopologicalSortUtils.h"
 
-using namespace mlir;
-using namespace mlir::iree_compiler;
-using namespace mlir::iree_compiler::IREE;
+namespace mlir::iree_compiler {
 
-iree_compiler::IREE::transform_dialect::FlowExtensions::FlowExtensions() {
+IREE::transform_dialect::FlowExtensions::FlowExtensions() {
   registerTransformOps<
 #define GET_OP_LIST
 #include "iree/compiler/Dialect/Flow/TransformExtensions/FlowExtensionsOps.cpp.inc"
       >();
 }
 
-void mlir::iree_compiler::registerTransformDialectFlowExtension(
-    DialectRegistry &registry) {
-  registry.addExtensions<transform_dialect::FlowExtensions>();
+void registerTransformDialectFlowExtension(DialectRegistry &registry) {
+  registry.addExtensions<IREE::transform_dialect::FlowExtensions>();
 }
 
 // TODO: Upstream to ShapeType and reuse.
@@ -50,11 +45,10 @@ static SmallVector<int64_t> getIndicesOfDynamicDims(ShapedType t) {
 
 /// Populate the workgroup_count region of `dispatchOp`.
 /// For now, this only supports constant index ops and empty workload operands.
-/// Assumes the Flow::DispatchWorkgroupsOp is built with an empty region.
-static LogicalResult
-populateWorkgroupCountComputingRegion(PatternRewriter &rewriter,
-                                      scf::ForallOp forallOp,
-                                      Flow::DispatchWorkgroupsOp dispatchOp) {
+/// Assumes the IREE::Flow::DispatchWorkgroupsOp is built with an empty region.
+static LogicalResult populateWorkgroupCountComputingRegion(
+    RewriterBase &rewriter, scf::ForallOp forallOp,
+    IREE::Flow::DispatchWorkgroupsOp dispatchOp) {
   Location loc = forallOp.getLoc();
   OpBuilder::InsertionGuard g(rewriter);
   Region &r = dispatchOp.getWorkgroupCount();
@@ -76,7 +70,7 @@ populateWorkgroupCountComputingRegion(PatternRewriter &rewriter,
   for (unsigned i = results.size(); i < 3; ++i) {
     results.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
   }
-  rewriter.create<Flow::ReturnOp>(loc, results);
+  rewriter.create<IREE::Flow::ReturnOp>(loc, results);
 
   return success();
 }
@@ -84,7 +78,7 @@ populateWorkgroupCountComputingRegion(PatternRewriter &rewriter,
 /// Rewrite ParallelInsertSlice ops in `InParallelOp` as Flow
 /// DispatchTensorStoreOps.
 /// Ops are inserted just before the `block` terminator.
-static void rewriteParallelInsertSlices(PatternRewriter &rewriter,
+static void rewriteParallelInsertSlices(RewriterBase &rewriter,
                                         scf::ForallOp forallOp,
                                         scf::InParallelOp InParallelOp,
                                         Block &block,
@@ -98,7 +92,7 @@ static void rewriteParallelInsertSlices(PatternRewriter &rewriter,
     auto parallelInsertOp = cast<tensor::ParallelInsertSliceOp>(&yieldingOp);
     OpBuilder::InsertionGuard g(rewriter);
     rewriter.setInsertionPoint(block.getTerminator());
-    auto dynamicDims = Util::findVariadicDynamicDims(
+    auto dynamicDims = IREE::Util::findDynamicDimsInList(
         resultIndex, resultTensorOperands, resultTensorsDynamicDims);
     BlockArgument destBbArg =
         llvm::cast<BlockArgument>(parallelInsertOp.getDest());
@@ -106,7 +100,7 @@ static void rewriteParallelInsertSlices(PatternRewriter &rewriter,
            "expected that dest is an output bbArg");
     Value dest = forallOp.getTiedOpOperand(destBbArg)->get();
     // clang-format off
-    rewriter.create<Flow::DispatchTensorStoreOp>(
+    rewriter.create<IREE::Flow::DispatchTensorStoreOp>(
         loc,
         parallelInsertOp.getSource(),
         tensorToFlowBvm.lookup(dest),
@@ -120,13 +114,12 @@ static void rewriteParallelInsertSlices(PatternRewriter &rewriter,
   }
 }
 
-/// Rewrite ExtractSlice ops in `dispatchOp` as Flow::DispatchTensorLoadOps.
-/// Takes a list of all tensor and all tensorDynamicDims operands to the
-/// dispatchOp as well as a IRMapping from tensor operands to the
-/// corresponding Flow dispatch tensor bbArgs.
-static void rewriteExtractSlices(PatternRewriter &rewriter,
-                                 scf::ForallOp forallOp,
-                                 Flow::DispatchWorkgroupsOp dispatchOp,
+/// Rewrite ExtractSlice ops in `dispatchOp` as
+/// IREE::Flow::DispatchTensorLoadOps. Takes a list of all tensor and all
+/// tensorDynamicDims operands to the dispatchOp as well as a IRMapping from
+/// tensor operands to the corresponding Flow dispatch tensor bbArgs.
+static void rewriteExtractSlices(RewriterBase &rewriter, scf::ForallOp forallOp,
+                                 IREE::Flow::DispatchWorkgroupsOp dispatchOp,
                                  ValueRange tensorOperands,
                                  ValueRange tensorDynamicDims,
                                  IRMapping tensorToFlowBvm) {
@@ -147,10 +140,10 @@ static void rewriteExtractSlices(PatternRewriter &rewriter,
     Location loc = extractSliceOp.getLoc();
     OpBuilder::InsertionGuard g(rewriter);
     rewriter.setInsertionPoint(extractSliceOp);
-    auto dynamicDims =
-        Util::findVariadicDynamicDims(index, tensorOperands, tensorDynamicDims);
+    auto dynamicDims = IREE::Util::findDynamicDimsInList(index, tensorOperands,
+                                                         tensorDynamicDims);
     // clang-format off
-    Value load = rewriter.create<Flow::DispatchTensorLoadOp>(
+    Value load = rewriter.create<IREE::Flow::DispatchTensorLoadOp>(
         loc,
         sourceFlow,
         dynamicDims,
@@ -184,7 +177,7 @@ static void cloneOpsIntoForallOp(RewriterBase &rewriter,
     visited.insert(op);
 
     // Do not clone ops that are not clonable.
-    if (!mlir::iree_compiler::IREE::Flow::isClonableIntoDispatchOp(op))
+    if (!IREE::Flow::isClonableIntoDispatchOp(op))
       continue;
 
     // Do not clone ParallelInsertSliceOp destinations.
@@ -219,13 +212,13 @@ static void cloneOpsIntoForallOp(RewriterBase &rewriter,
         uses.push_back(&use);
     for (OpOperand *use : uses) {
       unsigned resultNum = llvm::cast<OpResult>(use->get()).getResultNumber();
-      rewriter.updateRootInPlace(
+      rewriter.modifyOpInPlace(
           use->getOwner(), [&]() { use->set(cloned->getOpResult(resultNum)); });
     }
   }
 }
 
-/// Rewrite a ForallOp into a Flow::DispatchWorkGroupsOp.
+/// Rewrite a ForallOp into a IREE::Flow::DispatchWorkGroupsOp.
 /// This rewrite proceeds in a few steps:
 ///   - Step 0: Clone certain ops into the ForallOp (as per IREE
 ///     heuristic), so that they are part of the dispatch region.
@@ -249,9 +242,9 @@ static void cloneOpsIntoForallOp(RewriterBase &rewriter,
 ///   - Step 10: Perform RAUWIf.
 ///   - Step 11: Drop the terminator and replace forallOp.
 // TODO: n-D ForallOp
-FailureOr<Flow::DispatchWorkgroupsOp>
+FailureOr<IREE::Flow::DispatchWorkgroupsOp>
 rewriteForeachThreadToFlowDispatchWorkgroups(scf::ForallOp forallOp,
-                                             PatternRewriter &rewriter) {
+                                             RewriterBase &rewriter) {
   // Step 0: Clone ops into the ForallOp.
   cloneOpsIntoForallOp(rewriter, forallOp);
 
@@ -264,7 +257,7 @@ rewriteForeachThreadToFlowDispatchWorkgroups(scf::ForallOp forallOp,
 
   // Step 1: Compute all dynamic result dims.
   // The `dest` of the ParallelInsertSliceOp are tied to the results and carry
-  // over to the Flow::DispatchWorkgroupsOp.
+  // over to the IREE::Flow::DispatchWorkgroupsOp.
   // Use a SetVector to ensure tensor operand uniqueness.
   llvm::SetVector<Value> resultTensorOperands, resultTensorsDynamicDims;
   for (const Operation &yieldingOp : InParallelOp.getYieldingOps()) {
@@ -336,7 +329,7 @@ rewriteForeachThreadToFlowDispatchWorkgroups(scf::ForallOp forallOp,
   SmallVector<Value> allTensorDynamicDims = tensorDynamicDims;
   llvm::append_range(allTensorDynamicDims, resultTensorsDynamicDims);
   // clang-format off
-  auto dispatchOp = rewriter.create<Flow::DispatchWorkgroupsOp>(
+  auto dispatchOp = rewriter.create<IREE::Flow::DispatchWorkgroupsOp>(
       loc,
       /*workload=*/ValueRange{},
       /*resultTypes=*/forallOp.getResultTypes(),
@@ -380,7 +373,7 @@ rewriteForeachThreadToFlowDispatchWorkgroups(scf::ForallOp forallOp,
   {
     OpBuilder::InsertionGuard g(rewriter);
     rewriter.setInsertionPointToEnd(block);
-    rewriter.create<Flow::ReturnOp>(loc);
+    rewriter.create<IREE::Flow::ReturnOp>(loc);
   }
   // Add trailing index bbArgs and perform a basic sanity check.
   block->addArguments(
@@ -398,7 +391,7 @@ rewriteForeachThreadToFlowDispatchWorkgroups(scf::ForallOp forallOp,
   // Step 7. Set up bvm for RAUWIf.
   // Generally, allOperands map to their corresponding bbArg but there is a
   // twist: tensor operands map to flow.dispatch.tensor bbArgs and we need to
-  // insert an explicit Flow::DispatchTensorLoadOp to get back a proper
+  // insert an explicit IREE::Flow::DispatchTensorLoadOp to get back a proper
   // tensor. Save the tensor operand -> flow tensor bbArg mapping in
   // `tensorToFlowBvm`.
   IRMapping bvm, tensorToFlowBvm;
@@ -413,11 +406,11 @@ rewriteForeachThreadToFlowDispatchWorkgroups(scf::ForallOp forallOp,
   for (auto en : llvm::enumerate(allTensorOperands)) {
     OpBuilder::InsertionGuard g(rewriter);
     rewriter.setInsertionPointToStart(block);
-    // Warning: findVariadicDynamicDims needs to use the RankedTensorTypes and
-    // does not work out of the box with Flow::DispatchTensorType.
-    auto dynamicDims = Util::findVariadicDynamicDims(
+    // Warning: findDynamicDimsInList needs to use the RankedTensorTypes and
+    // does not work out of the box with IREE::Flow::DispatchTensorType.
+    auto dynamicDims = IREE::Util::findDynamicDimsInList(
         en.index(), allTensorOperands, allTensorDimsBBArgs);
-    auto loadOp = rewriter.create<Flow::DispatchTensorLoadOp>(
+    auto loadOp = rewriter.create<IREE::Flow::DispatchTensorLoadOp>(
         loc, llvm::cast<RankedTensorType>(en.value().getType()),
         tensorToFlowBvm.lookup(en.value()), dynamicDims);
     // Replace the tensor -> flow.dispatch.tensor entry by a
@@ -431,9 +424,9 @@ rewriteForeachThreadToFlowDispatchWorkgroups(scf::ForallOp forallOp,
   for (int64_t rank :
        llvm::seq<int64_t>(0, forallOp.getInductionVars().size())) {
     workgroupIds.push_back(
-        rewriter.create<Flow::DispatchWorkgroupIDOp>(loc, rank));
+        rewriter.create<IREE::Flow::DispatchWorkgroupIDOp>(loc, rank));
     workgroupCounts.push_back(
-        rewriter.create<Flow::DispatchWorkgroupCountOp>(loc, rank));
+        rewriter.create<IREE::Flow::DispatchWorkgroupCountOp>(loc, rank));
   }
   bvm.map(forallOp.getInductionVars(), workgroupIds);
   bvm.map(forallOp.getUpperBound(rewriter), workgroupCounts);
@@ -468,11 +461,11 @@ rewriteForeachThreadToFlowDispatchWorkgroups(scf::ForallOp forallOp,
 //===---------------------------------------------------------------------===//
 
 DiagnosedSilenceableFailure
-transform_dialect::ForeachThreadToFlowDispatchWorkgroupsOp::applyToOne(
+IREE::transform_dialect::ForeachThreadToFlowDispatchWorkgroupsOp::applyToOne(
     transform::TransformRewriter &rewriter, scf::ForallOp target,
     transform::ApplyToEachResultList &results, transform::TransformState &) {
-  SimplePatternRewriter patternRewriter(target->getContext());
-  FailureOr<Flow::DispatchWorkgroupsOp> result =
+  IRRewriter patternRewriter(target->getContext());
+  FailureOr<IREE::Flow::DispatchWorkgroupsOp> result =
       rewriteForeachThreadToFlowDispatchWorkgroups(target, patternRewriter);
   if (failed(result))
     return emitDefaultDefiniteFailure(target);
@@ -480,17 +473,18 @@ transform_dialect::ForeachThreadToFlowDispatchWorkgroupsOp::applyToOne(
   return DiagnosedSilenceableFailure::success();
 }
 
-void transform_dialect::ForeachThreadToFlowDispatchWorkgroupsOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  transform::consumesHandle(getTarget(), effects);
-  transform::producesHandle(getTransformed(), effects);
+void IREE::transform_dialect::ForeachThreadToFlowDispatchWorkgroupsOp::
+    getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  transform::consumesHandle(getTargetMutable(), effects);
+  transform::producesHandle(getOperation()->getOpResults(), effects);
   transform::modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure transform_dialect::RegionToWorkgroupsOp::applyToOne(
-    transform::TransformRewriter &rewriter, Flow::DispatchRegionOp target,
+DiagnosedSilenceableFailure
+IREE::transform_dialect::RegionToWorkgroupsOp::applyToOne(
+    transform::TransformRewriter &rewriter, IREE::Flow::DispatchRegionOp target,
     transform::ApplyToEachResultList &results, transform::TransformState &) {
-  FailureOr<Flow::DispatchWorkgroupsOp> result =
+  FailureOr<IREE::Flow::DispatchWorkgroupsOp> result =
       rewriteFlowDispatchRegionToFlowDispatchWorkgroups(target, rewriter);
   if (failed(result))
     return emitDefaultDefiniteFailure(target);
@@ -498,369 +492,14 @@ DiagnosedSilenceableFailure transform_dialect::RegionToWorkgroupsOp::applyToOne(
   return DiagnosedSilenceableFailure::success();
 }
 
-void transform_dialect::RegionToWorkgroupsOp::getEffects(
+void IREE::transform_dialect::RegionToWorkgroupsOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  transform::consumesHandle(getTarget(), effects);
-  transform::producesHandle(getTransformed(), effects);
+  transform::consumesHandle(getTargetMutable(), effects);
+  transform::producesHandle(getOperation()->getOpResults(), effects);
   transform::modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure
-transform_dialect::ClonePrecedingOpIntoDispatchRegionOp::apply(
-    transform::TransformRewriter &rewriter,
-    transform::TransformResults &transformResults,
-    transform::TransformState &state) {
-  auto targetOps = state.getPayloadOps(getTarget());
-  auto dispatchRegion = state.getPayloadOps(getDispatchRegion());
-
-  if (targetOps.empty() && dispatchRegion.empty()) {
-    transformResults.set(llvm::cast<OpResult>(getResult()),
-                         SmallVector<mlir::Operation *>{});
-    return DiagnosedSilenceableFailure::success();
-  }
-
-  if (!llvm::hasSingleElement(dispatchRegion)) {
-    return emitDefiniteFailure(
-        "requires exactly one target/dispatch region handle");
-  }
-
-  auto regionOp = dyn_cast<Flow::DispatchRegionOp>(*dispatchRegion.begin());
-  if (!regionOp)
-    return emitDefiniteFailure("expected 'dispatch.region' operand");
-
-  // We are cloning ops one-by-one, so the order must be inverted (as opposed
-  // to cloning all ops in one go).
-  SmallVector<Operation *> targetOpsList(targetOps.begin(), targetOps.end());
-  bool sortResult = computeTopologicalSorting(targetOpsList);
-  (void)sortResult;
-  assert(sortResult && "unable to sort topologically");
-  SmallVector<Operation *> orderedTargets =
-      llvm::to_vector(llvm::reverse(targetOps));
-  SmallVector<Operation *> clonedTargets;
-  for (Operation *target : orderedTargets) {
-    FailureOr<Operation *> clonedTarget =
-        clonePrecedingOpIntoDispatchRegion(rewriter, target, regionOp);
-    if (failed(clonedTarget))
-      return emitDefaultDefiniteFailure(target);
-    clonedTargets.push_back(*clonedTarget);
-  }
-
-  transformResults.set(llvm::cast<OpResult>(getCloned()), clonedTargets);
-  return DiagnosedSilenceableFailure::success();
-}
-
-void transform_dialect::ClonePrecedingOpIntoDispatchRegionOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  transform::onlyReadsHandle(getTarget(), effects);
-  transform::onlyReadsHandle(getDispatchRegion(), effects);
-  transform::producesHandle(getCloned(), effects);
-  transform::modifiesPayload(effects);
-}
-
-DiagnosedSilenceableFailure
-transform_dialect::MovePrecedingOpIntoDispatchRegionOp::apply(
-    transform::TransformRewriter &rewriter,
-    transform::TransformResults &transformResults,
-    transform::TransformState &state) {
-  auto targetOps = state.getPayloadOps(getTarget());
-  auto dispatchRegion = state.getPayloadOps(getDispatchRegion());
-
-  if (targetOps.empty() && dispatchRegion.empty()) {
-    transformResults.set(llvm::cast<OpResult>(getResult()),
-                         SmallVector<mlir::Operation *>{});
-    return DiagnosedSilenceableFailure::success();
-  }
-
-  if (!llvm::hasSingleElement(dispatchRegion)) {
-    return emitDefiniteFailure(
-        "requires exactly one target/dispatch region handle");
-  }
-
-  auto regionOp = dyn_cast<Flow::DispatchRegionOp>(*dispatchRegion.begin());
-  if (!regionOp)
-    return emitDefiniteFailure("expected 'dispatch.region' operand");
-
-  // We are cloning ops one-by-one, so the order must be inversed (as opposed
-  // to cloning all ops in one go).
-  SmallVector<Operation *> targetOpsList(targetOps.begin(), targetOps.end());
-  bool sortResult = computeTopologicalSorting(targetOpsList);
-  (void)sortResult;
-  assert(sortResult && "unable to sort topologically");
-  SmallVector<Operation *> orderedTargets =
-      llvm::to_vector(llvm::reverse(targetOps));
-  for (Operation *target : orderedTargets) {
-    auto newRegionOp =
-        movePrecedingOpsIntoDispatchRegion(rewriter, target, regionOp);
-    if (failed(newRegionOp))
-      return emitDefaultDefiniteFailure(target);
-    regionOp = *newRegionOp;
-  }
-
-  transformResults.set(llvm::cast<OpResult>(getTransformed()),
-                       {regionOp.getOperation()});
-  return DiagnosedSilenceableFailure::success();
-}
-
-void transform_dialect::MovePrecedingOpIntoDispatchRegionOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  transform::consumesHandle(getTarget(), effects);
-  transform::consumesHandle(getDispatchRegion(), effects);
-  transform::producesHandle(getTransformed(), effects);
-  transform::modifiesPayload(effects);
-}
-
-// Clone a `target` op that is succeeding the given dispatch region op into the
-// dispatch region.
-//
-// All operands of the target are replaced with values defined inside of the
-// dispatch region when possible.
-//
-// Example:
-//
-// %r = flow.dispatch.region -> (tensor<?xf32>{%d0}) {
-//   %1 = "another_op"() : () -> (tensor<?xf32>)
-//   flow.return %1 : tensor<?xf32>
-// }
-// %0 = "some_op"(%r) : (tensor<?xf32>) -> (tensor<?xf32>)
-// %2 = "yet_another_use"(%0) : (tensor<?xf32>) -> (tensor<?xf32>)
-//
-// In this example, "some_op" will be cloned into the dispatch region. The
-// OpOperand of "yet_another_use" will remain unchanged:
-//
-// %r:2 = flow.dispatch.region -> (tensor<?xf32>{%d0}) {
-//   %1 = "another_op"() : () -> (tensor<?xf32>)
-//   %0_clone = "some_op"(%1) : (tensor<?xf32>) -> (tensor<?xf32>)
-//   flow.return %1 : tensor<?xf32>
-// }
-// %0 = "some_op"(%r) : (tensor<?xf32>) -> (tensor<?xf32>)
-// %2 = "yet_another_use"(%0) : (tensor<?xf32>) -> (tensor<?xf32>)
-static FailureOr<Operation *>
-cloneSucceedingOpIntoDispatchRegion(RewriterBase &rewriter, Operation *target,
-                                    Flow::DispatchRegionOp regionOp) {
-  if (!regionOp->isBeforeInBlock(target)) {
-    target->emitError() << "expected that region op comes first";
-    return failure();
-  }
-
-  Block &body = regionOp.getBody().front();
-
-  // Gather all uses of `target`.
-  SmallVector<OpOperand *> usesOutsideOfRegion;
-  for (OpOperand &use : target->getUses())
-    usesOutsideOfRegion.push_back(&use);
-
-  // Clone op into dispatch region.
-  auto returnOp = cast<Flow::ReturnOp>(body.getTerminator());
-  OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPoint(returnOp);
-  Operation *newTargetOp = rewriter.clone(*target);
-
-  // Replace all operands that are results of the regionOp.
-  for (OpOperand &operand : newTargetOp->getOpOperands()) {
-    if (operand.get().getDefiningOp() == regionOp) {
-      unsigned resultNumber =
-          llvm::cast<OpResult>(operand.get()).getResultNumber();
-      operand.set(returnOp->getOperand(resultNumber));
-    }
-  }
-
-  return newTargetOp;
-}
-
-// Move a `target` op that is succeeding the given dispatch region op into the
-// dispatch region.
-//
-// All operands of the target are replaced with values defined inside of the
-// dispatch region when possible.
-//
-// All uses of the target op after the dispatch region, are updated: The target
-// op's results are returned from the the dispatch region an used in those
-// places.
-//
-// Example:
-//
-// %r = flow.dispatch.region -> (tensor<?xf32>{%d0}) {
-//   %1 = "another_op"() : () -> (tensor<?xf32>)
-//   flow.return %1 : tensor<?xf32>
-// }
-// %0 = "some_op"(%r) : (tensor<?xf32>) -> (tensor<?xf32>)
-// %2 = "yet_another_use"(%0) : (tensor<?xf32>) -> (tensor<?xf32>)
-//
-// In this example, "some_op" will be moved into the dispatch region and the
-// OpOperand of "yet_another_use" will be replaced:
-//
-// %r:2 = flow.dispatch.region -> (tensor<?xf32>{%d0}) {
-//   %1 = "another_op"() : () -> (tensor<?xf32>)
-//   %0 = "some_op"(%1) : (tensor<?xf32>) -> (tensor<?xf32>)
-//   flow.return %1, %0 : tensor<?xf32>, tensor<?xf32>
-// }
-// %2 = "yet_another_use"(%r#1) : (tensor<?xf32>) -> (tensor<?xf32>)
-static FailureOr<Flow::DispatchRegionOp>
-moveSucceedingOpIntoDispatchRegion(RewriterBase &rewriter, Operation *target,
-                                   Flow::DispatchRegionOp regionOp) {
-  if (!regionOp->isBeforeInBlock(target)) {
-    target->emitError() << "expected that region op comes first";
-    return failure();
-  }
-
-  Block &body = regionOp.getBody().front();
-
-  // Gather all uses of `target`.
-  SmallVector<OpOperand *> usesOutsideOfRegion;
-  for (OpOperand &use : target->getUses())
-    usesOutsideOfRegion.push_back(&use);
-
-  // Compute dynamic result dims.
-  SmallVector<SmallVector<Value>> dynamicDims;
-  for (Value v : target->getResults()) {
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPoint(target);
-    SmallVector<Value> &dims = dynamicDims.emplace_back();
-    if (failed(Flow::reifyDynamicResultDims(rewriter, v, dims)))
-      return failure();
-  }
-
-  // Clone op into dispatch region.
-  auto returnOp = cast<Flow::ReturnOp>(body.getTerminator());
-  target->moveBefore(returnOp);
-
-  // Replace all operands that are results of the regionOp.
-  for (OpOperand &operand : target->getOpOperands()) {
-    if (operand.get().getDefiningOp() == regionOp) {
-      unsigned resultNumber =
-          llvm::cast<OpResult>(operand.get()).getResultNumber();
-      rewriter.updateRootInPlace(
-          target, [&]() { operand.set(returnOp->getOperand(resultNumber)); });
-    }
-  }
-
-  // Replace all uses outside of the dispatch region.
-  unsigned previousNumResults = regionOp->getNumResults();
-
-  // Note: Appending results one-by-one here so that this can be extended to
-  // specific results in the future. Many ops have just one result, so this
-  // should not be a large overhead.
-  for (const auto &it : llvm::enumerate(target->getResults())) {
-    auto newRegionOp = appendDispatchRegionResults(
-        rewriter, regionOp, it.value(), dynamicDims[it.index()]);
-    if (failed(newRegionOp))
-      return failure();
-    regionOp = *newRegionOp;
-  }
-
-  // Replace uses of `target` after the dispatch region.
-  for (OpOperand *use : usesOutsideOfRegion) {
-    rewriter.updateRootInPlace(use->getOwner(), [&]() {
-      use->set(regionOp->getResult(
-          previousNumResults +
-          llvm::cast<OpResult>(use->get()).getResultNumber()));
-    });
-  }
-
-  return regionOp;
-}
-
-DiagnosedSilenceableFailure
-transform_dialect::CloneSucceedingOpIntoDispatchRegionOp::apply(
-    transform::TransformRewriter &rewriter,
-    transform::TransformResults &transformResults,
-    transform::TransformState &state) {
-  auto targetOps = state.getPayloadOps(getTarget());
-  auto dispatchRegion = state.getPayloadOps(getDispatchRegion());
-
-  if (!llvm::hasSingleElement(dispatchRegion))
-    return emitDefiniteFailure("requires exactly one dispatch region handle");
-
-  auto regionOp = dyn_cast<Flow::DispatchRegionOp>(*dispatchRegion.begin());
-  if (!regionOp)
-    return emitDefiniteFailure("expected 'dispatch.region' operand");
-
-  SmallVector<Operation *> orderedTargets(targetOps.begin(), targetOps.end());
-  bool sortResult = computeTopologicalSorting(orderedTargets);
-  (void)sortResult;
-  assert(sortResult && "unable to sort topologically");
-  SmallVector<Operation *> newTargets;
-  for (Operation *target : orderedTargets) {
-    auto newTarget =
-        cloneSucceedingOpIntoDispatchRegion(rewriter, target, regionOp);
-    if (failed(newTarget))
-      return DiagnosedSilenceableFailure::definiteFailure();
-    newTargets.push_back(*newTarget);
-  }
-
-  transformResults.set(llvm::cast<OpResult>(getCloned()), newTargets);
-  return DiagnosedSilenceableFailure::success();
-}
-
-void transform_dialect::CloneSucceedingOpIntoDispatchRegionOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  transform::onlyReadsHandle(getTarget(), effects);
-  transform::onlyReadsHandle(getDispatchRegion(), effects);
-  transform::producesHandle(getCloned(), effects);
-  transform::modifiesPayload(effects);
-}
-
-DiagnosedSilenceableFailure
-transform_dialect::MoveSucceedingOpIntoDispatchRegionOp::apply(
-    transform::TransformRewriter &rewriter,
-    transform::TransformResults &transformResults,
-    transform::TransformState &state) {
-  auto targetOps = state.getPayloadOps(getTarget());
-  auto dispatchRegion = state.getPayloadOps(getDispatchRegion());
-
-  if (!llvm::hasSingleElement(dispatchRegion)) {
-    return emitDefiniteFailure(
-        "requires exactly one target/dispatch region handle");
-  }
-
-  auto regionOp = dyn_cast<Flow::DispatchRegionOp>(*dispatchRegion.begin());
-  if (!regionOp)
-    return emitDefiniteFailure("expected 'dispatch.region' operand");
-
-  SmallVector<Operation *> orderedTargets(targetOps.begin(), targetOps.end());
-  bool sortResult = computeTopologicalSorting(orderedTargets);
-  (void)sortResult;
-  assert(sortResult && "unable to sort topologically");
-  for (Operation *target : orderedTargets) {
-    auto newRegionOp =
-        moveSucceedingOpIntoDispatchRegion(rewriter, target, regionOp);
-    if (failed(newRegionOp))
-      return DiagnosedSilenceableFailure::definiteFailure();
-    regionOp = *newRegionOp;
-  }
-
-  transformResults.set(llvm::cast<OpResult>(getTransformed()),
-                       {regionOp.getOperation()});
-  return DiagnosedSilenceableFailure::success();
-}
-
-void transform_dialect::MoveSucceedingOpIntoDispatchRegionOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  transform::consumesHandle(getTarget(), effects);
-  transform::consumesHandle(getDispatchRegion(), effects);
-  transform::producesHandle(getTransformed(), effects);
-  transform::modifiesPayload(effects);
-}
-
-DiagnosedSilenceableFailure
-transform_dialect::WrapInDispatchRegionOp::applyToOne(
-    transform::TransformRewriter &rewriter, Operation *target,
-    transform::ApplyToEachResultList &results,
-    transform::TransformState &state) {
-  auto regionOp = Flow::wrapOpInDispatchRegion(rewriter, target);
-  if (failed(regionOp))
-    return emitDefaultDefiniteFailure(target);
-
-  results.push_back(*regionOp);
-  return DiagnosedSilenceableFailure::success();
-}
-
-void transform_dialect::WrapInDispatchRegionOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  transform::consumesHandle(getTarget(), effects);
-  transform::producesHandle(getTransformed(), effects);
-  transform::modifiesPayload(effects);
-}
+} // namespace mlir::iree_compiler
 
 #define GET_OP_CLASSES
 #include "iree/compiler/Dialect/Flow/TransformExtensions/FlowExtensionsOps.cpp.inc"

@@ -4,15 +4,14 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/SPIRV/KernelConfig.h"
-#include "iree/compiler/Codegen/SPIRV/PassDetail.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/SPIRV/Passes.h"
-#include "iree/compiler/Codegen/SPIRV/Utils.h"
-#include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
+#include "iree/compiler/Codegen/Utils/GPUUtils.h"
+#include "iree/compiler/Codegen/Utils/Utils.h"
 #include "llvm/Support/Debug.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 
 #define DEBUG_TYPE "iree-spirv-verifier"
 
@@ -44,20 +43,30 @@ LogicalResult verifySPIRVMatmulPromoteVectorizePassPipeline(
     llvm::dbgs() << "]\n";
   });
 
-  // Get spirv.target_env attributes
-  const spirv::TargetEnvAttr targetEnvAttr = getSPIRVTargetEnvAttr(op);
-  const spirv::TargetEnv targetEnv(targetEnvAttr);
-  const auto limits = targetEnv.getResourceLimits();
-  LLVM_DEBUG(llvm::dbgs() << "target environment: " << targetEnvAttr << "\n");
+  FailureOr<int64_t> maybeDepth =
+      getSoftwarePipelineDepth(translationInfo.getConfiguration());
+  FailureOr<int64_t> maybeStage =
+      getSoftwarePipelineStoreStage(translationInfo.getConfiguration());
+  if (failed(maybeDepth) || failed(maybeStage)) {
+    return op->emitOpError(
+        "invalid matmul configuration without pipelining config");
+  }
 
-  auto funcOp = op->getParentOfType<func::FuncOp>();
-  const std::optional<int> subgroupSize = getSPIRVSubgroupSize(funcOp);
+  IREE::GPU::TargetAttr target = getGPUTargetAttr(op);
+  LLVM_DEBUG(llvm::dbgs() << "target: " << target << "\n");
+
+  auto funcOp = op->getParentOfType<mlir::FunctionOpInterface>();
+  std::optional<int> subgroupSize = getGPUSubgroupSize(funcOp);
   if (!subgroupSize)
     return funcOp->emitError("failed to query subgroup size");
-  const int maxThreads = limits.getMaxComputeWorkgroupInvocations();
-  const auto maxWorkGroupSize = llvm::map_to_vector<3>(
-      limits.getMaxComputeWorkgroupSize().getAsValueRange<IntegerAttr>(),
-      [](const APInt &dim) { return dim.getSExtValue(); });
+  const int maxThreads = target.getWgp().getMaxThreadCountPerWorkgroup();
+  const auto maxWorkGroupSize =
+      target.getWgp().getMaxWorkgroupSizes().asArrayRef();
+
+  if (workgroupSize.size() < 3) {
+    return funcOp->emitOpError("expected workgroup size to have three "
+                               "dimensions for SPIR-V pipelines");
+  }
 
   // Verify each dimension of workgroupSize should be power of two.
   if (!llvm::isPowerOf2_64(workgroupSize[0]) ||
@@ -122,9 +131,6 @@ LogicalResult verifySPIRVMatmulPromoteVectorizePassPipeline(
     return op->emitOpError("RHS shape is indivisible by first level tile size");
   }
 
-  auto pipelineDepth = translationInfo.getSoftwarePipelineDepth();
-  pipelineDepth = pipelineDepth ? pipelineDepth : 1;
-
   return success();
 }
 
@@ -149,20 +155,25 @@ LogicalResult verifySPIRVCooperativeMatrixVectorizePassPipeline(
     llvm::dbgs() << "]\n";
   });
 
-  // Get spirv.target_env attributes
-  const spirv::TargetEnvAttr targetEnvAttr = getSPIRVTargetEnvAttr(op);
-  const spirv::TargetEnv targetEnv(targetEnvAttr);
-  const auto limits = targetEnv.getResourceLimits();
-  LLVM_DEBUG(llvm::dbgs() << "target environment: " << targetEnvAttr << "\n");
+  FailureOr<int64_t> maybeDepth =
+      getSoftwarePipelineDepth(translationInfo.getConfiguration());
+  FailureOr<int64_t> maybeStage =
+      getSoftwarePipelineStoreStage(translationInfo.getConfiguration());
+  if (failed(maybeDepth) || failed(maybeStage)) {
+    return op->emitOpError(
+        "invalid cooperative matrix configuration without pipelining config");
+  }
 
-  auto funcOp = op->getParentOfType<func::FuncOp>();
-  const std::optional<int> subgroupSize = getSPIRVSubgroupSize(funcOp);
+  IREE::GPU::TargetAttr target = getGPUTargetAttr(op);
+  LLVM_DEBUG(llvm::dbgs() << "target: " << target << "\n");
+
+  auto funcOp = op->getParentOfType<mlir::FunctionOpInterface>();
+  std::optional<int> subgroupSize = getGPUSubgroupSize(funcOp);
   if (!subgroupSize)
     return funcOp->emitError("failed to query subgroup size");
-  const int maxThreads = limits.getMaxComputeWorkgroupInvocations();
-  const auto maxWorkGroupSize = llvm::map_to_vector<3>(
-      limits.getMaxComputeWorkgroupSize().getAsValueRange<IntegerAttr>(),
-      [](const APInt &dim) { return dim.getSExtValue(); });
+  const int maxThreads = target.getWgp().getMaxThreadCountPerWorkgroup();
+  const auto maxWorkGroupSize =
+      target.getWgp().getMaxWorkgroupSizes().asArrayRef();
 
   // Verify each dimension of workgroupSize should be power of two.
   if (!llvm::isPowerOf2_64(workgroupSize[0]) ||
@@ -235,29 +246,24 @@ LogicalResult verifySPIRVCooperativeMatrixVectorizePassPipeline(
   Type rhsType = getElementType(op->getOperand(1));
   Type resultType = getElementType(op->getOperand(2));
 
-  auto properties =
-      limits.getCooperativeMatrixPropertiesKhr()
-          .getAsRange<spirv::CooperativeMatrixPropertiesKHRAttr>();
-
   // Verify that the fourth level tile sizes match cooperative matrix,
   // and subgroup tile sizes should be multiple of cooperative matrix (M, N, K)
   // sizes.
   bool isNativeVectorSizeAccepted = false;
-  for (auto p : properties) {
-    if (p.getAType() == lhsType && p.getBType() == rhsType &&
-        p.getCType() == resultType &&
-        p.getScope().getValue() == spirv::Scope::Subgroup &&
-        p.getMSize() == nativeVectorSizes[0] &&
-        p.getNSize() == nativeVectorSizes[1] &&
-        p.getKSize() == nativeVectorSizes[2]) {
+  for (IREE::GPU::MMAAttr mma : target.getWgp().getMma()) {
+    auto [mSize, nSize, kSize] = mma.getMNKShape();
+    auto [aType, bType, cType] = mma.getABCElementTypes();
+
+    if (aType == lhsType && bType == rhsType && cType == resultType &&
+        mSize == nativeVectorSizes[0] && nSize == nativeVectorSizes[1] &&
+        kSize == nativeVectorSizes[2]) {
       isNativeVectorSizeAccepted = true;
-      if (subgroupTileSizes[0] % p.getMSize() != 0 ||
-          subgroupTileSizes[1] % p.getNSize() != 0 ||
-          reductionTileSizes[2] % p.getKSize() != 0) {
+      if (subgroupTileSizes[0] % mSize != 0 ||
+          subgroupTileSizes[1] % nSize != 0 ||
+          reductionTileSizes[2] % kSize != 0) {
         return op->emitOpError(
                    "expected subgroup tile sizes to be multiple of ")
-               << "[" << p.getMSize() << ", " << p.getNSize() << ", "
-               << p.getKSize() << "]";
+               << "[" << mSize << ", " << nSize << ", " << kSize << "]";
       }
     }
   }

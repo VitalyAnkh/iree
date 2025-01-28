@@ -12,31 +12,34 @@
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
 #include "iree/compiler/Utils/PassUtils.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Transforms/Passes.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/Passes.h"
 
-namespace mlir::iree_compiler::IREE::HAL {
-namespace Inline {
+namespace mlir::iree_compiler::IREE::HAL::Inline {
 
-using FunctionLikeNest = MultiOpNest<func::FuncOp, IREE::Util::InitializerOp>;
+using FunctionLikeNest =
+    MultiOpNest<func::FuncOp, IREE::Util::InitializerOp, IREE::Util::FuncOp>;
 
 //===----------------------------------------------------------------------===//
 // Utilities
 //===----------------------------------------------------------------------===//
 
 static void addCleanupPatterns(OpPassManager &passManager) {
-  // Standard MLIR cleanup.
-  passManager.addPass(mlir::createCanonicalizerPass());
-  passManager.addPass(mlir::createCSEPass());
-
   FunctionLikeNest(passManager)
+      // Standard MLIR cleanup.
+      .addPass(mlir::createCanonicalizerPass)
+      .addPass(mlir::createCSEPass)
+
       // Simplify util.global accesses; this can help with data flow tracking as
       // redundant store-loads are removed.
-      .addPass(IREE::Util::createSimplifyGlobalAccessesPass);
+      .addPass(IREE::Util::createSimplifyGlobalAccessesPass)
+
+      // Aggressive cleanup.
+      .addPass(IREE::Util::createApplyPatternsPass);
 
   // Cleanup and canonicalization of util.global (and other util ops).
-  passManager.addPass(IREE::Util::createApplyPatternsPass());
   passManager.addPass(IREE::Util::createFoldGlobalsPass());
   passManager.addPass(IREE::Util::createFuseGlobalsPass());
 }
@@ -46,12 +49,18 @@ static void addCleanupPatterns(OpPassManager &passManager) {
 //===----------------------------------------------------------------------===//
 
 void buildHALInlineStaticTransformPassPipeline(
-    OpPassManager &passManager, const TargetBackendRegistry &targetRegistry,
+    OpPassManager &passManager, const TargetRegistry &targetRegistry,
     const TargetOptions &targetOptions) {
   //----------------------------------------------------------------------------
   // Device assignment and interface materialization
   //----------------------------------------------------------------------------
 
+  IREE::HAL::AssignmentOptions assignmentOptions;
+  assignmentOptions.legacyTargetBackends = targetOptions.legacyTargetBackends;
+  assignmentOptions.targetDevices = targetOptions.targetDevices;
+  assignmentOptions.defaultDevice = targetOptions.defaultDevice;
+  IREE::HAL::buildHALDeviceAssignmentPassPipeline(passManager, targetRegistry,
+                                                  assignmentOptions);
   IREE::HAL::buildHALConfigurationPassPipeline(passManager, targetRegistry,
                                                targetOptions);
 
@@ -61,9 +70,9 @@ void buildHALInlineStaticTransformPassPipeline(
 
   // Translate each executable down to common MLIR dialects.
   passManager.addNestedPass<IREE::HAL::ExecutableOp>(
-      IREE::HAL::createConfigureExecutablesPass(targetRegistry));
+      IREE::HAL::createConfigureExecutablesPass({targetRegistry}));
   passManager.addNestedPass<IREE::HAL::ExecutableOp>(
-      IREE::HAL::createTranslateExecutablesPass(targetRegistry));
+      IREE::HAL::createTranslateAllExecutablesPass({targetRegistry}));
 
   // Inline the translated executable functions.
   // We preserve the executables for their metadata used during conversion.
@@ -105,10 +114,9 @@ void registerHALInlinePasses() {
       "Runs the inline HAL dialect transformation pipeline",
       [](OpPassManager &passManager) {
         buildHALInlineStaticTransformPassPipeline(
-            passManager, TargetBackendRegistry::getGlobal(),
+            passManager, TargetRegistry::getGlobal(),
             TargetOptions::FromFlags::get());
       });
 }
 
-} // namespace Inline
-} // namespace mlir::iree_compiler::IREE::HAL
+} // namespace mlir::iree_compiler::IREE::HAL::Inline

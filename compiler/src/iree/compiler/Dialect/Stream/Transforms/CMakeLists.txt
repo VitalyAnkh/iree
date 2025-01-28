@@ -15,9 +15,10 @@ iree_cc_library(
     Transforms
   HDRS
     "Passes.h"
-    "Passes.h.inc"
   SRCS
+    "AnnotateAffinities.cpp"
     "AnnotateDispatchArguments.cpp"
+    "AnnotateDispatchAssumptions.cpp"
     "ConvertToStream.cpp"
     "DumpStatistics.cpp"
     "ElideAsyncCopies.cpp"
@@ -31,19 +32,21 @@ iree_cc_library(
     "MaterializeCopyOnWrite.cpp"
     "PackConstants.cpp"
     "PackDispatchOperands.cpp"
-    "PassDetail.h"
     "Passes.cpp"
+    "Passes.h.inc"
     "PropagateTimepoints.cpp"
     "RefineUsage.cpp"
     "ScheduleAllocation.cpp"
     "ScheduleConcurrency.cpp"
     "ScheduleExecution.cpp"
     "SpecializeDispatches.cpp"
+    "SpecializeEncodings.cpp"
+    "SyncInitializers.cpp"
+    "VerifyAffinities.cpp"
     "VerifyAsyncAccessRanges.cpp"
     "VerifyLowerings.cpp"
   DEPS
     ::PassesIncGen
-    IREELinalgExtDialect
     LLVMSupport
     MLIRAffineDialect
     MLIRAnalysis
@@ -51,6 +54,7 @@ iree_cc_library(
     MLIRComplexDialect
     MLIRControlFlowDialect
     MLIRFuncDialect
+    MLIRFunctionInterfaces
     MLIRIR
     MLIRLinalgDialect
     MLIRMemRefDialect
@@ -62,9 +66,10 @@ iree_cc_library(
     MLIRTransformUtils
     MLIRTransforms
     MLIRVectorDialect
+    iree::compiler::Dialect::Encoding::IR
     iree::compiler::Dialect::Flow::IR
-    iree::compiler::Dialect::Flow::Transforms
     iree::compiler::Dialect::HAL::IR
+    iree::compiler::Dialect::LinalgExt::IR
     iree::compiler::Dialect::Stream::Analysis
     iree::compiler::Dialect::Stream::Builtins
     iree::compiler::Dialect::Stream::Conversion

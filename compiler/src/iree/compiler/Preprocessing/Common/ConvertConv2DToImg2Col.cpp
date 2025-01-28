@@ -4,7 +4,6 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Preprocessing/Common/PassDetail.h"
 #include "iree/compiler/Preprocessing/Common/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -20,6 +19,9 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler::Preprocessing {
+
+#define GEN_PASS_DEF_CONVERTCONV2DTOIMG2COLPASS
+#include "iree/compiler/Preprocessing/Common/Passes.h.inc" // IWYU pragma: export
 
 static bool hasAllOneValues(DenseIntElementsAttr attr) {
   return llvm::all_of(
@@ -46,7 +48,7 @@ namespace {
 // and linalg.matmul.
 //
 // A convolution operaton can be written as a matrix-matrix multiplication by
-// unfolding the cross corrolation between input and filter and explicitly copy
+// unfolding the cross correlation between input and filter and explicitly copy
 // overlapped sliding window inputs.
 //
 // Consider 2D input X with single channel input and output and 2x2 filter W:
@@ -87,12 +89,19 @@ public:
     auto outputType = llvm::cast<ShapedType>(convOp.getOutputs()[0].getType());
 
     if (!filterType.hasStaticShape() || !inputType.hasStaticShape()) {
-      return failure();
+      return rewriter.notifyMatchFailure(convOp, [](Diagnostic &diag) {
+        diag << "[unimplemented] "
+             << "expected 'filterType' and 'inputType' to have static shapes.";
+      });
     }
 
     // TODO: Support dilation.
-    if (!hasAllOneValues(convOp.getDilations()))
-      return failure();
+    if (!hasAllOneValues(convOp.getDilations())) {
+      return rewriter.notifyMatchFailure(convOp, [](Diagnostic &diag) {
+        diag << "[unimplemented] "
+             << "expected no dilations (expected dilations to all be one).";
+      });
+    }
 
     Value input = convOp.getInputs()[0];
     Value filter = convOp.getInputs()[1];
@@ -224,8 +233,8 @@ public:
 };
 
 // Similar to the conv pattern above except there is no reduction among the
-// input channles so each convolution can be a matrix-vector product and
-// by transposing both input filter so channles are outer most the computation
+// input channels so each convolution can be a matrix-vector product and
+// by transposing both input filter so channels are outer most the computation
 // is a batched matrix-vector product.
 class ConvertDepthwiseConv2DNhwcHwc final
     : public OpRewritePattern<linalg::DepthwiseConv2DNhwcHwcOp> {
@@ -242,12 +251,18 @@ public:
         llvm::cast<RankedTensorType>(convOp.getOutputs()[0].getType());
 
     if (!filterType.hasStaticShape() || !inputType.hasStaticShape()) {
-      return failure();
+      return rewriter.notifyMatchFailure(convOp, [](Diagnostic &diag) {
+        diag << "[unimplemented] "
+             << "expected 'filterType' and 'inputType' to have static shapes.";
+      });
     }
 
     // TODO: Support dilation.
     if (!hasAllOneValues(convOp.getDilations()))
-      return failure();
+      return rewriter.notifyMatchFailure(convOp, [](Diagnostic &diag) {
+        diag << "[unimplemented] "
+             << "expected no dilations (expected dilations to all be one).";
+      });
 
     auto loc = convOp.getLoc();
 
@@ -396,12 +411,18 @@ public:
     auto outputType = llvm::cast<ShapedType>(convOp.getOutputs()[0].getType());
 
     if (!filterType.hasStaticShape() || !inputType.hasStaticShape()) {
-      return failure();
+      return rewriter.notifyMatchFailure(convOp, [](Diagnostic &diag) {
+        diag << "[unimplemented] "
+             << "expected 'filterType' and 'inputType' to have static shapes.";
+      });
     }
 
     // TODO: Support dilation.
     if (!hasAllOneValues(convOp.getDilations()))
-      return failure();
+      return rewriter.notifyMatchFailure(convOp, [](Diagnostic &diag) {
+        diag << "[unimplemented] "
+             << "expected no dilations (expected dilations to all be one).";
+      });
 
     Value input = convOp.getInputs()[0];
     Value filter = convOp.getInputs()[1];
@@ -531,27 +552,20 @@ public:
   }
 };
 
-struct ConvertConv2DToImg2ColPass
-    : ConvertConv2DToImg2ColBase<ConvertConv2DToImg2ColPass> {
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<linalg::LinalgDialect>();
-  }
+class ConvertConv2DToImg2ColPass
+    : public iree_compiler::Preprocessing::impl::ConvertConv2DToImg2ColPassBase<
+          ConvertConv2DToImg2ColPass> {
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(&getContext());
     patterns.insert<ConvertConv2DNhwcHwcf, ConvertDepthwiseConv2DNhwcHwc,
                     ConvertConv2DNchwFchw>(context);
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
   }
 };
 
 } // namespace
-
-std::unique_ptr<Pass> createConvertConv2DToImg2ColPass() {
-  return std::make_unique<ConvertConv2DToImg2ColPass>();
-}
 
 } // namespace mlir::iree_compiler::Preprocessing

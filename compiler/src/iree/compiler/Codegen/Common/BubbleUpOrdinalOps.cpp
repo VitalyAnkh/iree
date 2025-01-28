@@ -11,13 +11,15 @@
 //
 //===---------------------------------------------------------------------===//
 
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_BUBBLEUPORDINALOPSPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 namespace {
 
@@ -62,8 +64,8 @@ struct BubbleUpAcrossCastOp
   }
 };
 
-struct BubbleUpOrdinalOpsPass
-    : public BubbleUpOrdinalOpsBase<BubbleUpOrdinalOpsPass> {
+struct BubbleUpOrdinalOpsPass final
+    : impl::BubbleUpOrdinalOpsPassBase<BubbleUpOrdinalOpsPass> {
   void runOnOperation() override;
 };
 } // namespace
@@ -72,14 +74,8 @@ void BubbleUpOrdinalOpsPass::runOnOperation() {
   MLIRContext *context = &getContext();
   RewritePatternSet patterns(context);
   patterns.insert<BubbleUpAcrossCastOp<arith::IndexCastUIOp>>(context);
-  if (failed(
-          applyPatternsAndFoldGreedily(getOperation(), std::move(patterns)))) {
+  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
     return signalPassFailure();
   }
 }
-
-std::unique_ptr<Pass> createBubbleUpOrdinalOpsPass() {
-  return std::make_unique<BubbleUpOrdinalOpsPass>();
-}
-
 } // namespace mlir::iree_compiler

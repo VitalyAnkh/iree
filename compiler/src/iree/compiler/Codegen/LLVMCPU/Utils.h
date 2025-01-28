@@ -10,10 +10,6 @@
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 
-namespace mlir::scf {
-struct SCFTilingOptions;
-} // namespace mlir::scf
-
 namespace mlir::iree_compiler {
 
 bool preferIntrinsicsOverAsm(IREE::HAL::ExecutableTargetAttr targetAttr);
@@ -36,19 +32,31 @@ bool hasZve32fFeature(IREE::HAL::ExecutableTargetAttr targetAttr);
 /// Returns true if the 'targetAttr' contains '+zve64x' in its cpu features.
 bool hasZve64xFeature(IREE::HAL::ExecutableTargetAttr targetAttr);
 
+/// Returns true if the 'targetAttr' contains any riscv vector feature in its
+/// cpu features.
+bool hasAnyVFeature(IREE::HAL::ExecutableTargetAttr targetAttr);
+
 /// Returns true if the 'targetAttr' contains '+sve' or '+sve2' in its cpu
-/// features.
+/// features or any other feature flag that includes them.
 bool hasAnySVEFeature(IREE::HAL::ExecutableTargetAttr targetAttr);
 
 /// Returns true if the 'targetAttr' contains '+sme' in its cpu features.
 bool hasSMEFeature(IREE::HAL::ExecutableTargetAttr targetAttr);
 
-/// Sets the tile sizes of the SCFTilingOptions. If `tileScalableFlags` are
-/// provided the corresponding tile size will be multiplied by a vector.vscale
-/// op.
-void setSCFTileSizes(scf::SCFTilingOptions &options, TilingInterface consumerOp,
-                     SmallVector<int64_t> tileSizes,
-                     SmallVector<bool> tileScalableFlags);
+/// Returns true if the 'targetAttr' contains '+i8mm' in its cpu features.
+bool hasI8mmFeature(IREE::HAL::ExecutableTargetAttr targetAttr);
+
+/// Returns true if the `genericOp` is a simple 2D transpose, i.e.,
+///
+///   1. The op has 2 dimensions.
+///   2. The op has a single input and a single output.
+///   3. One of the `indexing_maps` is a permutation and the other an identity.
+///   4. The body of the generic has a single yield op returning the block
+///   argument corresponding to the input.
+bool isLinalgGeneric2DTranspose(linalg::GenericOp genericOp);
+
+/// Returns true if the op could result in undefined behavior.
+bool mayHaveUndefinedBehaviorInMasking(Operation *op);
 
 } // namespace mlir::iree_compiler
 

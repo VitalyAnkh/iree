@@ -1,28 +1,21 @@
-// RUN: iree-opt --split-input-file \
-// RUN:   --pass-pipeline='builtin.module(hal.executable(hal.executable.variant(iree-codegen-spirv-configuration-pipeline, iree-codegen-linalg-to-spirv-pipeline)))' \
+// RUN: iree-opt --split-input-file --iree-gpu-test-target=pascal@vulkan \
+// RUN:   --pass-pipeline='builtin.module(hal.executable(hal.executable.variant(builtin.module(iree-codegen-spirv-configuration-pipeline), iree-codegen-linalg-to-spirv-pipeline)))' \
 // RUN:   %s | FileCheck %s
 
-#pipeline_layout = #hal.pipeline.layout<push_constants = 0, sets = [
-  #hal.descriptor_set.layout<0, bindings = [
-    #hal.descriptor_set.binding<0, storage_buffer>,
-    #hal.descriptor_set.binding<1, storage_buffer>,
-    #hal.descriptor_set.binding<2, storage_buffer>,
-    #hal.descriptor_set.binding<3, storage_buffer>,
-    #hal.descriptor_set.binding<4, storage_buffer>
-  ]>
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
 ]>
 hal.executable @i4_dequant_unit_matmul_f16 {
   hal.executable.variant @vulkan_spirv_fb target(<"vulkan-spirv", "vulkan-spirv-fb", {
-      spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [
-          Shader, Float16, StorageBuffer16BitAccess, GroupNonUniform,
-          GroupNonUniformArithmetic, GroupNonUniformShuffle
-        ], [SPV_KHR_16bit_storage]>, Unknown:IntegratedGPU,
-        #spirv.resource_limits<
-          max_compute_shared_memory_size = 32768,
-          max_compute_workgroup_invocations = 1024,
-          max_compute_workgroup_size = [1024, 1024, 64],
-          subgroup_size = 32
-        >>
+    iree.gpu.target = #iree_gpu.target<arch = "", features = "spirv:v1.6,cap:Shader", wgp = <
+      compute = fp32|fp16|int32, storage = b32|b16, subgroup = shuffle|arithmetic, dot = none, mma = [],
+      subgroup_size_choices = [32], max_workgroup_sizes = [1024, 1024, 1024],
+      max_thread_count_per_workgroup = 1024, max_workgroup_memory_bytes = 65536,
+      max_workgroup_counts = [65535, 65535, 65535]>>
     }>) {
     hal.executable.export @i4_dequant_unit_matmul_f16 layout(#pipeline_layout) {
     ^bb0(%arg0: !hal.device):
@@ -33,11 +26,11 @@ hal.executable @i4_dequant_unit_matmul_f16 {
       func.func @i4_dequant_unit_matmul_f16() {
         %c0 = arith.constant 0 : index
         %cst = arith.constant 0.000000e+00 : f16
-        %0 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%c0) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<4096x86x128xi4>>
-        %1 = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) alignment(64) offset(%c0) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<4096x86x1xf16>>
-        %2 = hal.interface.binding.subspan set(0) binding(2) type(storage_buffer) alignment(64) offset(%c0) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<4096x86x1xf16>>
-        %3 = hal.interface.binding.subspan set(0) binding(3) type(storage_buffer) alignment(64) offset(%c0) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<1x1x86x128xf16>>
-        %4 = hal.interface.binding.subspan set(0) binding(4) type(storage_buffer) alignment(64) offset(%c0) : !flow.dispatch.tensor<writeonly:tensor<1x1x4096xf16>>
+        %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<4096x86x128xi4>>
+        %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<4096x86x1xf16>>
+        %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<4096x86x1xf16>>
+        %3 = hal.interface.binding.subspan layout(#pipeline_layout) binding(3) alignment(64) offset(%c0) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<1x1x86x128xf16>>
+        %4 = hal.interface.binding.subspan layout(#pipeline_layout) binding(4) alignment(64) offset(%c0) : !flow.dispatch.tensor<writeonly:tensor<1x1x4096xf16>>
         %5 = flow.dispatch.tensor.load %0, offsets = [0, 0, 0], sizes = [4096, 86, 128], strides = [1, 1, 1] : !flow.dispatch.tensor<readonly:tensor<4096x86x128xi4>> -> tensor<4096x86x128xi4>
         %6 = flow.dispatch.tensor.load %1, offsets = [0, 0, 0], sizes = [4096, 86, 1], strides = [1, 1, 1] : !flow.dispatch.tensor<readonly:tensor<4096x86x1xf16>> -> tensor<4096x86x1xf16>
         %7 = flow.dispatch.tensor.load %2, offsets = [0, 0, 0], sizes = [4096, 86, 1], strides = [1, 1, 1] : !flow.dispatch.tensor<readonly:tensor<4096x86x1xf16>> -> tensor<4096x86x1xf16>
@@ -81,21 +74,22 @@ hal.executable @i4_dequant_unit_matmul_f16 {
 
 //   CHECK-LABEL: spirv.func @i4_dequant_unit_matmul_f16()
 
-//     CHECK-DAG: %[[CSTVEC4XI32:.+]] = spirv.Constant dense<255> : vector<4xi32>
-//     CHECK-DAG: %[[CSTVEC4XI320:.+]] = spirv.Constant dense<[15, -16, 15, -16]> : vector<4xi32>
-//     CHECK-DAG: %[[CSTVEC4XI321:.+]] = spirv.Constant dense<[0, 4, 0, 4]> : vector<4xi32>
+//     CHECK-DAG: %[[CSTVEC4XI32_255:.+]] = spirv.Constant dense<255> : vector<4xi32>
+//     CHECK-DAG: %[[CSTVEC4XI32_0:.+]] = spirv.Constant dense<0> : vector<4xi32>
+//     CHECK-DAG: %[[CSTVEC2XI32_4:.+]] = spirv.Constant dense<4> : vector<2xi32>
+//     CHECK-DAG: %[[CSTVEC2XI32_15:.+]] = spirv.Constant dense<15> : vector<2xi32>
 
 //         CHECK: spirv.mlir.loop
 
 // Load the quantized weight and get 8xi4 out of it.
-//         CHECK:   spirv.Load "StorageBuffer" %{{.+}} : vector<4xi32>
-//         CHECK:   spirv.VectorShuffle [0 : i32, 1 : i32] %{{.*}}, %{{.*}}  : vector<4xi32>, vector<4xi32> -> vector<2xi32>
-//         CHECK:   spirv.VectorShuffle [0 : i32, 0 : i32, 1 : i32, 1 : i32] %{{.*}} : vector<2xi32>, {{.*}} -> vector<4xi32>
-//         CHECK:   spirv.BitwiseAnd %{{.*}}, %[[CSTVEC4XI320]] : vector<4xi32>
-//         CHECK:   spirv.ShiftRightLogical %{{.*}}, %[[CSTVEC4XI321]] : vector<4xi32>, vector<4xi32>
-//         CHECK:   spirv.BitwiseAnd %{{.*}}, %[[CSTVEC4XI32]] : vector<4xi32>
+//         CHECK:   %[[LOAD:.+]] = spirv.Load "StorageBuffer" %{{.+}} : vector<4xi32>
+//         CHECK:   %[[SHUF01:.+]] = spirv.VectorShuffle [0 : i32, 1 : i32] %[[LOAD]], %[[LOAD]] : vector<4xi32>, vector<4xi32> -> vector<2xi32>
+//         CHECK:   %[[MASKED:.+]] = spirv.BitwiseAnd %[[SHUF01]], %[[CSTVEC2XI32_15]] : vector<2xi32>
+//         CHECK:   %[[SHIFTED:.+]] = spirv.ShiftRightLogical %[[SHUF01]], %[[CSTVEC2XI32_4]] : vector<2xi32>, vector<2xi32>
+//         CHECK:   %[[SHUF0011:.+]] = spirv.VectorShuffle [0 : i32, 2 : i32, 1 : i32, 3 : i32] %[[MASKED]], %[[SHIFTED]] : vector<2xi32>, vector<2xi32> -> vector<4xi32>
+//         CHECK:   %[[LOW4HIGH4_ZEROUPPER:.+]] = spirv.BitwiseAnd %[[SHUF0011]], %[[CSTVEC4XI32_255]] : vector<4xi32>
 
-//         CHECK:   spirv.VectorShuffle [2 : i32, 3 : i32] %{{.*}}, %{{.*}} : vector<4xi32>, vector<4xi32> -> vector<2xi32>
+//         CHECK:   %[[SHUF23:.+]] = spirv.VectorShuffle [2 : i32, 3 : i32] %[[LOAD:.+]], %[[LOAD:.+]] : vector<4xi32>, vector<4xi32> -> vector<2xi32>
 
 // CHECK-COUNT-2:   spirv.ConvertUToF %{{.+}} : vector<4xi32> to vector<4xf16>
 // CHECK-COUNT-2:   spirv.FSub %{{.+}}, %{{.+}} : vector<4xf16>
@@ -112,34 +106,25 @@ hal.executable @i4_dequant_unit_matmul_f16 {
 //         CHECK: %[[VS1:.+]] = spirv.VectorShuffle [2 : i32, 3 : i32] %[[LD]]
 //         CHECK: spirv.Bitcast %[[VS1]] : vector<2xi32> to vector<4xf16>
 
-//         CHECK: spirv.GroupNonUniformFAdd "Subgroup" "Reduce" {{.*}} : f16
+//         CHECK: spirv.GroupNonUniformFAdd <Subgroup> <Reduce> {{.*}} : f16
 
 //         CHECK: spirv.mlir.selection
 
 // -----
 
-#pipeline_layout = #hal.pipeline.layout<push_constants = 5, sets = [
-  #hal.descriptor_set.layout<0, bindings = [
-    #hal.descriptor_set.binding<0, storage_buffer>,
-    #hal.descriptor_set.binding<1, storage_buffer>,
-    #hal.descriptor_set.binding<2, storage_buffer>,
-    #hal.descriptor_set.binding<3, storage_buffer>,
-    #hal.descriptor_set.binding<4, storage_buffer>
-  ]>
+#pipeline_layout = #hal.pipeline.layout<constants = 5, bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
 ]>
 hal.executable @i4_dequant_matvec_f16_subgroup_64 {
   hal.executable.variant @vulkan_spirv_fb target(<"vulkan-spirv", "vulkan-spirv-fb", {
-      spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [
-          Shader, Float16, StorageBuffer16BitAccess, GroupNonUniform,
-          GroupNonUniformArithmetic, GroupNonUniformShuffle
-        ], [SPV_KHR_16bit_storage]>, Unknown:IntegratedGPU,
-        #spirv.resource_limits<
-          max_compute_shared_memory_size = 32768,
-          max_compute_workgroup_invocations = 1024,
-          max_compute_workgroup_size = [1024, 1024, 64],
-          subgroup_size = 64
-        >>
-    }>) {
+    iree.gpu.target = #iree_gpu.target<arch = "", features = "spirv:v1.6,cap:Shader", wgp = <
+      compute = fp32|fp16|int32, storage = b32|b16, subgroup = shuffle|arithmetic, dot = none, mma = [],
+      subgroup_size_choices = [64], max_workgroup_sizes = [1024, 1024, 1024],
+      max_thread_count_per_workgroup = 1024, max_workgroup_memory_bytes = 65536,
+      max_workgroup_counts = [65535, 65535, 65535]>>
+  }>) {
     hal.executable.export @i4_dequant_matvec_f16_subgroup_64 layout(#pipeline_layout) {
     ^bb0(%arg0: !hal.device):
       %x, %y, %z = flow.dispatch.workgroup_count_from_slice
@@ -148,21 +133,21 @@ hal.executable @i4_dequant_matvec_f16_subgroup_64 {
     builtin.module {
       func.func @i4_dequant_matvec_f16_subgroup_64() {
         %cst = arith.constant 0.000000e+00 : f16
-        %0 = hal.interface.constant.load[0] : i32
-        %1 = hal.interface.constant.load[1] : i32
-        %2 = hal.interface.constant.load[2] : i32
-        %3 = hal.interface.constant.load[3] : i32
-        %4 = hal.interface.constant.load[4] : i32
+        %0 = hal.interface.constant.load layout(#pipeline_layout) ordinal(0) : i32
+        %1 = hal.interface.constant.load layout(#pipeline_layout) ordinal(1) : i32
+        %2 = hal.interface.constant.load layout(#pipeline_layout) ordinal(2) : i32
+        %3 = hal.interface.constant.load layout(#pipeline_layout) ordinal(3) : i32
+        %4 = hal.interface.constant.load layout(#pipeline_layout) ordinal(4) : i32
         %5 = arith.index_castui %0 : i32 to index
         %6 = arith.index_castui %1 : i32 to index
         %7 = arith.index_castui %2 : i32 to index
         %8 = arith.index_castui %3 : i32 to index
         %9 = arith.index_castui %4 : i32 to index
-        %10 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%5) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<4096x86x128xi4>>
-        %11 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%6) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<4096x86xf16>>
-        %12 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%7) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<4096x86xf16>>
-        %13 = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) alignment(64) offset(%8) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<86x128xf16>>
-        %14 = hal.interface.binding.subspan set(0) binding(2) type(storage_buffer) alignment(64) offset(%9) : !flow.dispatch.tensor<writeonly:tensor<4096xf16>>
+        %10 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%5) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<4096x86x128xi4>>
+        %11 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%6) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<4096x86xf16>>
+        %12 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%7) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<4096x86xf16>>
+        %13 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%8) flags(ReadOnly) : !flow.dispatch.tensor<readonly:tensor<86x128xf16>>
+        %14 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%9) : !flow.dispatch.tensor<writeonly:tensor<4096xf16>>
         %15 = flow.dispatch.tensor.load %10, offsets = [0, 0, 0], sizes = [4096, 86, 128], strides = [1, 1, 1] : !flow.dispatch.tensor<readonly:tensor<4096x86x128xi4>> -> tensor<4096x86x128xi4>
         %16 = flow.dispatch.tensor.load %11, offsets = [0, 0], sizes = [4096, 86], strides = [1, 1] : !flow.dispatch.tensor<readonly:tensor<4096x86xf16>> -> tensor<4096x86xf16>
         %17 = flow.dispatch.tensor.load %12, offsets = [0, 0], sizes = [4096, 86], strides = [1, 1] : !flow.dispatch.tensor<readonly:tensor<4096x86xf16>> -> tensor<4096x86xf16>
@@ -199,10 +184,8 @@ hal.executable @i4_dequant_matvec_f16_subgroup_64 {
 //     CHECK-DAG: %[[C4:.+]] = spirv.Constant 4 : i32
 //     CHECK-DAG: %[[C2:.+]] = spirv.Constant 2 : i32
 //     CHECK-DAG: %[[C0:.+]] = spirv.Constant 0 : i32
-//     CHECK-DAG: %[[CSTVEC4XI32:.+]] = spirv.Constant dense<255> : vector<4xi32>
-//     CHECK-DAG: %[[CSTVEC4ONE:.+]] = spirv.Constant dense<1.000000e+00> : vector<4xf16>
-//     CHECK-DAG: %[[CSTVEC4XI320:.+]] = spirv.Constant dense<[15, -16, 15, -16]> : vector<4xi32>
-//     CHECK-DAG: %[[CSTVEC4XI321:.+]] = spirv.Constant dense<[0, 4, 0, 4]> : vector<4xi32>
+//     CHECK-DAG: %[[CSTVEC4XF16_1:.+]] = spirv.Constant dense<1.000000e+00> : vector<4xf16>
+//     CHECK-DAG: %[[CSTVEC4XI32_255:.+]] = spirv.Constant dense<255> : vector<4xi32>
 
 //         CHECK: %[[WIDX:.+]] = spirv.CompositeExtract %{{.*}}[0 : i32] : vector<3xi32>
 //         CHECK: %[[PCPTR:.+]] = spirv.AccessChain %{{.*}}[{{.*}}, %[[C0]]] : !spirv.ptr<!spirv.struct<(!spirv.array<5 x i32, stride=4> [0])>, PushConstant>, i32, i32
@@ -214,20 +197,15 @@ hal.executable @i4_dequant_matvec_f16_subgroup_64 {
 
 // Load the quantized weight and get 4xi4 out of it. Ensure that the offset
 // calculation avoids excessive scaling down in computing the element offset.
-//         CHECK:   spirv.IMul %{{.*}}, %[[C64]] : i32
+//         CHECK:   spirv.IMul %{{.*}}, %[[C64]]  {no_signed_wrap} : i32
 //         CHECK:   spirv.IAdd %{{.*}}, %[[STREAMBINDING]] : i32
-//         CHECK:   spirv.IMul %{{.*}}, %[[C5504]] : i32
+//         CHECK:   spirv.IMul %{{.*}}, %[[C5504]] {no_signed_wrap} : i32
 //         CHECK:   spirv.IAdd %{{.*}}, %{{.*}} : i32
-//         CHECK:   spirv.IMul %[[WIDX]], %[[C2]] : i32
+//         CHECK:   spirv.IMul %[[WIDX]], %[[C2]] {no_signed_wrap} : i32
 //         CHECK:   spirv.IAdd %{{.*}}, %{{.*}} : i32
 //         CHECK:   %[[OFFSET:.+]] = spirv.SDiv %{{.*}}, %[[C4]] : i32
 //         CHECK:   %[[ACCESS:.+]] = spirv.AccessChain %[[RADDR]][{{.*}}, %[[OFFSET]]] : !spirv.ptr<!spirv.struct<(!spirv.rtarray<i32, stride=4> [0])>, StorageBuffer>, i32, i32
 //         CHECK:   spirv.Load "StorageBuffer" %[[ACCESS]] : i32
-
-//         CHECK:   spirv.VectorShuffle [0 : i32, 0 : i32, 1 : i32, 1 : i32] %{{.*}} : vector<2xi32>, vector<2xi32> -> vector<4xi32>
-//         CHECK:   spirv.BitwiseAnd %{{.*}}, %[[CSTVEC4XI320]] : vector<4xi32>
-//         CHECK:   spirv.ShiftRightLogical %{{.*}}, %[[CSTVEC4XI321]] : vector<4xi32>, vector<4xi32>
-//         CHECK:   spirv.BitwiseAnd %{{.*}}, %[[CSTVEC4XI32]] : vector<4xi32>
 
 //         CHECK:   spirv.ConvertUToF %{{.+}} : vector<4xi32> to vector<4xf16>
 //         CHECK:   spirv.FSub %{{.+}}, %{{.+}} : vector<4xf16>
@@ -237,8 +215,8 @@ hal.executable @i4_dequant_matvec_f16_subgroup_64 {
 //         CHECK:   spirv.mlir.merge
 
 //         CHECK: %[[LD:.+]] = spirv.Load "Function" {{.*}} : vector<4xf16>
-//         CHECK: %[[RES:.+]] = spirv.Dot %[[LD]], %[[CSTVEC4ONE]] : vector<4xf16> -> f16
+//         CHECK: %[[RES:.+]] = spirv.Dot %[[LD]], %[[CSTVEC4XF16_1]] : vector<4xf16> -> f16
 
-//         CHECK: spirv.GroupNonUniformFAdd "Subgroup" "Reduce" %[[RES]] : f16
+//         CHECK: spirv.GroupNonUniformFAdd <Subgroup> <Reduce> %[[RES]] : f16
 
 //         CHECK: spirv.mlir.selection

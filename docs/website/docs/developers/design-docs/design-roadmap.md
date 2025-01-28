@@ -7,8 +7,8 @@ become much clearer when seeing where we want to go with the infrastructure we
 are building (as opposed to where we currently are with our MVP slice). This
 document is not meant to encompass the entire design of any individual feature
 and if there's interest please say hi on the
-[iree-discuss](https://groups.google.com/forum/#!forum/iree-discuss) mailing
-list.
+[iree-technical-discussion](https://lists.lfaidata.foundation/g/iree-technical-discussion)
+mailing list.
 
 [TOC]
 
@@ -44,8 +44,7 @@ the allocation you don't make_ ;)
 ### Avoiding Readbacks with `flow.stream`
 
 A majority of the readbacks we have today (manifested as `flow.tensor.load.*`
-ops) will be removed when we have an
-[HLO tensor->primitive conversion](#xla-hlo-tensor-to-primitive-conversion).
+ops) will be removed when we have an HLO tensor->primitive conversion.
 There will still be cases when readbacks are required for correctness but they
 usually fall into a small set of usage patterns. For those that don't this is
 one place where IREE will warn about performance issues, allowing programs that

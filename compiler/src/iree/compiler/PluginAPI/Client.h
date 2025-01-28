@@ -27,6 +27,7 @@ class OpPassManager;
 // bringing full dependencies into the plugin API.
 namespace mlir::iree_compiler::IREE::HAL {
 class TargetBackendList;
+class TargetDeviceList;
 } // namespace mlir::iree_compiler::IREE::HAL
 
 namespace mlir::iree_compiler {
@@ -60,14 +61,14 @@ public:
   // Adds input type mnemonics that this instance supports. At least one plugin
   // must advertise support for a custom input type in order for it to be
   // considered valid.
-  virtual void populateCustomInputConversionTypes(StringSet<> &typeMnemonics) {}
+  virtual void
+  populateCustomInputConversionTypes(llvm::StringSet<> &typeMnemonics) {}
 
   // Adds input type mnemonics that this instance supports, if those types are
   // detected in |module|.
   // Requires that |registerDialects| has been called first.
-  virtual void
-  populateDetectedCustomInputConversionTypes(ModuleOp &module,
-                                             StringSet<> &typeMnemonics) {}
+  virtual void populateDetectedCustomInputConversionTypes(
+      ModuleOp &module, llvm::StringSet<> &typeMnemonics) {}
 
   // Adds passes to the input preprocessing pipeline for the given
   // InputDialectOptions::Type::plugin type with the given mnemonic.
@@ -177,6 +178,10 @@ public:
   // Called after the session has been fully constructed. If it fails, then
   // it should emit an appropriate diagnostic.
   LogicalResult activate(MLIRContext *context);
+
+  // Populates new HAL target devices, if any, into the given list.
+  // Targets will be merged into the plugin session-owned registry.
+  virtual void populateHALTargetDevices(IREE::HAL::TargetDeviceList &targets) {}
 
   // Populates new HAL target backends, if any, into the given list.
   // Targets will be merged into the plugin session-owned registry.

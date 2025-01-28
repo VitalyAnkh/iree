@@ -12,105 +12,84 @@
 #ifndef IREE_COMPILER_CODEGEN_LLVMGPU_PASSES_H_
 #define IREE_COMPILER_CODEGEN_LLVMGPU_PASSES_H_
 
-#include "iree/compiler/Codegen/Dialect/IREECodegenAttrs.h"
+#include <optional>
+
+#include "iree/compiler/Codegen/Common/GPU/Passes.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/ConfigUtils.h"
+#include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::iree_compiler {
 
-//===----------------------------------------------------------------------===//
-// Passes
-//===----------------------------------------------------------------------===//
+using IREE::GPU::GPUPipelineOptions;
 
-/// Lowering using SIMT CUDA core operations.
-void addGPUMatmulSimtPassPipeline(OpPassManager &pm);
+//----------------------------------------------------------------------------//
+// LLVMGPU Backend Pass Pipelines
+//----------------------------------------------------------------------------//
 
 /// Lowering using mma.sync Tensor Core operations.
-void addGPUMatmulTensorCoreMmaSyncPassPipeline(OpPassManager &pm,
-                                               unsigned pipelineDepth);
+void addGPUMatmulTensorCoreMmaSyncPassPipeline(
+    OpPassManager &funcPassManager, const GPUPipelineOptions &options,
+    unsigned pipelineDepth);
 
 /// Lowering using wmma Tensor Core operations.
-void addGPUMatmulTensorCorePassPipeline(OpPassManager &pm,
+void addGPUMatmulTensorCorePassPipeline(OpPassManager &funcPassManager,
+                                        const GPUPipelineOptions &options,
                                         unsigned pipelineDepth);
 
-void addGPUPackUnPackPasses(OpPassManager &pm);
+void addGPUPackUnPackPasses(OpPassManager &funcPassManager);
 
 /// Simple lowering only distributute linalg ops on blocks and threads. This
 /// will result in scalar operations. Expects pass manager to be a
 /// module-level pass manager.
-void addGPUSimpleDistributePassPipeline(OpPassManager &pm);
+void addGPUSimpleDistributePassPipeline(OpPassManager &funcPassManager);
+
+/// Lowering config driven pipeline that uses greedy tile + fuse to distribute
+/// to threads.
+void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
+                                   const GPUPipelineOptions &pipelineOptions);
 
 /// Transform dialect-based path.
-void addGPUTransformDialectPasses(OpPassManager &pm);
+void addGPUTransformDialectPasses(OpPassManager &funcPassManager,
+                                  StringRef entryPoint);
 
 /// Lowering transpose using shared memory.
-void addGPUTransposePassPipeline(OpPassManager &pm);
+void addGPUTransposePassPipeline(OpPassManager &funcPassManager,
+                                 const GPUPipelineOptions &options);
 
 /// Lowering calling vectorization patterns. Expects pass manager to be a
 /// module-level pass manager.
-void addGPUVectorizationPassPipeline(OpPassManager &pm);
+void addGPUVectorizationPassPipeline(OpPassManager &funcPassManager);
+
+/// Lowering for winograd transform ops. Follows `VectorizationPassPipeline`
+/// with different tiling and distribution passes.
+void addGPUWinogradVectorizePassPipeline(OpPassManager &funcPassManager);
+
+/// Lowering based on vector distribution patterns.
+void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
+                                        const GPUPipelineOptions &options,
+                                        bool usePadToModelSharedMemcpy);
 
 /// Lowering reductions to warp reductions.
-void addGPUWarpReductionPassPipeline(OpPassManager &pm);
+void addGPUWarpReductionPassPipeline(OpPassManager &funcPassManager);
 
 /// Default pass pipeline on GPU, currently used only for the ukernel path.
-void addGPUDefaultPassPipeline(OpPassManager &pm);
+void addGPUDefaultPassPipeline(OpPassManager &funcPassManager,
+                               const GPUPipelineOptions &options);
+
+/// Pass pipeline to lower IREE HAL executables without tiling and distribution.
+void addGPUBaseLoweringPassPipeline(OpPassManager &pm);
 
 /// Populates passes needed to preprocess and select the translation strategy.
-void buildLLVMGPUCodegenConfigurationPassPipeline(OpPassManager &pm);
+void buildLLVMGPUCodegenConfigurationPassPipeline(
+    OpPassManager &variantPassManagery);
 
 /// Populates passes needed to lower a XLA HLO op to NVVM/ROCDL dialect via
 /// the structured ops path. The pass manager `pm` in here should operate on
 /// the module within the IREE::HAL::ExecutableOp.
-void buildLLVMGPUCodegenPassPipeline(OpPassManager &pm, bool useROCM);
-
-/// Performs the final conversion to NNVM+LLVM dialect.
-std::unique_ptr<OperationPass<ModuleOp>> createConvertToNVVMPass();
-
-/// Performs the final conversion to ROCDL+LLVM dialect.
-std::unique_ptr<OperationPass<ModuleOp>> createConvertToROCDLPass();
-
-/// Cast address space to generic in CallOp and FuncOp
-std::unique_ptr<OperationPass<ModuleOp>>
-createLLVMGPUCastAddressSpaceFunction();
-
-std::unique_ptr<OperationPass<func::FuncOp>> createLLVMGPUDistribute();
-
-/// Create pass selecting the lowering strategy for LLVMGPU.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableVariantOp>>
-createLLVMGPUSelectLoweringStrategyPass();
-
-/// Create pass calling the dynamic pipeline for LLVMGPU.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableVariantOp>>
-createLLVMGPULowerExecutableTargetPass();
-
-// Pass to pack shared memory allocations in order to reduce shared memory
-// usage.
-std::unique_ptr<OperationPass<func::FuncOp>>
-createLLVMGPUPackSharedMemoryAlloc();
-
-enum class GPUTensorCoreType {
-  WMMA = 0,
-  MMA_SYNC = 1,
-};
-
-/// Convert Linalg ops to Vector and prepare converstion to GPU MMA ops.
-std::unique_ptr<OperationPass<func::FuncOp>>
-createLLVMGPUTensorCoreVectorizationPass(
-    GPUTensorCoreType tensorCoreType = GPUTensorCoreType::WMMA);
-
-//. Pass to pad out tensors up to static dimensions.
-std::unique_ptr<OperationPass<func::FuncOp>> createLLVMGPUTensorPadPass();
-
-/// Perform tiling and distribution to threads.
-std::unique_ptr<OperationPass<func::FuncOp>>
-createLLVMGPUTileAndDistribute(bool distributeToWarp = false);
-
-/// Lower vector ops before convertion to LLVM.
-std::unique_ptr<OperationPass<func::FuncOp>> createLLVMGPUVectorLoweringPass();
-
-/// Converts vector ops to gpu dialect.
-std::unique_ptr<OperationPass<func::FuncOp>> createLLVMGPUVectorToGPU(
-    GPUTensorCoreType tensorCoreType = GPUTensorCoreType::WMMA);
+void buildLLVMGPUCodegenPassPipeline(OpPassManager &variantPassManagery,
+                                     bool useROCM);
 
 /// Lowering calling vectorization patterns.
 LogicalResult
@@ -120,16 +99,40 @@ verifyGPUMatmulPipeline(Operation *op,
                         ArrayRef<int64_t> workgroupSize);
 
 //----------------------------------------------------------------------------//
+// LLVMGPU Linking Passes and Pipelines
+//----------------------------------------------------------------------------//
+
+/// Populates passes needed to link HAL executables across LLVMGPU targets.
+void buildLLVMGPULinkingPassPipeline(
+    OpPassManager &modulePassManager,
+    std::optional<std::string> target = std::nullopt);
+
+//------------------------------------------------------------------------------
+// Wrappers that do not use tablegen options
+//------------------------------------------------------------------------------
+
+enum class GPUTensorCoreType {
+  WMMA = 0,
+  MMA_SYNC = 1,
+};
+
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+
+createLLVMGPUTensorCoreVectorizationPass(GPUTensorCoreType tensorCoreType);
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createLLVMGPUVectorToGPUPass(GPUTensorCoreType tensorCoreType);
+
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createLLVMGPUTileAndDistributePass(bool distributeToWarp);
+
+//----------------------------------------------------------------------------//
 // Register LLVMGPU Passes
 //----------------------------------------------------------------------------//
 
+#define GEN_PASS_DECL
+#include "iree/compiler/Codegen/LLVMGPU/Passes.h.inc" // IWYU pragma: keep
+
 void registerCodegenLLVMGPUPasses();
-
-//------------------------------------------------------------------------------
-// Test passes
-//------------------------------------------------------------------------------
-
-std::unique_ptr<OperationPass<ModuleOp>> createTestLLVMGPULegalizePass();
 
 } // namespace mlir::iree_compiler
 

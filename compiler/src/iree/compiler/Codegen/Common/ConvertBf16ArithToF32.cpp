@@ -14,7 +14,6 @@
 #include <memory>
 #include <utility>
 
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
@@ -24,7 +23,6 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -33,11 +31,15 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_CONVERTBF16ARITHTOF32PASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 namespace {
 
@@ -147,7 +149,7 @@ struct GenericTypeConversionPattern : public ConversionPattern {
       TypeConverter::SignatureConversion result(newRegion->getNumArguments());
       (void)getTypeConverter()->convertSignatureArgs(
           newRegion->getArgumentTypes(), result);
-      rewriter.applySignatureConversion(newRegion, result);
+      rewriter.applySignatureConversion(&newRegion->front(), result);
     }
 
     Operation *newOp = rewriter.create(state);
@@ -193,7 +195,7 @@ struct ConvertTypeSensitiveArithCastOp : public OpConversionPattern<OpTy> {
   }
 };
 
-// This is required due to https://github.com/openxla/iree/issues/13891.
+// This is required due to https://github.com/iree-org/iree/issues/13891.
 // We are not able to execute `arith.extf` or `arith.truncf` on a scalar
 // vector type. To handle materializing `vector<bf16>` to `vector<f32>`
 // we should propagate into the source operation by constant propagation
@@ -235,9 +237,10 @@ struct PromoteBF16ToF32Converter
   }
 };
 
-struct ConvertBf16ArithToF32Pass
-    : public ConvertBf16ArithToF32Base<ConvertBf16ArithToF32Pass> {
-  using ConvertBf16ArithToF32Base::ConvertBf16ArithToF32Base;
+struct ConvertBf16ArithToF32Pass final
+    : impl::ConvertBf16ArithToF32PassBase<ConvertBf16ArithToF32Pass> {
+  using impl::ConvertBf16ArithToF32PassBase<
+      ConvertBf16ArithToF32Pass>::ConvertBf16ArithToF32PassBase;
   void runOnOperation() override {
     MLIRContext *context = &this->getContext();
     RewritePatternSet patterns(context);
@@ -283,6 +286,7 @@ struct ConvertBf16ArithToF32Pass
     // Some arithmetic operations exist in the vector dialect.
     target.addDynamicallyLegalOp<vector::FMAOp, vector::ReductionOp,
                                  vector::MultiDimReductionOp, vector::MaskOp,
+                                 vector::MatmulOp, vector::OuterProductOp,
                                  vector::YieldOp>(checkOp);
 
     // Some ops are always legal.
@@ -300,8 +304,7 @@ struct ConvertBf16ArithToF32Pass
     cleanupPatterns
         .insert<PropagateCastF<arith::TruncFOp>, PropagateCastF<arith::ExtFOp>>(
             context);
-    if (applyPatternsAndFoldGreedily(this->getOperation(),
-                                     std::move(cleanupPatterns))
+    if (applyPatternsGreedily(this->getOperation(), std::move(cleanupPatterns))
             .failed()) {
       return this->signalPassFailure();
     }
@@ -311,10 +314,4 @@ struct ConvertBf16ArithToF32Pass
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createConvertBf16ArithToF32Pass() {
-  return std::make_unique<ConvertBf16ArithToF32Pass>();
-}
-
 } // namespace mlir::iree_compiler

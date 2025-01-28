@@ -66,10 +66,10 @@ static iree_status_t iree_tooling_load_bytecode_module(
     } else if (strcmp(FLAG_module_mode, "preload") == 0) {
       read_flags |= IREE_FILE_READ_FLAG_PRELOAD;
     } else {
-      IREE_RETURN_AND_END_ZONE_IF_ERROR(
-          z0, iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                               "unrecognized --module_mode= value '%s'",
-                               FLAG_module_mode));
+      IREE_TRACE_ZONE_END(z0);
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "unrecognized --module_mode= value '%s'",
+                              FLAG_module_mode);
     }
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_file_read_contents(path_str, read_flags, host_allocator,
@@ -196,16 +196,20 @@ static iree_status_t iree_tooling_load_hal_async_module(
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_hal_module_register_all_types(instance));
 
-  // Create the device to use.
-  // In the future this will change to a set of available devices instead.
+  // Create the device(s) to use.
   if (iree_string_view_is_empty(default_device_uri)) {
     default_device_uri = iree_hal_default_device_uri();
   }
-  iree_hal_device_t* device = NULL;
+  iree_hal_device_list_t* device_list = NULL;
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0, iree_hal_create_device_from_flags(
+      z0, iree_hal_create_devices_from_flags(
               iree_hal_available_driver_registry(), default_device_uri,
-              host_allocator, &device));
+              host_allocator, &device_list));
+
+  // Pick a lead device we'll use for bookkeeping.
+  iree_hal_device_t* device = iree_hal_device_list_at(device_list, 0);
+  IREE_ASSERT(device, "require at least one device");
+  iree_hal_device_retain(device);
 
   // Fetch the allocator from the device to pass back to the caller.
   iree_hal_allocator_t* device_allocator = iree_hal_device_allocator(device);
@@ -214,8 +218,11 @@ static iree_status_t iree_tooling_load_hal_async_module(
   // Create HAL module wrapping the device created above.
   iree_hal_module_flags_t flags = IREE_HAL_MODULE_FLAG_NONE;
   iree_vm_module_t* module = NULL;
-  iree_status_t status =
-      iree_hal_module_create(instance, device, flags, host_allocator, &module);
+  iree_status_t status = iree_hal_module_create(
+      instance, device_list->count, device_list->devices, flags,
+      iree_hal_module_debug_sink_stdio(stderr), host_allocator, &module);
+
+  iree_hal_device_list_free(device_list);
 
   if (iree_status_is_ok(status)) {
     *out_module = module;
@@ -273,7 +280,8 @@ static iree_status_t iree_tooling_load_hal_inline_module(
   iree_hal_inline_module_flags_t flags = IREE_HAL_INLINE_MODULE_FLAG_NONE;
   iree_vm_module_t* module = NULL;
   iree_status_t status = iree_hal_inline_module_create(
-      instance, flags, device_allocator, host_allocator, &module);
+      instance, flags, iree_hal_module_debug_sink_stdio(stderr),
+      device_allocator, host_allocator, &module);
 
   if (iree_status_is_ok(status)) {
     *out_module = module;

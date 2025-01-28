@@ -12,7 +12,6 @@
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 
@@ -67,7 +66,7 @@ void mlir::iree_compiler::Reducer::reduceFlowDispatchResultBySplatDelta(
          ++index) {
       auto result = dispatch.getResults()[index];
       auto dynamicDims = dispatch.getResultDynamicDims(index);
-      auto tensorType = result.getType().cast<RankedTensorType>();
+      auto tensorType = cast<RankedTensorType>(result.getType());
       auto elType = tensorType.getElementType();
       auto zeroAttr = builder.getZeroAttr(elType);
       auto zero = builder.create<arith::ConstantOp>(result.getLoc(), zeroAttr);

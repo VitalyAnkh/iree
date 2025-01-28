@@ -4,15 +4,13 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/Common/GPU/PassDetail.h"
 #include "iree/compiler/Codegen/Common/GPU/Passes.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/LinalgOpInfo.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
@@ -20,8 +18,12 @@
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_GPUTENSORALLOCPASS
+#include "iree/compiler/Codegen/Common/GPU/Passes.h.inc"
+
+namespace {
 // For optimal performance we always want to copy 128 bits
-static constexpr int copyVectorNumBits = 128;
+constexpr int copyVectorNumBits = 128;
 
 /// Filter to decide which contract ops need allocations.
 static bool contractOpFilter(Operation *op) {
@@ -79,7 +81,6 @@ static bool transposeOpFilter(Operation *op) {
   return opInfo.isTranspose();
 }
 
-namespace {
 /// Swaps bufferization.alloc_tensor with the copied linalg op result when the
 /// linalg op does not use the output initial value during calculation.
 ///
@@ -118,7 +119,7 @@ struct SwapAllocTensorPattern final
         allocOp.getLoc(), allocOp.getType(), allocOp.getDynamicSizes(),
         /*copy=*/Value(),
         memorySpace ? cast<IntegerAttr>(*memorySpace) : IntegerAttr());
-    rewriter.updateRootInPlace(linalgOp, [&]() {
+    rewriter.modifyOpInPlace(linalgOp, [&]() {
       linalgOp->setOperand(linalgOp.getNumDpsInputs() + resultNumber,
                            newAllocOp);
     });
@@ -128,7 +129,8 @@ struct SwapAllocTensorPattern final
   }
 };
 
-struct GPUTensorAllocPass : public GPUTensorAllocBase<GPUTensorAllocPass> {
+struct GPUTensorAllocPass final
+    : impl::GPUTensorAllocPassBase<GPUTensorAllocPass> {
 private:
   GPUPromoteSharedMemPattern promoteSharedMemPattern =
       GPUPromoteSharedMemPattern::ContractionOpPattern;
@@ -136,23 +138,9 @@ private:
 public:
   GPUTensorAllocPass(GPUPromoteSharedMemPattern promoteSharedMemPattern)
       : promoteSharedMemPattern(promoteSharedMemPattern) {}
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<bufferization::BufferizationDialect, scf::SCFDialect>();
-  }
+
   void runOnOperation() override {
-    auto funcOp = getOperation();
-
-    // Tile the reduction first to reduce the alloc size.
-    if (failed(
-            tileReductionToSerialLoops(funcOp, /*fuseInputProducer=*/true))) {
-      return signalPassFailure();
-    }
-
-    LLVM_DEBUG({
-      llvm::dbgs() << "// --- After tiling to serial loops ---\n";
-      funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
-      llvm::dbgs() << "\n\n";
-    });
+    FunctionOpInterface funcOp = getOperation();
 
     SmallVector<Operation *> opsToPromote;
     funcOp.walk([&](Operation *op) {
@@ -214,15 +202,16 @@ public:
       MLIRContext *context = &getContext();
       RewritePatternSet patterns(context);
       patterns.add<SwapAllocTensorPattern>(context);
-      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
   }
 };
+
 } // namespace
 
-std::unique_ptr<OperationPass<func::FuncOp>>
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 createGPUTensorAlloc(GPUPromoteSharedMemPattern promoteSharedMemPattern) {
   return std::make_unique<GPUTensorAllocPass>(promoteSharedMemPattern);
 }

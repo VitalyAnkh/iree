@@ -82,29 +82,26 @@ struct ExecutableDispatchOpConversion
   matchAndRewrite(IREE::HAL::Loader::ExecutableDispatchOp dispatchOp,
                   OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto entryPoint = rewriter.create<IREE::VM::ConstI32Op>(
-        dispatchOp.getLoc(),
-        static_cast<int32_t>(adaptor.getEntryPoint().getZExtValue()));
     SmallVector<Value, 8> callOperands = {
         adaptor.getExecutable(),
-        entryPoint,
+        castToI32(adaptor.getEntryPoint(), rewriter),
         castToI32(adaptor.getWorkgroupX(), rewriter),
         castToI32(adaptor.getWorkgroupY(), rewriter),
         castToI32(adaptor.getWorkgroupZ(), rewriter),
     };
-    auto pushConstants = adaptor.getPushConstants();
+    auto constants = adaptor.getConstants();
     SmallVector<int16_t, 5> segmentSizes = {
         /*executable=*/-1,
         /*entry_point=*/-1,
         /*workgroup_x=*/-1,
         /*workgroup_y=*/-1,
         /*workgroup_z=*/-1,
-        /*push_constants=*/
-        static_cast<int16_t>(pushConstants.size()),
+        /*constants=*/
+        static_cast<int16_t>(constants.size()),
         /*bindings=*/
         static_cast<int16_t>(adaptor.getBindingBuffers().size()),
     };
-    callOperands.append(pushConstants.begin(), pushConstants.end());
+    callOperands.append(constants.begin(), constants.end());
     for (auto [bindingBuffer, bindingOffset, bindingLength] : llvm::zip_equal(
              adaptor.getBindingBuffers(), adaptor.getBindingOffsets(),
              adaptor.getBindingLengths())) {

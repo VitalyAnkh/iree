@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 import pytest
-from ireers import *
+from ireers_tools import *
 
 ###############################################################################
 # Fixtures
@@ -19,12 +19,12 @@ COMMON_FLAGS = [
 ]
 
 llama2_7b_f16qi4_stripped_source = fetch_source_fixture(
-    "https://storage.googleapis.com/shark_tank/llama_regression/09152023/llama2_7b_int4_stripped.mlir",
+    "https://sharktank.blob.core.windows.net/sharktank/llama_regression/09152023/llama2_7b_int4_stripped.mlir",
     group="llama2_7b_f16qi4_stripped",
 )
 
 llama2_7b_f16qi4_source = fetch_source_fixture(
-    "https://storage.googleapis.com/shark_tank/llama_regression/llama2_7b_int4.mlir",
+    "https://sharktank.blob.core.windows.net/sharktank/llama_regression/llama2_7b_int4.mlir",
     group="llama2_7b_f16qi4",
 )
 
@@ -35,10 +35,7 @@ def llama2_7b_f16qi4_stripped_rdna3_vulkan_vmfb(llama2_7b_f16qi4_stripped_source
         llama2_7b_f16qi4_stripped_source,
         "rdna3_vulkan",
         flags=COMMON_FLAGS
-        + [
-            "--iree-hal-target-backends=vulkan",
-            "--iree-vulkan-target-triple=rdna3-unknown-linux",
-        ],
+        + ["--iree-hal-target-backends=vulkan-spirv", "--iree-vulkan-target=rdna3"],
     )
 
 
@@ -74,10 +71,7 @@ def llama2_7b_f16qi4_a100_vulkan_vmfb(llama2_7b_f16qi4_stripped_source):
         llama2_7b_f16qi4_stripped_source,
         "a100_vulkan",
         flags=COMMON_FLAGS
-        + [
-            "--iree-hal-target-backends=vulkan",
-            f"--iree-vulkan-target-triple=ampere-a100-linux",
-        ],
+        + ["--iree-hal-target-backends=vulkan-spirv", f"--iree-vulkan-target=ampere"],
     )
 
 
@@ -89,7 +83,7 @@ def llama2_7b_f16qi4_stripped_sm80_cuda_vmfb(llama2_7b_f16qi4_stripped_source):
         flags=COMMON_FLAGS
         + [
             "--iree-hal-target-backends=cuda",
-            f"--iree-hal-cuda-llvm-target-arch=sm_80",
+            f"--iree-cuda-target=sm_80",
         ],
     )
 
@@ -102,8 +96,7 @@ def llama2_7b_f16qi4_stripped_rdna3_rocm_vmfb(llama2_7b_f16qi4_stripped_source):
         flags=COMMON_FLAGS
         + [
             "--iree-hal-target-backends=rocm",
-            "--iree-rocm-target-chip=gfx1100",
-            "--iree-rocm-link-bc=true",
+            "--iree-hip-target=gfx1100",
         ],
     )
 
@@ -116,7 +109,7 @@ def llama2_7b_f16qi4_sm80_cuda_vmfb(llama2_7b_f16qi4_source):
         flags=COMMON_FLAGS
         + [
             "--iree-hal-target-backends=cuda",
-            f"--iree-hal-cuda-llvm-target-arch=sm_70",
+            f"--iree-cuda-target=sm_70",
         ],
     )
 
@@ -224,7 +217,7 @@ def test_step_a100_vulkan_stripped(llama2_7b_f16qi4_a100_vulkan_vmfb):
 def test_step_rdna3_rocm_stripped(llama2_7b_f16qi4_stripped_rdna3_rocm_vmfb):
     iree_benchmark_module(
         llama2_7b_f16qi4_stripped_rdna3_rocm_vmfb,
-        device="rocm",
+        device="hip",
         function="first_vicuna_forward",
         args=[
             "--input=1x1xi64",
@@ -232,7 +225,7 @@ def test_step_rdna3_rocm_stripped(llama2_7b_f16qi4_stripped_rdna3_rocm_vmfb):
     )
     iree_benchmark_module(
         llama2_7b_f16qi4_stripped_rdna3_rocm_vmfb,
-        device="rocm",
+        device="hip",
         function="second_vicuna_forward",
         args=[
             "--input=1x1xi64",
@@ -247,22 +240,22 @@ def test_step_rdna3_rocm_stripped(llama2_7b_f16qi4_stripped_rdna3_rocm_vmfb):
 
 
 llama2_7b_f16qi4_first_input_cpu = fetch_source_fixture(
-    "https://storage.googleapis.com/shark_tank/llama_regression/llama2-7b-i4-golden-outputs/cpu/first_vicuna_forward_input.npy",
+    "https://sharktank.blob.core.windows.net/sharktank/llama_regression/llama2-7b-i4-golden-outputs/cpu/first_vicuna_forward_input.npy",
     group="llama2_7b_f16qi4_first_input_cpu",
 )
 
 llama2_7b_f16qi4_first_output_cpu = fetch_source_fixture(
-    "https://storage.googleapis.com/shark_tank/llama_regression/llama2-7b-i4-golden-outputs/cpu/first_vicuna_forward_output.npy",
+    "https://sharktank.blob.core.windows.net/sharktank/llama_regression/llama2-7b-i4-golden-outputs/cpu/first_vicuna_forward_output.npy",
     group="llama2_7b_f16qi4_first_output_cpu",
 )
 
 llama2_7b_f16qi4_second_input_cpu = fetch_source_fixture(
-    "https://storage.googleapis.com/shark_tank/llama_regression/llama2-7b-i4-golden-outputs/cpu/second_vicuna_forward_input.npy",
+    "https://sharktank.blob.core.windows.net/sharktank/llama_regression/llama2-7b-i4-golden-outputs/cpu/second_vicuna_forward_input.npy",
     group="llama2_7b_f16qi4_second_input_cpu",
 )
 
 llama2_7b_f16qi4_second_output_cpu = fetch_source_fixture(
-    "https://storage.googleapis.com/shark_tank/llama_regression/llama2-7b-i4-golden-outputs/cpu/second_vicuna_forward_output.npy",
+    "https://sharktank.blob.core.windows.net/sharktank/llama_regression/llama2-7b-i4-golden-outputs/cpu/second_vicuna_forward_output.npy",
     group="llama2_7b_f16qi4_second_output_cpu",
 )
 
@@ -298,22 +291,22 @@ def test_correctness_host_cpu(
 
 
 llama2_7b_f16qi4_first_input_cuda = fetch_source_fixture(
-    "https://storage.googleapis.com/shark_tank/llama_regression/llama2-7b-i4-golden-outputs/cuda/first_vicuna_forward_input.npy",
+    "https://sharktank.blob.core.windows.net/sharktank/llama_regression/llama2-7b-i4-golden-outputs/cuda/first_vicuna_forward_input.npy",
     group="llama2_7b_f16qi4_first_input_cuda",
 )
 
 llama2_7b_f16qi4_first_output_cuda = fetch_source_fixture(
-    "https://storage.googleapis.com/shark_tank/llama_regression/llama2-7b-i4-golden-outputs/cuda/first_vicuna_forward_output.npy",
+    "https://sharktank.blob.core.windows.net/sharktank/llama_regression/llama2-7b-i4-golden-outputs/cuda/first_vicuna_forward_output.npy",
     group="llama2_7b_f16qi4_first_output_cuda",
 )
 
 llama2_7b_f16qi4_second_input_cuda = fetch_source_fixture(
-    "https://storage.googleapis.com/shark_tank/llama_regression/llama2-7b-i4-golden-outputs/cuda/second_vicuna_forward_input.npy",
+    "https://sharktank.blob.core.windows.net/sharktank/llama_regression/llama2-7b-i4-golden-outputs/cuda/second_vicuna_forward_input.npy",
     group="llama2_7b_f16qi4_second_input_cuda",
 )
 
 llama2_7b_f16qi4_second_output_cuda = fetch_source_fixture(
-    "https://storage.googleapis.com/shark_tank/llama_regression/llama2-7b-i4-golden-outputs/cuda/second_vicuna_forward_output.npy",
+    "https://sharktank.blob.core.windows.net/sharktank/llama_regression/llama2-7b-i4-golden-outputs/cuda/second_vicuna_forward_output.npy",
     group="llama2_7b_f16qi4_second_output_cuda",
 )
 

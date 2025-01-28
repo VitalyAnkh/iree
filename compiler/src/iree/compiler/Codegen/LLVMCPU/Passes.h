@@ -12,89 +12,48 @@
 #ifndef IREE_COMPILER_CODEGEN_LLVMCPU_PASSES_H_
 #define IREE_COMPILER_CODEGEN_LLVMCPU_PASSES_H_
 
-#include "iree/compiler/Codegen/Dialect/IREECodegenAttrs.h"
+#include <optional>
+
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::iree_compiler {
 
 class TilingConfig;
 
-/// Performs the final conversion to LLVM dialect.
-std::unique_ptr<OperationPass<ModuleOp>>
-createConvertToLLVMPass(bool reassociateFpReordering = false);
+//------------------------------------------------------------------------------
+// Wrappers that not use tablegen options.
+//------------------------------------------------------------------------------
 
-/// Checks CPU backend specific IR constraints (like no stack allocations)
-std::unique_ptr<OperationPass<ModuleOp>>
-createLLVMCPUCheckIRBeforeLLVMConversionPass();
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createLLVMCPUEmitVectorizationRemarksPass();
-
-/// Pass to select a lowering strategy for a hal.executable.variant operation.
-/// The variant is annotated with the selected strategies, which are
-/// subsequently ingested by LLVMCPULowerExecutableTargetPass.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableVariantOp>>
-createLLVMCPUSelectLoweringStrategyPass();
-
-/// Pass to lower the module an hal.executable.variant operation to external
-/// dialect. Currently this pass lowers to LLVM dialect, but could be
-/// generalized to lower to any "final" dialect like SPIR-V/NVVM, etc.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableVariantOp>>
-createLLVMCPULowerExecutableTargetPass();
-
-/// Pass to handel F16 bit operations, but converting f16 operands to F32.
-/// Currently this pass is handeling fmaxf conversion from f16 to f32,
-/// and then returing a f16 output back after preforming the operation.
-/// Can handel more operations if required in future.
-std::unique_ptr<Pass> createExpandF16OpToF32Pass();
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createLLVMCPUMmt4dVectorLoweringPass();
-
-/// Pass to perform peeling on non-distributed loops.
-std::unique_ptr<OperationPass<func::FuncOp>> createLLVMCPUPeelPass();
-
-/// Pass to perform SplitReduction transformations of `LinalgOp`s.
-std::unique_ptr<OperationPass<func::FuncOp>>
-createLLVMCPUSplitReductionPass(bool enableReassociateFpReductions = false);
-
-/// Synchronizes LLVM linkage with MLIR symbol visibility.
-std::unique_ptr<OperationPass<ModuleOp>>
-createLLVMCPUSynchronizeSymbolVisibilityPass();
-
-/// Pass to pad operations on tensors in top-down order.
-enum class LLVMCPUTensorPadOption { ParallelDims, ReductionDims };
-std::unique_ptr<OperationPass<func::FuncOp>> createLLVMCPUTensorPadPass(
-    LLVMCPUTensorPadOption option = LLVMCPUTensorPadOption::ParallelDims);
-
-/// Pass to tile and fuse TilingInterface ops with given tilingLevel.
-std::unique_ptr<OperationPass<func::FuncOp>>
-createLLVMCPUTileAndFusePass(int64_t tilingLevel = -1);
-
-/// Pass to tile TilingInterface ops with given tilingLevel.
-std::unique_ptr<OperationPass<func::FuncOp>>
-createLLVMCPUTilePass(int64_t tilingLevel = -1);
-
-/// Replaces llvm.intr.fma with its unfused mul and add ops.
-std::unique_ptr<OperationPass<func::FuncOp>> createLLVMCPUUnfuseFMAOpsPass();
-
-// Pass to lower Vector ops before conversion to LLVM.
 struct LLVMCPUVectorLoweringPassOptions {
   std::string splitVectorTransfersTo = "";
   bool lowerVectorTransposeToAVX2 = false;
+  bool enableArmI8mm = false;
+  bool enableArmSME = false;
 };
-std::unique_ptr<OperationPass<func::FuncOp>> createLLVMCPUVectorLoweringPass();
-std::unique_ptr<OperationPass<func::FuncOp>> createLLVMCPUVectorLoweringPass(
-    const LLVMCPUVectorLoweringPassOptions &options);
 
-/// A pass that converts certain vector.contract ops to custom kernels.
-std::unique_ptr<OperationPass<func::FuncOp>>
-createVectorContractCustomKernelsPass();
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
+createLLVMCPUSplitReductionPass(bool enableReassociateFpReductions);
 
-// Verifies that only supported IR constructs are passed to the compiler (like
-// no Linalg transform markers are set).
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
+createLLVMCPUTilePass(int64_t tilingLevel);
+
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
+createLLVMCPUTileAndFusePass(int64_t tilingLevel);
+
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
+createLLVMCPUTileRootAndFuseProducerConsumer(int64_t tilingLevel);
+
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
+createLLVMCPUTileRootAndFuseInputOperands(int64_t tilingLevel);
+
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
+createLLVMCPUVerifyVectorSizeLegalityPass(
+    int64_t maxAllowedNumberOfNativeVectors);
+
 std::unique_ptr<OperationPass<ModuleOp>>
-createVerifyLinalgTransformLegalityPass();
+createConvertToLLVMPass(bool reassociateFpReordering);
 
 //------------------------------------------------------------------------------
 // LLVMCPU Codegen specific patterns.
@@ -112,49 +71,54 @@ void populateVectorContractCustomKernelsPatterns(
 // LLVMCPU backend Pass Pipelines.
 //----------------------------------------------------------------------------//
 
+struct LLVMCPUPipelineOptions {
+  bool decomposePackUnPackOps = true;
+  bool useConfiguredVectorSizes = true;
+  bool enablePeeling = false;
+  bool enableVectorMasking = false;
+  bool enableAArch64SME = false;
+  bool enableAArch64I8mm = false;
+  bool lowerToAVX2 = false;
+};
+
 /// Populates the passes to lower linalg ops on buffers. Currenly this
 /// pipeline is only used for dispatches that just copy data from input
 /// interfaces to output interface.
-void addCPUBufferOpsTileAndVectorizePipeline(OpPassManager &passManager,
-                                             TilingConfig &tilingConfig,
-                                             bool enableVectorMasking,
-                                             bool enableAArch64SSVE = false);
+void addCPUBufferOpsTileAndVectorizePipeline(
+    OpPassManager &funcPassManager, TilingConfig &tilingConfig,
+    LLVMCPUPipelineOptions &pipelineOpt);
 
 /// Populates the passes to lower ops through data tiling transformations.
-void addCPUDataTilingPipeline(OpPassManager &passManager,
+void addCPUDataTilingPipeline(OpPassManager &funcPassManager,
                               TilingConfig &tilingConfig,
-                              bool enableVectorMasking);
+                              LLVMCPUPipelineOptions &pipelineOpt);
 
-/// Populates the passes to lower to scalars operations for linalg based
-/// code-generation. This pipeline does not vectorize, but instead just
-/// converts to memrefs
-void addCPUDefaultPassPipeline(OpPassManager &passManager);
+void addCPULinalgExtTileAndVectorizePipeline(
+    OpPassManager &funcPassManager, TilingConfig &tilingConfig,
+    LLVMCPUPipelineOptions &pipelineOpt);
 
-void addConvTileAndDecomposeExpertPassPipeline(OpPassManager &passManager,
-                                               TilingConfig &tilingConfig,
-                                               bool enableVectorMasking,
-                                               bool enableAArch64SSVE = false);
+/// Populates the passes to lower scalars and unknown tensor op (i.e. linalg op
+/// that is not specialized by any pipeline). Adds an additional level of tiling
+/// and converts to memrefs.
+void addCPUDefaultPassPipeline(OpPassManager &funcPassManager,
+                               FailureOr<TilingConfig> &tilingConfig);
 
-void addDoubleTilingPadExpertPassPipeline(OpPassManager &passManager,
-                                          TilingConfig &tilingConfig,
-                                          bool enableVectorMasking);
+void addConvTileAndDecomposeExpertPassPipeline(
+    OpPassManager &funcPassManager, TilingConfig &tilingConfig,
+    LLVMCPUPipelineOptions &pipelineOpt);
 
 /// Populates the passes needed to multi level tile, fuse and vectorize
 /// lowering of linalg ops on tensors to vectors operations.
-void addMmt4dTilingExpertPassPipeline(OpPassManager &passManager,
+void addMmt4dTilingExpertPassPipeline(OpPassManager &funcPassManager,
                                       TilingConfig &tilingConfig,
-                                      bool enableMicrokernels,
-                                      bool lowerToAVX2);
+                                      LLVMCPUPipelineOptions &pipelineOpt);
 
-void addMultiTilingExpertPassPipeline(
-    OpPassManager &passManager, TilingConfig &tilingConfig, bool enablePeeling,
-    bool enableVectorMasking, bool lowerToAVX2, bool enableAArch64SSVE = false);
+void addMultiTilingExpertPassPipeline(OpPassManager &funcPassManager,
+                                      TilingConfig &tilingConfig,
+                                      LLVMCPUPipelineOptions &pipelineOpt);
 
-void addTensorToVectorsPassPipeline(OpPassManager &passManager,
+void addTensorToVectorsPassPipeline(OpPassManager &funcPassManager,
                                     bool lowerToVectors = true);
-
-/// Transform dialect-based common.
-void addTransformDialectPasses(OpPassManager &passManager);
 
 // Populates the passes needed to do tiling, decomposing, and vectorizing the
 // convolution ops.
@@ -182,35 +146,30 @@ LogicalResult verifyTensorToVectorsPassPipelineConfig(
 
 /// Populates passes needed for preprocessing before codegen lowerings, as well
 /// as high level lowering strategy selection.
-void buildLLVMCPUCodegenConfigurationPassPipeline(OpPassManager &passManager);
+void buildLLVMCPUCodegenConfigurationPassPipeline(
+    OpPassManager &variantPassManager);
 
 /// Populates passes needed to lower a XLA HLO op to LLVM dialect via the
 /// structured ops path. The pass manager `pm` in here should operate on the
 /// module within the IREE::HAL::ExecutableOp.
-void buildLLVMCPUCodegenPassPipeline(OpPassManager &passManager);
+void buildLLVMCPUCodegenPassPipeline(OpPassManager &variantPassManager,
+                                     bool enableAArch64SME = false);
 
 //----------------------------------------------------------------------------//
 // LLVMCPU Linking Passes and Pipelines
 //----------------------------------------------------------------------------//
 
-/// Assigns executable constant ordinals across all LLVMCPU variants.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableVariantOp>>
-createLLVMCPUAssignConstantOrdinalsPass();
-
-/// Assigns executable import ordinals across all LLVMCPU variants.
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableVariantOp>>
-createLLVMCPUAssignImportOrdinalsPass();
-
-/// Links LLVMCPU HAL executables within the top-level program module.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createLLVMCPULinkExecutablesPass();
-
 /// Populates passes needed to link HAL executables across LLVMCPU targets.
-void buildLLVMCPULinkingPassPipeline(OpPassManager &passManager);
+void buildLLVMCPULinkingPassPipeline(
+    OpPassManager &modulePassManager,
+    std::optional<std::string> target = std::nullopt);
 
 //----------------------------------------------------------------------------//
 // Register LLVMCPU Passes
 //----------------------------------------------------------------------------//
+
+#define GEN_PASS_DECL
+#include "iree/compiler/Codegen/LLVMCPU/Passes.h.inc" // IWYU pragma: keep
 
 void registerCodegenLLVMCPUPasses();
 

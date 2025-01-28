@@ -1,8 +1,24 @@
-from typing import Any, Callable, ClassVar, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    overload,
+)
+import asyncio
 
-from typing import overload
+from .typing import HalModuleBufferViewTraceCallback
 
-def create_hal_module(instance: VmInstance, device: HalDevice) -> VmModule: ...
+def create_hal_module(
+    instance: VmInstance,
+    device: Optional[HalDevice] = None,
+    devices: Optional[List[HalDevice]] = None,
+    debug_sink: Optional[HalModuleDebugSink] = None,
+) -> VmModule: ...
 def create_io_parameters_module(
     instance: VmInstance, *providers: ParameterProvider
 ) -> VmModule: ...
@@ -54,6 +70,14 @@ class FileHandle:
     def wrap_memory(
         host_buffer: Any, readable: bool = True, writable: bool = False
     ) -> FileHandle: ...
+    def host_allocation(self) -> memoryview:
+        """Access the raw view of the allocated host memory.
+
+        Requires is_host_allocation.
+        """
+        ...
+    @property
+    def is_host_allocation(self) -> bool: ...
 
 class HalAllocator:
     def allocate_buffer(
@@ -113,6 +137,8 @@ class HalBufferView:
     @property
     def shape(self) -> list[int]: ...
     @property
+    def byte_length(self) -> int: ...
+    @property
     def __iree_vm_ref__(self) -> VmRef: ...
 
 class HalCommandBuffer:
@@ -169,12 +195,44 @@ class HalDevice:
     ) -> None: ...
     def queue_execute(
         self,
-        command_buffers: Sequence[HalCommandBuffer],
+        command_buffer: HalCommandBuffer,
         wait_semaphores: HalSemaphoreList,
         signal_semaphores: HalSemaphoreList,
     ) -> None: ...
     @property
     def allocator(self) -> HalAllocator: ...
+    def create_dlpack_capsule(
+        self, buffer_view: HalBufferView, device_type_code: int, device_id: int
+    ) -> Any:
+        """Creates a DLPack capsule for the given buffer view with an explicit
+        device type code and id.
+
+        Note that IREE's HAL hierarchy does not match 1:1 with DLPack's view of
+        the world, which combines synchronization, memory access, and device
+        identity. As such, we presume that some higher level Python class will
+        represent "framework tensors" for interop in a way that interops
+        completely. Such an implementation would delegate to this facility
+        to create the low level capsule, having explicitly mapped the devices
+        and placed appropriate synchronization guards.
+        """
+        ...
+    def from_dlpack_capsule(self, capsule: Any) -> HalBufferView:
+        """Imports a DLPack tensor capsule and returns a corresponding buffer
+        view.
+
+        As with create_dlpack_capsule, this is just a partial implementation
+        of concerns and presumes that the caller has chosen the correct
+        device and placed any synchronization barriers necessary for actually
+        using the result.
+        """
+        ...
+
+class HalDeviceLoopBridge:
+    def __init__(self, device: HalDevice, loop: asyncio.BaseEventLoop): ...
+    def stop(self): ...
+    def on_semaphore(
+        self, semaphore: HalSemaphore, payload: int, value: Any
+    ) -> asyncio.Future: ...
 
 class HalDriver:
     @staticmethod
@@ -225,6 +283,10 @@ class HalElementType:
     UINT_8: ClassVar[HalElementType] = ...
     @staticmethod
     def map_to_dtype(element_type: HalElementType) -> Any: ...
+    @staticmethod
+    def is_byte_aligned(element_type: HalElementType) -> bool: ...
+    @staticmethod
+    def dense_byte_count(element_type: HalElementType) -> int: ...
     __name__: Any
 
 class HalFence:
@@ -234,7 +296,9 @@ class HalFence:
     def join(fences: Sequence[HalFence]) -> HalFence: ...
     def __init__(self, capacity: int) -> None: ...
     def extend(self, from_fence: HalFence) -> None: ...
+    def fail(self, message: str) -> None: ...
     def insert(self, sem: HalSemaphore, value: int) -> None: ...
+    def signal(self) -> None: ...
     def wait(
         self, timeout: Optional[int] = None, deadline: Optional[int] = None
     ) -> None: ...
@@ -246,8 +310,45 @@ class HalFence:
     def __iree_vm_ref__(self) -> VmRef: ...
 
 class HalSemaphore:
+    def fail(self, message: str): ...
     def query(self) -> int: ...
     def signal(self, new_value: int) -> None: ...
+    def wait(
+        self,
+        payload: int,
+        timeout: Optional[int] = None,
+        deadline: Optional[int] = None,
+    ) -> None: ...
+
+class HalModuleDebugSink:
+    def __init__(
+        self, buffer_view_trace_callback: Optional[HalModuleBufferViewTraceCallback]
+    ):
+        """The function object buffer_view_trace_callback must not include the
+        corresponding HAL VmModule, VmInstance or VmContext in its closure.
+        Native runtime objects are managed by reference counting and do not track
+        cyclic references. This will create an uncollectible cycle.
+        E.g.
+
+        ```
+        vm_context = ...
+        def callback(key, hal_buffer_view):
+            print(vm_context)
+        hal_module = iree.runtime.create_hal_module(
+            vm_instance,
+            device,
+            debug_sink=iree.runtime.HalModuleDebugSink(callback),
+        )
+        ```
+
+        This callback will cause the VM context to never be destroyed.
+        """
+
+        ...
+    @property
+    def buffer_view_trace_callback(
+        self,
+    ) -> Optional[HalModuleBufferViewTraceCallback]: ...
 
 class Linkage(int):
     EXPORT: ClassVar[Linkage] = ...
@@ -284,9 +385,40 @@ class MemoryType(int):
     def __and__(self, other: MemoryType) -> int: ...
     def __or__(self, other: MemoryType) -> int: ...
 
+class ParameterIndexEntry:
+    @property
+    def key(self) -> str: ...
+    @property
+    def length(self) -> int: ...
+    @property
+    def metadata(self) -> bytes: ...
+    @property
+    def is_file(self) -> bool: ...
+    @property
+    def is_splat(self) -> bool: ...
+    @property
+    def file_storage(self) -> Tuple[FileHandle, int]:
+        """Accesses the underlying storage (if is_file).
+
+        Only valid if is_file. Returns the backing FileHandle and offset.
+        """
+        ...
+    @property
+    def file_view(self) -> memoryview:
+        """Accesses a memoryview of the file contents.
+
+        Only valid if is_file and the file has host accessible storage.
+        """
+        ...
+    @property
+    def splat_pattern(self) -> bytes:
+        """Accesses the splat pattern (if is_splat)."""
+        ...
+
 class ParameterIndex:
     def __init__() -> None: ...
     def __len__(self) -> int: ...
+    def __getitem__(self, i) -> ParameterIndexEntry: ...
     def reserve(self, new_capacity: int) -> None: ...
     def add_splat(
         self,
@@ -324,9 +456,22 @@ class ParameterIndex:
         writable: bool = False,
         mmap: bool = True
     ) -> None: ...
+    def create_archive_file(
+        self,
+        file_path: str,
+        file_offset: int = 0,
+        target_index: Optional[ParameterIndex] = None,
+    ) -> ParameterIndex: ...
     def create_provider(
         self, *, scope: str = "", max_concurrent_operations: Optional[int] = None
     ) -> ParameterProvider: ...
+    def items(self) -> List[Tuple[str, ParameterIndexEntry]]:
+        """Accesses the items as a tuple(str, entry).
+
+        Note that the index may contain duplicates, so loading into a dict
+        is up to the user, as only they can know if this is legal.
+        """
+        ...
 
 class ParameterProvider: ...
 

@@ -4,7 +4,6 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/LLVMCPU/PassDetail.h"
 #include "iree/compiler/Codegen/LLVMCPU/Passes.h"
 #include "iree/compiler/Codegen/LLVMCPU/Utils.h"
 #include "iree/compiler/Utils/StringUtils.h"
@@ -17,7 +16,6 @@
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ArmNeon/ArmNeonDialect.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -26,6 +24,9 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_VECTORCONTRACTCUSTOMKERNELSPASS
+#include "iree/compiler/Codegen/LLVMCPU/Passes.h.inc"
 
 namespace {
 
@@ -169,7 +170,7 @@ static Value getUnpromotedInput(Type unpromotedType, Type promotedType,
 // Helper to create a 1D, contiguous slice of a 1D vector.
 static Value extract1DSlice(PatternRewriter &rewriter, Location loc,
                             VectorType dstVecType, Value input, int position) {
-  assert(input.getType().cast<VectorType>().getRank() == 1);
+  assert(cast<VectorType>(input.getType()).getRank() == 1);
   assert(dstVecType.getRank() == 1);
   std::array<int64_t, 1> offsets{position};
   std::array<int64_t, 1> strides{1};
@@ -683,7 +684,7 @@ Type mlirType(MLIRContext *context, MMTKernel::ScalarType t) {
   case MMTKernel::ScalarType::I32:
     return IntegerType::get(context, 32, IntegerType::Signless);
   case MMTKernel::ScalarType::F32:
-    return FloatType::getF32(context);
+    return Float32Type::get(context);
   }
   assert(false);
   return Type();
@@ -743,7 +744,7 @@ private:
                        VectorType expectedType) {
       assert(vals.size() == expectedSize);
       for (const auto &val : vals) {
-        assert(val.getType().dyn_cast<VectorType>() == expectedType);
+        assert(dyn_cast<VectorType>(val.getType()) == expectedType);
         (void)val;
       }
       (void)expectedSize;
@@ -830,8 +831,8 @@ private:
         // Perform the code replacement for the operand.
         // Example:   $(lhs:1)   =>   $5
         replaceAllSubstrsInPlace(
-            code, llvm::formatv("$({0}:{1})", name, unprocessedIdx),
-            llvm::formatv("${0}", processedIdx));
+            code, llvm::formatv("$({}:{})", name, unprocessedIdx),
+            llvm::formatv("${}", processedIdx));
       }
     };
     processOperands(Constraints::Kind::InputOutput, "acc", kernel.accRegs);
@@ -1116,7 +1117,8 @@ public:
 };
 
 class VectorContractCustomKernelsPass
-    : public VectorContractCustomKernelsBase<VectorContractCustomKernelsPass> {
+    : public impl::VectorContractCustomKernelsPassBase<
+          VectorContractCustomKernelsPass> {
 public:
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<vector::VectorDialect, LLVM::LLVMDialect,
@@ -1128,13 +1130,10 @@ public:
     auto funcOp = getOperation();
     auto target = IREE::HAL::ExecutableTargetAttr::lookup(funcOp);
     populateVectorContractCustomKernelsPatterns(target, patterns);
-    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
       signalPassFailure();
     }
   }
-
-private:
-  IREE::HAL::ExecutableTargetAttr target;
 };
 
 } // namespace
@@ -1172,10 +1171,4 @@ void populateVectorContractCustomKernelsPatterns(
     }
   }
 }
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createVectorContractCustomKernelsPass() {
-  return std::make_unique<VectorContractCustomKernelsPass>();
-}
-
 } // namespace mlir::iree_compiler

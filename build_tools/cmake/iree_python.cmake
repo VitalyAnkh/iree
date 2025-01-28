@@ -7,29 +7,6 @@
 include(CMakeParseArguments)
 
 ###############################################################################
-# Package detection
-###############################################################################
-
-# Checks whether the PyYAML package is available. Sets IREE_PYYAML_FOUND to
-# ON if so.
-function(iree_detect_pyyaml)
-  execute_process(
-      COMMAND ${Python3_EXECUTABLE} -c "import yaml"
-      RESULT_VARIABLE EXIT_CODE
-      OUTPUT_QUIET
-      ERROR_QUIET
-  )
-  if(EXIT_CODE)
-    message(STATUS "Looking for PyYAML - not found (some features may not be available: install with 'python -m pip install PyYAML' or equiv for your system)")
-    set(IREE_PYYAML_FOUND OFF PARENT_SCOPE)
-  else()
-    message(STATUS "Looking for PyYAML - found")
-    set(IREE_PYYAML_FOUND ON PARENT_SCOPE)
-  endif()
-endfunction()
-
-
-###############################################################################
 # Main user rules
 ###############################################################################
 
@@ -66,10 +43,11 @@ function(iree_py_library)
   foreach(_SRC_FILE ${_RULE_SRCS})
     # _SRC_FILE could have other path components in it, so we need to make a
     # directory for it. Ninja does this automatically, but make doesn't. See
-    # https://github.com/openxla/iree/issues/6801
+    # https://github.com/iree-org/iree/issues/6801
     set(_SRC_BIN_PATH "${CMAKE_CURRENT_BINARY_DIR}/${_SRC_FILE}")
     get_filename_component(_SRC_BIN_DIR "${_SRC_BIN_PATH}" DIRECTORY)
     add_custom_command(
+      POST_BUILD
       TARGET ${_NAME}
       COMMAND
         ${CMAKE_COMMAND} -E make_directory "${_SRC_BIN_DIR}"
@@ -199,40 +177,5 @@ function(iree_py_test)
       "${_RULE_GENERATED_IN_BINARY_DIR}"
     TIMEOUT
       ${_RULE_TIMEOUT}
-  )
-endfunction()
-
-# iree_build_tools_py_test()
-#
-# CMake function to test with build_tools python modules.
-#
-# Parameters:
-# NAME: name of test
-# SRC: Test source file
-# ARGS: Command line arguments to the Python source file.
-# LABELS: Additional labels to apply to the test. The package path is added
-#     automatically.
-# PACKAGE_DIRS: Additional python module paths.
-function(iree_build_tools_py_test)
-  cmake_parse_arguments(
-    _RULE
-    ""
-    "NAME;SRC"
-    "ARGS;LABELS;PACKAGE_DIRS"
-    ${ARGN}
-  )
-
-  iree_local_py_test(
-    NAME
-      "${_RULE_NAME}"
-    SRC
-      "${_RULE_SRC}"
-    ARGS
-      ${_RULE_ARGS}
-    LABELS
-      ${_RULE_LABELS}
-    PACKAGE_DIRS
-      ${_RULE_PACKAGE_DIRS}
-      "${IREE_ROOT_DIR}/build_tools/python"
   )
 endfunction()

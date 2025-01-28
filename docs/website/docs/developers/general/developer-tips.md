@@ -123,8 +123,8 @@ Module Dependencies:
   hal, version >= 0, required
 
 Imported Functions:
-  [  0] hal.ex.shared_device() -> (!vm.ref<?>)
-  [  1] hal.allocator.allocate(!vm.ref<?>, i32, i32, i64) -> (!vm.ref<?>)
+  [  0] hal.allocator.allocate(!vm.ref<?>, i32, i32, i64) -> (!vm.ref<?>)
+  [  1] hal.devices.get(i32) -> (!vm.ref<?>)
   ...
 
 Exported Functions:
@@ -166,8 +166,11 @@ Flag | Files dumped
 
     module_abs_dispatch_0.mlir
     module_abs_dispatch_0_system_elf_x86_64_benchmark.mlir
+    module_abs_dispatch_0_system_elf_x86_64.codegen.ll
     module_abs_dispatch_0_system_elf_x86_64.codegen.bc
+    module_abs_dispatch_0_system_elf_x86_64.linked.ll
     module_abs_dispatch_0_system_elf_x86_64.linked.bc
+    module_abs_dispatch_0_system_elf_x86_64.optimized.ll
     module_abs_dispatch_0_system_elf_x86_64.optimized.bc
     module_abs_dispatch_0_system_elf_x86_64.o
     module_abs_dispatch_0_system_elf_x86_64.s
@@ -185,6 +188,7 @@ Flag | Files dumped
 
     ??? tip "Tip - Disassembling `.bc` files with `llvm-dis`"
 
+        This section can be skipped if the .ll files are already in the directory you choose.
         The `.bc` intermediate files use the
         [LLVM BitCode](https://llvm.org/docs/BitCodeFormat.html) format, which
         can be disassembled using
@@ -323,8 +327,11 @@ Flag | Files dumped
     $ ls /tmp/iree/simple_abs
 
     module_abs_dispatch_0_cuda_nvptx_fb_benchmark.mlir
+    module_abs_dispatch_0_cuda_nvptx_fb.codegen.ll
     module_abs_dispatch_0_cuda_nvptx_fb.codegen.bc
+    module_abs_dispatch_0_cuda_nvptx_fb.linked.ll
     module_abs_dispatch_0_cuda_nvptx_fb.linked.bc
+    module_abs_dispatch_0_cuda_nvptx_fb.optimized.ll
     module_abs_dispatch_0_cuda_nvptx_fb.optimized.bc
     module_abs_dispatch_0_cuda_nvptx_fb.ptx
     module_abs_dispatch_0.mlir
@@ -333,6 +340,7 @@ Flag | Files dumped
 
     ??? tip "Tip - Disassembling `.bc` files with `llvm-dis`"
 
+        This section can be skipped if the .ll files are already in the directory you choose.
         The `.bc` intermediate files use the
         [LLVM BitCode](https://llvm.org/docs/BitCodeFormat.html) format, which
         can be disassembled using
@@ -381,6 +389,56 @@ Flag | Files dumped
 
 <!-- TODO(scotttodd): Link to a playground Colab notebook that dumps files? -->
 
+### Module level executable benchmarks
+
+The _benchmark_ files produced by `--iree-hal-dump-executable-benchmarks-to`
+can be compiled in isolation and passed to `iree-benchmark-module`, where they
+exercise the full IREE runtime for a single executable:
+
+```console hl_lines="3 6-11"
+$ iree-compile simple_abs.mlir \
+  --iree-hal-target-backends=llvm-cpu \
+  --iree-hal-dump-executable-benchmarks-to=/tmp/iree/simple_abs/ \
+  -o /dev/null
+
+$ iree-compile \
+  /tmp/iree/simple_abs/module_abs_dispatch_0_embedded_elf_x86_64_benchmark.mlir \
+  -o /tmp/iree/simple_abs/module_abs_dispatch_0_benchmark.vmfb
+
+$ iree-benchmark-module \
+  /tmp/iree/simple_abs/module_abs_dispatch_0_benchmark.vmfb
+```
+
+### Low level executable binary benchmarks
+
+The _binary_ files produced by `--iree-hal-dump-executable-binaries-to`
+can be passed to `iree-benchmark-executable` where they are benchmarked
+directly, without using the IREE VM, HAL APIs, task system, etc. Note that this
+interface is much lower level and you must specify all push constants / binding
+parameters manually:
+
+```console hl_lines="3 6-13"
+$ iree-compile \
+  --iree-hal-target-backends=llvm-cpu \
+  --iree-hal-dump-executable-binaries-to=/tmp/iree/simple_abs/ \
+  -o /dev/null
+
+$ iree-benchmark-executable \
+  --device=local-sync \
+  --executable_format=embedded-elf-x86_64 \
+  --executable_file=/tmp/iree/simple_abs/module_abs_dispatch_0_embedded_elf_x86_64.so \
+  --entry_point=0 \
+  --binding=f32=-2.5 \
+  --binding=f32=0 \
+  --workgroup_count=1,1,1
+```
+
+See the comments in
+[`tools/iree-benchmark-executable-main.c`](https://github.com/iree-org/iree/blob/main/tools/iree-benchmark-executable-main.c)
+and the test file at
+[`tools/test/iree-benchmark-executable.mlir`](https://github.com/iree-org/iree/blob/main/tools/test/iree-benchmark-executable.mlir)
+for more information and examples.
+
 ## Compiling phase by phase
 
 IREE compiles programs through a series of broad phases:
@@ -405,19 +463,24 @@ graph LR
 
     | Phase name | Description |
     | ---------- | ----------- |
+    `start` | Entry point to the compilation pipeline
     `input` | Performs input processing and lowering into core IREE input dialects (linalg/etc)
     `abi` | Adjusts the program ABI for the specified execution environment
     `preprocessing` | Applies customizable `preprocessing` prior to FLow/Stream/HAL/VM
+    `global-optimization` | Performs global program optimization
+    `dispatch-creation` | Fuses operations and forms dispatch regions
     `flow` | Models execution data flow and partitioning using the `flow` dialect
     `stream` | Models execution partitioning and scheduling using the `stream` dialect
     `executable-sources` | Prepares `hal` dialect executables for translation, prior to codegen
+    `executable-configurations` | Selects translation strategies for code generation
     `executable-targets` | Runs code generation for `hal` dialect executables
     `hal` | Finishes `hal` dialect processing
     `vm` | Lowers to IREE's abstract virtual machine using the `vm` dialect
     `end` | Completes the full compilation pipeline
 
-    For an accurate list of phases, see the source code or check the help output
-    with a command such as:
+    For an accurate list of phases, see
+    [the source code](https://github.com/iree-org/iree/blob/main/compiler/src/iree/compiler/Pipelines/Pipelines.h)
+    or check the help output with a command such as:
 
     ```shell
     iree-compile --help | sed -n '/--compile-to/,/--/p' | head -n -1
@@ -468,9 +531,52 @@ $ iree-compile simple_exp_abi.mlir \
 
 or explicitly resume from an intermediate phase with `--compile-from=<phase name>`:
 
-```console
+```console hl_lines="3"
 $ iree-compile simple_exp_abi.mlir \
   --iree-hal-target-backends=llvm-cpu \
   --compile-from=abi \
   -o simple_exp_cpu.vmfb
 ```
+
+### Dumping compilation phases
+
+The `--dump-compilation-phases-to` flag can be used to dump program IR after
+each phase, much like `--compile-to` but without exiting early:
+
+```console hl_lines="3"
+$ iree-compile simple_abs.mlir \
+  --iree-hal-target-backends=llvm-cpu \
+  --dump-compilation-phases-to=/tmp/iree/simple_abs \
+  -o /tmp/iree/simple_abs/simple_abs_cpu.vmfb
+
+$ ls /tmp/iree/simple_abs -1v
+
+simple_abs.1.input.mlir
+simple_abs.2.abi.mlir
+simple_abs.3.preprocessing.mlir
+simple_abs.4.global-optimization.mlir
+simple_abs.5.dispatch-creation.mlir
+simple_abs.6.flow.mlir
+simple_abs.7.stream.mlir
+simple_abs.8.executable-sources.mlir
+simple_abs.9.executable-configurations.mlir
+simple_abs.10.executable-targets.mlir
+simple_abs.11.hal.mlir
+simple_abs.12.vm.mlir
+```
+
+As with `--compile-to`, these files can be used together with `--compile-from`:
+
+```console
+$ iree-compile simple_abs.2.abi.mlir \
+  --iree-hal-target-backends=llvm-cpu \
+  --compile-from=abi \
+  -o simple_exp_cpu.vmfb
+```
+
+All together, these passes can be used to, for example:
+
+* speed up triage ("at which phase do we go wrong")
+* allow for faster development iteration (snapshot all phases at some baseline,
+  modify the compiler source, then resume from just before where those changes
+  impact a pipeline)

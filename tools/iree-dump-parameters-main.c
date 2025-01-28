@@ -110,6 +110,7 @@ static iree_status_t iree_tooling_extract_parameters(
 //===----------------------------------------------------------------------===//
 
 int main(int argc, char** argv) {
+  IREE_TRACE_APP_ENTER();
   IREE_TRACE_ZONE_BEGIN(z0);
 
   iree_allocator_t host_allocator = iree_allocator_system();
@@ -119,6 +120,16 @@ int main(int argc, char** argv) {
   iree_flags_set_usage("iree-dump-parameters",
                        "Dumps information about parsed parameter files.\n");
   iree_flags_parse_checked(IREE_FLAGS_PARSE_MODE_DEFAULT, &argc, &argv);
+
+  if (argc > 1) {
+    fprintf(stderr, "Error: no positional arguments expected.\n");
+    fprintf(stderr,
+            "Use one or more --parameters=file.ext flags to specify parameter "
+            "files.\n");
+    IREE_TRACE_ZONE_END(z0);
+    IREE_TRACE_APP_EXIT(exit_code);
+    return EXIT_FAILURE;
+  }
 
   iree_io_scope_map_t scope_map = {0};
   iree_io_scope_map_initialize(host_allocator, &scope_map);
@@ -155,5 +166,6 @@ int main(int argc, char** argv) {
   fflush(stderr);
 
   IREE_TRACE_ZONE_END(z0);
+  IREE_TRACE_APP_EXIT(exit_code);
   return exit_code;
 }

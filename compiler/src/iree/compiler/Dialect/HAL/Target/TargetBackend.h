@@ -12,54 +12,13 @@
 #include <string>
 #include <vector>
 
-#include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
-#include "iree/compiler/Utils/OptionUtils.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/Pass/PassManager.h"
 
 namespace mlir::iree_compiler::IREE::HAL {
-
-// TODO(benvanik): remove this and replace with the pass pipeline options.
-// Controls executable translation targets.
-struct TargetOptions {
-  // TODO(benvanik): multiple targets of the same type, etc.
-  std::vector<std::string> targets;
-
-  // Coarse debug level for executable translation across all targets.
-  // Each target backend can use this to control its own flags, with values
-  // generally corresponding to the gcc-style levels 0-3:
-  //   0: no debug information
-  //   1: minimal debug information
-  //   2: default debug information
-  //   3: maximal debug information
-  int debugLevel;
-
-  // Default path to write executable files into.
-  std::string executableFilesPath;
-
-  // A path to write individual executable source listings into (before
-  // configuration).
-  std::string executableSourcesPath;
-
-  // A path to write individual executable source listings into (after
-  // configuration).
-  std::string executableConfigurationsPath;
-
-  // A path to write standalone executable benchmarks into.
-  std::string executableBenchmarksPath;
-
-  // A path to write executable intermediates into.
-  std::string executableIntermediatesPath;
-
-  // A path to write translated and serialized executable binaries into.
-  std::string executableBinariesPath;
-
-  void bindOptions(OptionsBinder &binder);
-  using FromFlags = OptionsFromFlags<TargetOptions>;
-};
 
 // HAL executable target backend interface.
 // Multiple backends can be registered and targeted during a single compilation.
@@ -92,7 +51,7 @@ struct TargetOptions {
 //      filter="spirv-v1.2-desktop*"
 //          hal.executable.export @my_entry
 //          module { ... }
-//   [[-iree-hal-translate-executables]]
+//   [[-iree-hal-translate-all-executables]]
 //   -> hal.executable @my_exe
 //      + hal.executable.variant @spirv-v1.1-mobile filter="spirv-v1.1-mobile*"
 //          hal.executable.export @my_entry_1
@@ -107,9 +66,9 @@ struct TargetOptions {
 //      filter="spirv-v1.2-desktop*"
 //          hal.executable.export @my_entry
 //          module { spirv.module { ... } }
-//   [[-iree-hal-link-executables]]
+//   [[-iree-hal-link-all-executables]]
 //   -> TODO(benvanik): linkage rules.
-//   [[-iree-hal-serialize-executables]]
+//   [[-iree-hal-serialize-all-executables]]
 //   -> hal.executable @my_exe
 //      + hal.executable.binary attributes { ... }
 //          data blob...
@@ -123,33 +82,30 @@ class TargetBackend {
 public:
   virtual ~TargetBackend() = default;
 
-  // Returns a name for the backend used to differentiate between other targets.
-  virtual std::string name() const = 0;
+  // Returns the ID of a DeviceTarget that can execute files produced by this
+  // backend. This is used to support the `--iree-hal-target-backends=` flag
+  // and will be removed in the future.
+  virtual std::string getLegacyDefaultDeviceID() const = 0;
 
-  // Returns the name of the runtime device for this backend.
-  // TODO(benvanik): remove this once we can properly specify targets.
-  virtual std::string deviceID() const { return name(); }
+  // Appends zero or more executable targets for a device with the given
+  // ID and configuration using flags/options that control target defaults.
+  virtual void getDefaultExecutableTargets(
+      MLIRContext *context, StringRef deviceID, DictionaryAttr deviceConfigAttr,
+      SmallVectorImpl<IREE::HAL::ExecutableTargetAttr> &executableTargetAttrs)
+      const = 0;
+
+  // Appends zero or more executable targets for a device with the given
+  // ID and configuration that represents the hosting machine.
+  virtual void getHostExecutableTargets(
+      MLIRContext *context, StringRef deviceID, DictionaryAttr deviceConfigAttr,
+      SmallVectorImpl<IREE::HAL::ExecutableTargetAttr> &executableTargetAttrs)
+      const {}
 
   // Registers dependent dialects for the TargetBackend.
   // Mirrors the method on mlir::Pass of the same name. A TargetBackend is
   // expected to register the dialects it will create entities for (Operations,
   // Types, Attributes).
   virtual void getDependentDialects(DialectRegistry &registry) const {}
-
-  // Returns the default device this backend targets. This may involve setting
-  // defaults from flags and other environmental sources, and it may be
-  // cross-targeting in a way that is not compatible with the host.
-  virtual IREE::HAL::DeviceTargetAttr
-  getDefaultDeviceTarget(MLIRContext *context) const = 0;
-
-  // Similar to getDefaultDeviceTarget, but always returns a DeviceTargetAttr
-  // that is configured for the host, regardless of if flags/environment were
-  // configured to cross-target in some way.
-  //
-  virtual std::optional<IREE::HAL::DeviceTargetAttr>
-  getHostDeviceTarget(MLIRContext *context) const {
-    return {};
-  }
 
   // Inserts passes used to configure the `hal.executable.variant` op contents
   // for translation. The pass manager will be nested on `hal.executable` such
@@ -195,8 +151,8 @@ public:
   //     }
   //   }
   virtual void
-  buildConfigurationPassPipeline(IREE::HAL::ExecutableVariantOp variantOp,
-                                 OpPassManager &passManager){};
+  buildConfigurationPassPipeline(IREE::HAL::ExecutableTargetAttr targetAttr,
+                                 OpPassManager &passManager) {}
 
   // Inserts passes used to translate the `hal.executable.variant` op contents.
   // The pass manager will be nested on `hal.executable` such that the pipeline
@@ -230,7 +186,7 @@ public:
   //     }
   //   }
   virtual void
-  buildTranslationPassPipeline(IREE::HAL::ExecutableVariantOp variantOp,
+  buildTranslationPassPipeline(IREE::HAL::ExecutableTargetAttr targetAttr,
                                OpPassManager &passManager) = 0;
 
   // Inserts passes used to link `hal.executable.variant` ops together.
@@ -311,6 +267,13 @@ public:
     return failure();
   }
 };
+
+// Returns a sorted uniqued set of target backends used in the executable.
+SmallVector<std::string>
+gatherExecutableTargetNames(IREE::HAL::ExecutableOp executableOp);
+
+// Returns a sorted uniqued set of target backends used in the entire module.
+SmallVector<std::string> gatherExecutableTargetNames(mlir::ModuleOp moduleOp);
 
 // Dumps binary data to a file formed by joining the given path components:
 //   `path/baseName_suffix[extension]`

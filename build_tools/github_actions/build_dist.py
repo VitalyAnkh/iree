@@ -7,8 +7,7 @@
 
 This script runs as the CIBW_BEFORE_BUILD command within cibuildwheel:
   - Main distribution .tar.bz2 file (the result of `ninja install`).
-  - The python_packages/iree_compiler wheel, which is python version
-    independent but platform specific.
+  - The python_packages/iree_base_compiler wheel.
   - Installable tests.
 
 It uses cibuildwheel for all of this as a convenience since it already knows
@@ -19,7 +18,8 @@ This is expected to be run from the project directory, containing the
 following sub-directories:
   - c/ : Main IREE repository checkout.
   - bindist/ : Directory where binary distribution artifacts are written.
-  - c/version_info.json : Version config information.
+  - c/version_info.json : Version config information (legacy).
+  - c/version_local.json : Version config information.
 
 Within the build environment (which may be the naked runner or a docker image):
   - iree-build/ : The build tree.
@@ -76,19 +76,18 @@ BUILD_REQUIREMENTS_TXT = os.path.join(
 )
 CI_REQUIREMENTS_TXT = os.path.join(THIS_DIR, "ci_requirements.txt")
 CONFIGURE_BAZEL_PY = os.path.join(IREESRC_DIR, "configure_bazel.py")
-INSTALL_TARGET = "install" if platform.system() == "Windows" else "install/strip"
 
 
 # Load version info.
 def load_version_info():
-    with open(os.path.join(IREESRC_DIR, "version_info.json"), "rt") as f:
+    with open(os.path.join(IREESRC_DIR, "version_local.json"), "rt") as f:
         return json.load(f)
 
 
 try:
     version_info = load_version_info()
 except FileNotFoundError:
-    print("version_info.json not found. Using defaults")
+    print("version_local.json not found. Using version.json defaults")
     version_info = {
         "package-version": "0.1dev1",
         "package-suffix": "-dev",
@@ -147,6 +146,9 @@ def build_main_dist():
             f"-DIREE_BUILD_COMPILER=ON",
             f"-DIREE_BUILD_PYTHON_BINDINGS=OFF",
             f"-DIREE_BUILD_SAMPLES=OFF",
+            # cpuinfo is set to be removed and is problematic from an
+            # installed/bundled library perspective.
+            f"-DIREE_ENABLE_CPUINFO=OFF",
         ],
         check=True,
     )
@@ -159,7 +161,21 @@ def build_main_dist():
             "--build",
             BUILD_DIR,
             "--target",
-            INSTALL_TARGET,
+            "all",
+        ],
+        check=True,
+    )
+
+    # TODO: Get proper dependency management on install targets so we don't
+    # have to build all first.
+    subprocess.run(
+        [
+            sys.executable,
+            CMAKE_CI_SCRIPT,
+            "--build",
+            BUILD_DIR,
+            "--target",
+            "iree-install-dist-stripped",
         ],
         check=True,
     )
@@ -168,6 +184,7 @@ def build_main_dist():
     dist_entries = [
         "bin",
         "lib",
+        "include",
     ]
     dist_archive = os.path.join(
         BINDIST_DIR,

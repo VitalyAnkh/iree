@@ -8,6 +8,7 @@
 #define IREE_COMPILER_MODULES_HAL_LOADER_TRANSFORMS_PASSES_H_
 
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
+#include "iree/compiler/Dialect/HAL/Target/TargetOptions.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "iree/compiler/Modules/HAL/Loader/IR/HALLoaderOps.h"
 #include "llvm/ADT/StringMap.h"
@@ -16,8 +17,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LLVM.h"
 
-namespace mlir::iree_compiler::IREE::HAL {
-namespace Loader {
+namespace mlir::iree_compiler::IREE::HAL::Loader {
 
 //===----------------------------------------------------------------------===//
 // Helpers
@@ -34,31 +34,18 @@ namespace Loader {
 //   buildHALInlineDynamicTransformPassPipeline & run
 //   <serialize VM module>
 void buildHALInlineDynamicTransformPassPipeline(
-    OpPassManager &passManager, const TargetBackendRegistry &targetRegistry,
+    OpPassManager &passManager, const TargetRegistry &targetRegistry,
     const TargetOptions &targetOptions);
-
-//===----------------------------------------------------------------------===//
-// Passes
-//===----------------------------------------------------------------------===//
-
-// Converts from the stream dialect into the hal_inline + hal_loader dialects.
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createConversionPass();
-
-// Materializes executable globals and loader code.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createMaterializeExecutablesPass();
-
-// Resolves dispatch operation target export entry point ordinals.
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createResolveExportOrdinalsPass();
 
 //===----------------------------------------------------------------------===//
 // Register all Passes
 //===----------------------------------------------------------------------===//
 
+#define GEN_PASS_DECL
+#include "iree/compiler/Modules/HAL/Loader/Transforms/Passes.h.inc"
+
 void registerHALLoaderPasses();
 
-} // namespace Loader
-} // namespace mlir::iree_compiler::IREE::HAL
+} // namespace mlir::iree_compiler::IREE::HAL::Loader
 
 #endif // IREE_COMPILER_MODULES_HAL_LOADER_TRANSFORMS_PASSES_H_

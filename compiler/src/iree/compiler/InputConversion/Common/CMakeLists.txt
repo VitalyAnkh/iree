@@ -23,12 +23,12 @@ iree_cc_library(
   NAME
     PassHeaders
   HDRS
-    "PassDetail.h"
     "Passes.h"
     "Passes.h.inc"
   DEPS
     ::PassesIncGen
     MLIRPass
+    MLIRTransformUtils
     MLIRTransforms
   PUBLIC
 )
@@ -38,15 +38,12 @@ iree_cc_library(
     Common
   HDRS
     "Passes.h"
-    "Utils.h"
   SRCS
+    "ConvertPrimitiveType.cpp"
     "IREEImportPublic.cpp"
     "ImportMLProgram.cpp"
     "Passes.cpp"
-    "QuantizedConvToConv.cpp"
-    "QuantizedMatmulToMatmul.cpp"
     "SanitizeModuleNames.cpp"
-    "Utils.cpp"
   DEPS
     ::PassHeaders
     ::PassesIncGen
@@ -54,6 +51,7 @@ iree_cc_library(
     LLVMSupport
     MLIRArithDialect
     MLIRFuncDialect
+    MLIRFunctionInterfaces
     MLIRIR
     MLIRLinalgDialect
     MLIRLinalgTransforms
@@ -63,12 +61,17 @@ iree_cc_library(
     MLIRPass
     MLIRSCFDialect
     MLIRSCFToControlFlow
+    MLIRSupport
     MLIRTensorDialect
     MLIRTensorUtils
+    MLIRTransformUtils
     MLIRTransforms
     iree::compiler::Dialect::Flow::IR
+    iree::compiler::Dialect::Flow::Transforms
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::Util::IR
+    iree::compiler::Dialect::Util::Transforms
+    iree::compiler::Pipelines::Options
     iree::compiler::Utils
   PUBLIC
 )
@@ -78,7 +81,6 @@ iree_cc_library(
     AutoInputConversionPipeline
   HDRS
     "Passes.h"
-    "Utils.h"
   SRCS
     "AutoInputConversionPipeline.cpp"
   DEPS
@@ -86,9 +88,12 @@ iree_cc_library(
     ::PassesIncGen
     LLVMSupport
     MLIRFuncDialect
+    MLIRFunctionInterfaces
     MLIRIR
     MLIRPass
+    MLIRTransformUtils
     MLIRTransforms
+    iree::compiler::Pipelines::Options
     iree::compiler::PluginAPI
     iree::compiler::Utils
   PUBLIC

@@ -6,24 +6,37 @@
 
 #include "iree/compiler/Codegen/Utils/Utils.h"
 
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Interfaces/ProcessorOpInterfaces.h"
 #include "iree/compiler/Codegen/Interfaces/UKernelOpInterface.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Casting.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/Transforms/Transforms.h"
+#include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/AffineExprVisitor.h"
+#include "mlir/IR/Attributes.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/TilingInterface.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/RegionUtils.h"
 
 #define DEBUG_TYPE "iree-codegen-utils"
 
@@ -33,91 +46,96 @@ namespace mlir::iree_compiler {
 // Utility functions to get entry points
 //===----------------------------------------------------------------------===//
 
-FailureOr<IREE::HAL::ExecutableExportOp> getEntryPoint(func::FuncOp funcOp) {
+std::optional<IREE::HAL::ExecutableExportOp>
+getEntryPoint(mlir::FunctionOpInterface funcOp) {
   auto variantOp = funcOp->getParentOfType<IREE::HAL::ExecutableVariantOp>();
-  if (!variantOp)
-    return failure();
+  if (!variantOp) {
+    return std::nullopt;
+  }
 
   for (auto op : variantOp.getExportOps()) {
     if (op.getSymName() == funcOp.getName()) {
       return op;
     }
   }
-  return failure();
+  return std::nullopt;
 }
 
-FailureOr<IREE::HAL::ExecutableVariantOp>
-getExecutableVariantOp(Operation *op) {
-  if (auto result = dyn_cast<IREE::HAL::ExecutableVariantOp>(op)) {
-    return result;
-  }
-  if (auto result = op->getParentOfType<IREE::HAL::ExecutableVariantOp>()) {
-    return result;
-  }
-  return failure();
+bool isEntryPoint(mlir::FunctionOpInterface func) {
+  return func.isPublic() && getEntryPoint(func);
 }
 
-bool isEntryPoint(func::FuncOp func) {
-  return func.isPublic() && succeeded(getEntryPoint(func));
-}
-
-llvm::StringMap<IREE::HAL::ExecutableExportOp>
-getAllEntryPoints(ModuleOp module) {
-  auto variantOp = module->getParentOfType<IREE::HAL::ExecutableVariantOp>();
-  llvm::StringMap<IREE::HAL::ExecutableExportOp> exportOps;
-  for (auto op : variantOp.getExportOps()) {
-    exportOps[op.getSymName()] = op;
-  }
-  return exportOps;
-}
-
-std::optional<StringAttr>
-getConfigStringAttr(IREE::HAL::ExecutableTargetAttr targetAttr,
-                    StringRef stringAttr) {
-  if (!targetAttr)
+std::optional<StringAttr> getConfigStringAttr(Attribute srcAttr,
+                                              StringRef stringAttr) {
+  if (!srcAttr) {
     return std::nullopt;
-  auto config = targetAttr.getConfiguration();
-  if (!config)
+  }
+  auto targetAttr = dyn_cast<IREE::HAL::ExecutableTargetAttr>(srcAttr);
+  DictionaryAttr config;
+  if (targetAttr) {
+    config = targetAttr.getConfiguration();
+  } else {
+    config = dyn_cast<DictionaryAttr>(srcAttr);
+  }
+  if (!config) {
     return std::nullopt;
+  }
   auto attr = config.getAs<StringAttr>(stringAttr);
-  if (!attr)
+  if (!attr) {
     return std::nullopt;
+  }
   return attr;
 }
 
-std::optional<IntegerAttr>
-getConfigIntegerAttr(IREE::HAL::ExecutableTargetAttr targetAttr,
-                     StringRef integerAttr) {
-  if (!targetAttr)
+std::optional<IntegerAttr> getConfigIntegerAttr(Attribute srcAttr,
+                                                StringRef integerAttr) {
+  if (!srcAttr) {
     return std::nullopt;
-  auto config = targetAttr.getConfiguration();
-  if (!config)
+  }
+  auto targetAttr = dyn_cast<IREE::HAL::ExecutableTargetAttr>(srcAttr);
+  DictionaryAttr config;
+  if (targetAttr) {
+    config = targetAttr.getConfiguration();
+  } else {
+    config = dyn_cast<DictionaryAttr>(srcAttr);
+  }
+  if (!config) {
     return std::nullopt;
+  }
   auto attr = config.getAs<IntegerAttr>(integerAttr);
-  if (!attr)
+  if (!attr) {
     return std::nullopt;
+  }
   return attr;
 }
 
-std::optional<BoolAttr>
-getConfigBoolAttr(IREE::HAL::ExecutableTargetAttr targetAttr,
-                  StringRef integerAttr) {
-  if (!targetAttr)
+std::optional<BoolAttr> getConfigBoolAttr(Attribute srcAttr,
+                                          StringRef boolAttr) {
+  if (!srcAttr) {
     return std::nullopt;
-  auto config = targetAttr.getConfiguration();
-  if (!config)
+  }
+  auto targetAttr = dyn_cast<IREE::HAL::ExecutableTargetAttr>(srcAttr);
+  DictionaryAttr config;
+  if (targetAttr) {
+    config = targetAttr.getConfiguration();
+  } else {
+    config = dyn_cast<DictionaryAttr>(srcAttr);
+  }
+  if (!config) {
     return std::nullopt;
-  auto attr = config.getAs<BoolAttr>(integerAttr);
-  if (!attr)
+  }
+  auto attr = config.getAs<BoolAttr>(boolAttr);
+  if (!attr) {
     return std::nullopt;
+  }
   return attr;
 }
 
-std::optional<llvm::Triple>
-getTargetTriple(IREE::HAL::ExecutableTargetAttr targetAttr) {
-  auto triple = getConfigStringAttr(targetAttr, "target_triple");
-  if (!triple)
+std::optional<llvm::Triple> getTargetTriple(Attribute attr) {
+  auto triple = getConfigStringAttr(attr, "target_triple");
+  if (!triple) {
     return std::nullopt;
+  }
   return llvm::Triple(triple.value().str());
 }
 
@@ -143,21 +161,51 @@ const char *getIreeArchNameForTargetTriple(llvm::Triple triple) {
   return "unknown";
 }
 
-bool isVMVXBackend(IREE::HAL::ExecutableTargetAttr targetAttr) {
-  return targetAttr && targetAttr.getBackend().getValue().startswith("vmvx");
+bool isLLVMCPUBackend(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  return targetAttr && targetAttr.getBackend().getValue() == "llvm-cpu";
 }
 
-bool hasUkernel(IREE::HAL::ExecutableTargetAttr targetAttr,
-                StringRef ukernelName) {
-  auto enabledUkernels = getConfigStringAttr(targetAttr, "ukernels");
-  if (!enabledUkernels) {
-    return false;
+bool isVMVXBackend(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  return targetAttr && targetAttr.getBackend().getValue().starts_with("vmvx");
+}
+
+bool isROCMBackend(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  return targetAttr && targetAttr.getBackend().getValue().starts_with("rocm");
+}
+
+static const char *getDefaultEnabledUkernels(Attribute attr) {
+  const char *kNone = "none";
+  if (!attr) {
+    return kNone;
   }
-  StringRef enabledUkernelsStr = enabledUkernels->getValue();
+  auto targetAttr = dyn_cast<IREE::HAL::ExecutableTargetAttr>(attr);
+  if (!targetAttr) {
+    return kNone;
+  }
+  if (isX86_64(targetAttr)) {
+    return "mmt4d";
+  }
+  if (isAArch64(targetAttr)) {
+    if (hasFeature(targetAttr, "+sve") || hasFeature(targetAttr, "+sve2") ||
+        hasFeature(targetAttr, "+sme")) {
+      return kNone;
+    }
+    return "mmt4d";
+  }
+  return kNone;
+}
+
+bool hasUkernel(Attribute attr, StringRef ukernelName) {
+  auto enabledUkernels = getConfigStringAttr(attr, "ukernels");
+  StringRef enabledUkernelsStr;
+  if (enabledUkernels) {
+    enabledUkernelsStr = enabledUkernels->getValue();
+  } else {
+    enabledUkernelsStr = "default";
+  }
   // Resolve `default`.
   if (enabledUkernelsStr == "default") {
-    // Current defaults implemented here. Could depend on targetAttr.
-    enabledUkernelsStr = "none";
+    enabledUkernelsStr = getDefaultEnabledUkernels(attr);
   }
   // Resolve `none`.
   if (enabledUkernelsStr == "none") {
@@ -182,11 +230,11 @@ bool hasUkernel(IREE::HAL::ExecutableTargetAttr targetAttr,
   return false;
 }
 
-std::optional<StringRef>
-getCpuFeatures(IREE::HAL::ExecutableTargetAttr targetAttr) {
-  auto cpuFeatures = getConfigStringAttr(targetAttr, "cpu_features");
-  if (!cpuFeatures)
+std::optional<StringRef> getCpuFeatures(Attribute attr) {
+  auto cpuFeatures = getConfigStringAttr(attr, "cpu_features");
+  if (!cpuFeatures) {
     return std::nullopt;
+  }
   return cpuFeatures->getValue();
 }
 
@@ -194,8 +242,8 @@ getCpuFeatures(IREE::HAL::ExecutableTargetAttr targetAttr) {
 // features in the future, we may want to consider a persistent state to carry
 // over processed HAL information or keeping the TTI instance alive and query
 // subtarget features data structure.
-bool hasFeature(IREE::HAL::ExecutableTargetAttr targetAttr, StringRef feature) {
-  std::optional<StringRef> features = getCpuFeatures(targetAttr);
+bool hasFeature(Attribute attr, StringRef feature) {
+  std::optional<StringRef> features = getCpuFeatures(attr);
   if (!features) {
     return false;
   }
@@ -213,28 +261,28 @@ bool hasFeature(IREE::HAL::ExecutableTargetAttr targetAttr, StringRef feature) {
   return false;
 }
 
-bool isX86(IREE::HAL::ExecutableTargetAttr targetAttr) {
-  std::optional<llvm::Triple> triple = getTargetTriple(targetAttr);
+bool isX86(Attribute attr) {
+  std::optional<llvm::Triple> triple = getTargetTriple(attr);
   return triple && triple.value().isX86();
 }
 
-bool isX86_64(IREE::HAL::ExecutableTargetAttr targetAttr) {
-  std::optional<llvm::Triple> triple = getTargetTriple(targetAttr);
+bool isX86_64(Attribute attr) {
+  std::optional<llvm::Triple> triple = getTargetTriple(attr);
   return triple && triple.value().getArch() == llvm::Triple::x86_64;
 }
 
-bool isAArch64(IREE::HAL::ExecutableTargetAttr targetAttr) {
-  std::optional<llvm::Triple> triple = getTargetTriple(targetAttr);
+bool isAArch64(Attribute attr) {
+  std::optional<llvm::Triple> triple = getTargetTriple(attr);
   return triple && triple.value().isAArch64();
 }
 
-bool isRISCV(IREE::HAL::ExecutableTargetAttr targetAttr) {
-  std::optional<llvm::Triple> triple = getTargetTriple(targetAttr);
+bool isRISCV(Attribute attr) {
+  std::optional<llvm::Triple> triple = getTargetTriple(attr);
   return triple && triple.value().isRISCV();
 }
 
-bool isRISCV32(IREE::HAL::ExecutableTargetAttr targetAttr) {
-  std::optional<llvm::Triple> triple = getTargetTriple(targetAttr);
+bool isRISCV32(Attribute attr) {
+  std::optional<llvm::Triple> triple = getTargetTriple(attr);
   return triple && triple.value().isRISCV32();
 }
 
@@ -258,6 +306,257 @@ bool isReadOnly(Value v) {
       .Default([&](Operation *op) { return false; });
 }
 
+LogicalResult duplicateTensorEmptyOps(OpBuilder &b, tensor::EmptyOp emptyOp) {
+  OpBuilder::InsertionGuard g(b);
+  b.setInsertionPoint(emptyOp);
+  SmallVector<OpOperand *> uses = llvm::map_to_vector(
+      emptyOp->getUses(), [](OpOperand &use) { return &use; });
+  for (auto use : llvm::make_range(std::next(uses.begin()), uses.end())) {
+    auto newOp = cast<tensor::EmptyOp>(b.clone(*emptyOp.getOperation()));
+    Operation *user = use->getOwner();
+    user->setOperand(use->getOperandNumber(), newOp);
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Setting CustomOp Lowering config.
+//===----------------------------------------------------------------------===//
+
+static std::tuple<SmallVector<Operation *>, SetVector<Value>>
+getNonConstantValuesDefinedFromAbove(Region &region) {
+  llvm::SetVector<Value> valuesDefinedFromAbove;
+  mlir::getUsedValuesDefinedAbove(region, valuesDefinedFromAbove);
+  SmallVector<Operation *> constants;
+  SetVector<Value> erasedVals;
+  for (auto value : valuesDefinedFromAbove) {
+    Attribute constVal;
+    if (!matchPattern(value, m_Constant(&constVal))) {
+      continue;
+    }
+    if (!isa<IntegerAttr, FloatAttr>(constVal)) {
+      continue;
+    }
+    constants.push_back(value.getDefiningOp());
+    erasedVals.insert(value);
+  }
+  valuesDefinedFromAbove.set_subtract(erasedVals);
+  return {constants, valuesDefinedFromAbove};
+}
+
+/// Listener to track mapping from operations in the body of a cloned custom op
+/// back to the original operations in the body of the original custom op.
+class CustomOpConfigListener : public RewriterBase::Listener {
+public:
+  CustomOpConfigListener(IREE::LinalgExt::CustomOp origCustomOp,
+                         IREE::LinalgExt::CustomOp clonedCustomOp) {
+    for (auto [origOp, clonedOp] :
+         llvm::zip_equal(origCustomOp.getBody()->without_terminator(),
+                         clonedCustomOp.getBody()->without_terminator())) {
+      clonedOpToOrigOp[&clonedOp] = &origOp;
+    }
+  }
+  void notifyOperationErased(Operation *op) override {
+    clonedOpToOrigOp.erase(op);
+  }
+  void notifyOperationReplaced(Operation *op, Operation *replacement) override {
+    auto it = clonedOpToOrigOp.find(op);
+    if (it != clonedOpToOrigOp.end()) {
+      Operation *origOp = it->second;
+      clonedOpToOrigOp.erase(it);
+      clonedOpToOrigOp[replacement] = origOp;
+    }
+  }
+  void notifyOperationReplaced(Operation *op,
+                               ValueRange replacements) override {
+    Operation *replacementOp = nullptr;
+    for (auto val : replacements) {
+      Operation *definingOp = getDefiningOp(val);
+      if (!definingOp) {
+        // One of the replacements is definitely not from an op. Bail
+        // immediately.
+        return;
+      }
+      if (replacementOp) {
+        if (definingOp != replacementOp) {
+          // No consistent replacementOp. Bail.
+          return;
+        }
+      } else {
+        replacementOp = definingOp;
+      }
+    }
+    if (replacementOp && replacementOp->getName() == op->getName()) {
+      notifyOperationReplaced(op, replacementOp);
+    }
+  }
+
+  // Helper methods to get back the orig op for the cloned op.
+  std::optional<Operation *> getOrigOp(Operation *clonedOp) {
+    auto it = clonedOpToOrigOp.find(clonedOp);
+    if (it == clonedOpToOrigOp.end()) {
+      return std::nullopt;
+    }
+    return it->second;
+  }
+
+private:
+  llvm::MapVector<Operation *, Operation *> clonedOpToOrigOp;
+
+  /// On cast propagation, the replacement value used is not the
+  /// actual op that is used for replacement. Walk back the replacement
+  /// value use-def chain to get to the real replacement. This is a
+  /// bit of a hack, but the lowering config propagation is really
+  /// best effort, so not incorrect.
+  Operation *getDefiningOp(Value v) {
+    Operation *definingOp = v.getDefiningOp();
+    while (definingOp) {
+      if (auto castOp = dyn_cast<tensor::CastOp>(definingOp)) {
+        definingOp = castOp.getSource().getDefiningOp();
+        continue;
+      }
+      // Default is to break out of the loop.
+      break;
+    }
+    return definingOp;
+  }
+};
+
+LogicalResult setDefaultCustomOpLoweringConfig(
+    FunctionOpInterface funcOp, IREE::LinalgExt::CustomOp customOp,
+    std::function<LogicalResult(FunctionOpInterface)> configFn) {
+
+  MLIRContext *context = funcOp.getContext();
+  IRRewriter rewriter(context);
+  rewriter.setInsertionPoint(funcOp);
+
+  // 1. Get values captured from above in the custom op region.
+  llvm::SetVector<Value> valuesDefinedAbove;
+  SmallVector<Operation *> constantOps;
+  std::tie(constantOps, valuesDefinedAbove) =
+      getNonConstantValuesDefinedFromAbove(customOp.getRegion());
+
+  // 2. Create an empty function with arguments being the operands of the custom
+  // op and values captured from above in the custom op.
+  auto operandTypes = llvm::to_vector(customOp->getOperandTypes());
+  auto valuesDefinedAboveTypes =
+      llvm::map_range(valuesDefinedAbove, [](Value v) { return v.getType(); });
+  operandTypes.append(valuesDefinedAboveTypes.begin(),
+                      valuesDefinedAboveTypes.end());
+  auto dummyFuncType =
+      FunctionType::get(context, operandTypes, customOp->getResultTypes());
+  std::string dummyFuncName =
+      std::string("__") + funcOp.getName().str() + "_config_setting__";
+  auto dummyFuncOp = rewriter.create<func::FuncOp>(
+      customOp.getLoc(), dummyFuncName, dummyFuncType);
+  auto targetAttr = IREE::HAL::ExecutableTargetAttr::lookup(funcOp);
+  if (targetAttr) {
+    dummyFuncOp->setAttr(IREE::HAL::ExecutableTargetAttr::name, targetAttr);
+  }
+
+  // 3. Clone the custom op into the function
+  SmallVector<Location> locs = llvm::map_to_vector(
+      customOp->getOperands(), [](Value v) { return v.getLoc(); });
+  auto valuesDefinedAboveLocs =
+      llvm::map_range(valuesDefinedAbove, [](Value v) { return v.getLoc(); });
+  locs.append(valuesDefinedAboveLocs.begin(), valuesDefinedAboveLocs.end());
+  Block *body =
+      rewriter.createBlock(&dummyFuncOp.getRegion(),
+                           dummyFuncOp.getRegion().begin(), operandTypes, locs);
+  rewriter.setInsertionPointToStart(body);
+  IRMapping map;
+  map.map(customOp.getOperands(),
+          body->getArguments().take_front(customOp.getNumOperands()));
+  map.map(valuesDefinedAbove.getArrayRef(),
+          body->getArguments().take_back(valuesDefinedAbove.size()));
+  for (auto op : constantOps) {
+    rewriter.clone(*op, map);
+  }
+  auto clonedCustomOp = cast<IREE::LinalgExt::CustomOp>(
+      rewriter.clone(*customOp.getOperation(), map));
+  rewriter.create<func::ReturnOp>(customOp.getLoc(),
+                                  clonedCustomOp->getResults());
+  CustomOpConfigListener customOpConfigListener(customOp, clonedCustomOp);
+
+  // 4. Inline the cloned custom op.
+  rewriter.setInsertionPoint(clonedCustomOp);
+  FailureOr<SmallVector<Value>> replacements =
+      clonedCustomOp.decomposeOperation(rewriter);
+  if (failed(replacements)) {
+    return customOp.emitOpError(
+        "failed to decompose op during custom op configuration setting");
+  }
+  rewriter.replaceOp(clonedCustomOp, replacements.value());
+
+  // 5. Run canonicalizations on the created function to constant propagate the
+  // shape.
+  RewritePatternSet patterns(context);
+  auto addCanonicalizationPatterns = [&context,
+                                      &patterns](StringRef dialectName) {
+    context->getLoadedDialect(dialectName)
+        ->getCanonicalizationPatterns(patterns);
+  };
+  addCanonicalizationPatterns(linalg::LinalgDialect::getDialectNamespace());
+  addCanonicalizationPatterns(
+      IREE::LinalgExt::IREELinalgExtDialect::getDialectNamespace());
+  tensor::CastOp::getCanonicalizationPatterns(patterns, context);
+  addCanonicalizationPatterns(tensor::TensorDialect::getDialectNamespace());
+  memref::populateResolveRankedShapedTypeResultDimsPatterns(patterns);
+  GreedyRewriteConfig config;
+  config.listener = &customOpConfigListener;
+  if (failed(applyPatternsGreedily(dummyFuncOp, std::move(patterns), config))) {
+    return customOp.emitOpError(
+        "failed to canonicalize during custom op configuration setting");
+  }
+
+  // 6. Run set configuration on the new dummy function.
+  if (failed(configFn(dummyFuncOp))) {
+    return customOp.emitOpError("failed to set configuration for custom op");
+  }
+
+  // 7. Set translation info and lowering config for the custom op.
+  IREE::Codegen::TranslationInfoAttr translationInfo =
+      getTranslationInfo(dummyFuncOp);
+  // Move lowering config from ops in the cloned function to the ops
+  // within the body of the custom op.
+  // TODO: This logic needs to be made more robust (by account for indexing maps
+  // specified for operands on the custom op and the indexing maps of the
+  // operations within the region of the custom op). For now, just use the first
+  // operation with lowering config.
+  std::optional<SmallVector<int64_t>> workgroupTileSizes;
+  std::optional<SmallVector<int64_t>> workgroupInterchange;
+  for (Operation &op : dummyFuncOp.getBody().front()) {
+    auto currLoweringConfig =
+        getLoweringConfig<IREE::Codegen::LoweringConfigAttrInterface>(&op);
+    if (!currLoweringConfig)
+      continue;
+
+    // Translate the lowering config to the original operation.
+    if (std::optional<Operation *> originalOperation =
+            customOpConfigListener.getOrigOp(&op)) {
+      setLoweringConfig(originalOperation.value(), currLoweringConfig);
+    }
+
+    auto currWorkgroupTileSizes = currLoweringConfig.getWorkgroupTileSizes();
+    if (currWorkgroupTileSizes.empty())
+      continue;
+    workgroupTileSizes = currWorkgroupTileSizes;
+    workgroupInterchange = currLoweringConfig.getWorkgroupInterchange();
+  }
+  IREE::Codegen::LoweringConfigAttr loweringConfig;
+  if (workgroupTileSizes) {
+    loweringConfig = IREE::Codegen::LoweringConfigAttr::get(
+        context, workgroupTileSizes.value_or(SmallVector<int64_t>{}),
+        workgroupInterchange.value_or(SmallVector<int64_t>{}));
+  }
+  if (failed(setOpConfigAndEntryPointFnTranslation(
+          funcOp, customOp, loweringConfig, translationInfo))) {
+    return funcOp.emitOpError("failed to set custom op configuration");
+  }
+  rewriter.eraseOp(dummyFuncOp);
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Utility functions to set configurations
 //===----------------------------------------------------------------------===//
@@ -265,24 +564,9 @@ bool isReadOnly(Value v) {
 /// Returns the first of `exprs` which is of the type `T`.
 template <typename T>
 static AffineExpr getAffineExprOfType(ArrayRef<AffineExpr> exprs) {
-  for (auto expr : exprs) {
-    if (isa<T>(expr))
-      return expr;
-  }
+  if (auto it = llvm::find_if(exprs, llvm::IsaPred<T>); it != exprs.end())
+    return *it;
   return nullptr;
-}
-
-/// Returns true if the `expr` is on of the types in {`T1`, `T2`, `T3...`}.
-template <typename T>
-static bool isaAffineExprOfType(AffineExpr expr) {
-  return isa<T>(expr);
-}
-template <typename T1, typename T2, typename... T3>
-static bool isaAffineExprOfType(AffineExpr expr) {
-  if (isa<T1>(expr)) {
-    return true;
-  }
-  return isaAffineExprOfType<T2, T3...>(expr);
 }
 
 /// Returns a Value that represents the value for symbol or dim expr for the map
@@ -381,7 +665,7 @@ public:
     // The other expression must be the undistributed `lb`.
     AffineExpr lbExpr =
         (offsetExpr == expr.getLHS() ? expr.getRHS() : expr.getLHS());
-    if (isaAffineExprOfType<AffineDimExpr, AffineSymbolExpr>(lbExpr)) {
+    if (isa<AffineDimExpr, AffineSymbolExpr>(lbExpr)) {
       Value v = getValueForDimOrSymbol(applyOp, lbExpr);
       if (!v) {
         return failure();
@@ -535,7 +819,7 @@ public:
 private:
   LogicalResult processSentinel(AffineExpr e,
                                 SmallVectorImpl<AffineExpr> &sentinels) {
-    if (isaAffineExprOfType<AffineDimExpr, AffineSymbolExpr>(e)) {
+    if (isa<AffineDimExpr, AffineSymbolExpr>(e)) {
       sentinels.push_back(e);
       return success();
     } else if (auto constExpr = dyn_cast<AffineConstantExpr>(e)) {
@@ -566,9 +850,9 @@ static std::optional<unsigned> getInterfaceWorkgroupOpDim(Value value) {
 /// form
 /// ```
 ///   %dim = arith.constant ... : index
-///   %id = flow.dispatch.workgroup.id[%dim]
-///   %count = flow.dispatch.workgroup.count[%dim]
-///   %size = flow.dispatch.workgroup.size[%dim]
+///   %id = stream.dispatch.workgroup.id[%dim]
+///   %count = stream.dispatch.workgroup.count[%dim]
+///   %size = stream.dispatch.workgroup.size[%dim]
 ///   %offset = affine.apply
 ///     affine_map<(d0)[s0, s1] -> (d0 + s0 * s1)>(%lb)[%id, %size]
 ///   %new_step = affine.apply
@@ -626,9 +910,14 @@ isTiledAndDistributedLoop(scf::ForOp forOp) {
   return loopInfo;
 }
 
-SmallVector<Operation *> getComputeOps(func::FuncOp funcOp) {
+SmallVector<Operation *> getComputeOps(Operation *containingOp) {
+  if (containingOp->getNumRegions() == 0) {
+    return {};
+  }
+  assert(containingOp->getNumRegions() == 1 &&
+         "expected op with a single region");
   SmallVector<Operation *> computeOps;
-  funcOp.walk([&](Operation *op) {
+  containingOp->getRegion(0).walk([&](Operation *op) {
     if (isa<TilingInterface, IREE::Codegen::UKernelOpInterface>(op)) {
       computeOps.push_back(op);
     }
@@ -637,7 +926,7 @@ SmallVector<Operation *> getComputeOps(func::FuncOp funcOp) {
 }
 
 SmallVector<LoopTilingAndDistributionInfo>
-getTiledAndDistributedLoopInfo(func::FuncOp funcOp) {
+getTiledAndDistributedLoopInfo(mlir::FunctionOpInterface funcOp) {
   SmallVector<LoopTilingAndDistributionInfo> info;
   funcOp.walk([&](scf::ForOp forOp) {
     if (auto tiledLoopInfo = isTiledAndDistributedLoop(forOp)) {
@@ -645,6 +934,39 @@ getTiledAndDistributedLoopInfo(func::FuncOp funcOp) {
     }
   });
   return info;
+}
+
+void setSCFTileSizes(scf::SCFTilingOptions &options, TilingInterface op,
+                     ArrayRef<int64_t> tileSizes,
+                     ArrayRef<bool> tileScalableFlags) {
+  // scf::tileUsingSCFForOp expects the num of tile sizes = num of loops.
+  int numLoops = op.getLoopIteratorTypes().size();
+  SmallVector<int64_t> fixedTileSizes(tileSizes);
+  fixedTileSizes.resize(numLoops, /*default=*/0);
+  SmallVector<bool> fixedTileScalableFlags(tileScalableFlags);
+  fixedTileScalableFlags.resize(numLoops, /*default=*/false);
+  if (!llvm::is_contained(fixedTileScalableFlags, true)) {
+    // Non-scalable case: All constant tile sizes.
+    options.setTileSizes(
+        getAsIndexOpFoldResult(op.getContext(), fixedTileSizes));
+  } else {
+    // Scalable case: Multiply scalable tile sizes by a vector.vscale op.
+    options.setTileSizeComputationFunction(
+        [=](OpBuilder &b, Operation *op) -> SmallVector<OpFoldResult> {
+          auto loc = op->getLoc();
+          return llvm::map_to_vector(
+              llvm::zip(fixedTileSizes, fixedTileScalableFlags),
+              [&](auto pair) -> OpFoldResult {
+                auto [t, isScalable] = pair;
+                Value size = b.create<arith::ConstantIndexOp>(loc, t);
+                if (isScalable) {
+                  Value vscale = b.create<vector::VectorScaleOp>(loc);
+                  size = b.create<arith::MulIOp>(loc, size, vscale);
+                }
+                return size;
+              });
+        });
+  }
 }
 
 /// Create a linalg::GenericOp version of an n-D copy that can further tile,
@@ -683,21 +1005,15 @@ static Value buildHALWorkgroupInfoOp(OpBuilder &b, unsigned dim) {
 }
 
 linalg::LinalgLoopDistributionOptions getIREELinalgLoopDistributionOptions(
-    const SmallVector<int64_t> &tileSizes,
     linalg::DistributionMethod distributionMethod,
     int32_t maxWorkgroupParallelDims) {
-  return {[&tileSizes, distributionMethod,
+  return {[distributionMethod,
            maxWorkgroupParallelDims](OpBuilder &builder, Location loc,
                                      ArrayRef<Range> parallelLoopRanges) {
-    SmallVector<int64_t> nonZeroTileSizes;
-    for (int64_t size : tileSizes) {
-      if (size != 0)
-        nonZeroTileSizes.push_back(size);
-    }
     auto numParallelDims = parallelLoopRanges.size();
 
     SmallVector<linalg::ProcInfo, 3> procInfo(numParallelDims);
-    Value splitDim;
+    std::optional<OpFoldResult> splitDim;
     for (size_t dim = 0; dim < numParallelDims; ++dim) {
       if (numParallelDims > maxWorkgroupParallelDims &&
           dim >= maxWorkgroupParallelDims - 1) {
@@ -705,26 +1021,28 @@ linalg::LinalgLoopDistributionOptions getIREELinalgLoopDistributionOptions(
           splitDim = buildHALWorkgroupInfoOp<IREE::HAL::InterfaceWorkgroupIDOp>(
               builder, maxWorkgroupParallelDims - 1);
         }
-        Value size = getValueOrCreateConstantIndexOp(
-            builder, loc, parallelLoopRanges[numParallelDims - dim - 1].size);
-        Value offset = getValueOrCreateConstantIndexOp(
-            builder, loc, parallelLoopRanges[numParallelDims - dim - 1].offset);
-        AffineExpr d0, d1;
-        int64_t tileSize = nonZeroTileSizes[numParallelDims - dim - 1];
-        bindSymbols(builder.getContext(), d0, d1);
-        Value numTiles = affine::makeComposedAffineApply(
-            builder, loc, (d0 - d1).ceilDiv(tileSize), {size, offset});
-        Value dimValue;
+        OpFoldResult size = parallelLoopRanges[numParallelDims - dim - 1].size;
+        OpFoldResult offset =
+            parallelLoopRanges[numParallelDims - dim - 1].offset;
+        OpFoldResult step =
+            parallelLoopRanges[numParallelDims - dim - 1].stride;
+        AffineExpr d0, d1, d2;
+        bindSymbols(builder.getContext(), d0, d1, d2);
+        OpFoldResult numTiles = affine::makeComposedFoldedAffineApply(
+            builder, loc, (d1 - d0).ceilDiv(d2), {offset, size, step});
+        OpFoldResult dimValue;
         if (dim == numParallelDims - 1)
-          dimValue = splitDim;
+          dimValue = splitDim.value();
         else {
-          dimValue = affine::makeComposedAffineApply(builder, loc, (d0 % d1),
-                                                     {splitDim, numTiles});
-          splitDim = affine::makeComposedAffineApply(
-              builder, loc, (d0).floorDiv(d1), {splitDim, numTiles});
+          dimValue = affine::makeComposedFoldedAffineApply(
+              builder, loc, (d0 % d1), {splitDim.value(), numTiles});
+          splitDim = affine::makeComposedFoldedAffineApply(
+              builder, loc, (d0).floorDiv(d1), {splitDim.value(), numTiles});
         }
-        procInfo[numParallelDims - dim - 1] = {dimValue, numTiles,
-                                               distributionMethod};
+        procInfo[numParallelDims - dim - 1] = {
+            getValueOrCreateConstantIndexOp(builder, loc, dimValue),
+            getValueOrCreateConstantIndexOp(builder, loc, numTiles),
+            distributionMethod};
         continue;
       }
       procInfo[numParallelDims - dim - 1] = {
@@ -737,6 +1055,78 @@ linalg::LinalgLoopDistributionOptions getIREELinalgLoopDistributionOptions(
     return procInfo;
   }};
 }
+
+static constexpr char pipeliningDepthName[] = "pipeline_depth";
+static constexpr char pipeliningStageName[] = "store_stage";
+
+DictionaryAttr
+getSoftwarePipeliningAttrDict(MLIRContext *context,
+                              unsigned softwarePipelineDepth,
+                              unsigned softwarePipelineStoreStage) {
+  SmallVector<NamedAttribute> attrs;
+  attrs.push_back(
+      {StringAttr::get(context, pipeliningDepthName),
+       IntegerAttr::get(IntegerType::get(context, 64), softwarePipelineDepth)});
+  attrs.push_back({StringAttr::get(context, pipeliningStageName),
+                   IntegerAttr::get(IntegerType::get(context, 64),
+                                    softwarePipelineStoreStage)});
+  return DictionaryAttr::get(context, attrs);
+}
+
+FailureOr<int64_t> getSoftwarePipelineDepth(DictionaryAttr config) {
+  if (!config) {
+    return failure();
+  }
+  Attribute depth = config.get(pipeliningDepthName);
+  if (!depth) {
+    return failure();
+  }
+  return llvm::cast<IntegerAttr>(depth).getInt();
+}
+
+FailureOr<int64_t> getSoftwarePipelineStoreStage(DictionaryAttr config) {
+  if (!config) {
+    return failure();
+  }
+  Attribute stage = config.get(pipeliningStageName);
+  if (!stage) {
+    return failure();
+  }
+  return llvm::cast<IntegerAttr>(stage).getInt();
+}
+
+/// Returns a small tiling factor for the given reduction `dimSize`.
+/// Returns 0 to avoid tiling.
+int getReductionTilingFactor(int64_t dimSize) {
+  if (dimSize % 4 == 0)
+    return 4;
+
+  // Try to find the smallest prime factor as the tiling factor. As a trade off
+  // between generated code size and compilation time, only look at prime
+  // numbers less than 50 right now.
+  static constexpr std::array<int, 15> primeNumbers = {
+      2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47};
+  for (int n : primeNumbers) {
+    if (dimSize % n == 0)
+      return n;
+  }
+
+  return 1; // Otherwise just tile with size 1.
+}
+
+int64_t getMinElementBitwidth(linalg::LinalgOp linalgOp) {
+  unsigned bitwidth = std::numeric_limits<unsigned>::max();
+  for (OpOperand *operand : linalgOp.getDpsInputOperands()) {
+    unsigned b =
+        IREE::Util::getTypeBitWidth(getElementTypeOrSelf(operand->get()));
+    bitwidth = std::min(bitwidth, b);
+  }
+  for (Value result : linalgOp.getDpsInits()) {
+    unsigned b = IREE::Util::getTypeBitWidth(getElementTypeOrSelf(result));
+    bitwidth = std::min(bitwidth, b);
+  }
+  return bitwidth;
+};
 
 //===---------------------------------------------------------------------===//
 // Misc. utility functions
@@ -764,6 +1154,104 @@ OpFoldResult convertByteOffsetToElementOffset(RewriterBase &rewriter,
     return affine::makeComposedFoldedAffineApply(rewriter, loc, s0.floorDiv(s1),
                                                  {byteOffset, elementByteSize});
   }
+}
+
+LogicalResult isArgmaxOp(linalg::GenericOp genericOp) {
+  // Check for 2 results(value, index), and 1 input
+  if (genericOp.getNumDpsInits() != 2) {
+    return failure();
+  }
+  if (genericOp.getNumDpsInputs() != 1) {
+    return failure();
+  }
+
+  // If max value is being used, it is not a pure argmax.
+  if (!genericOp.getResults()[0].use_empty()) {
+    return failure();
+  }
+
+  // Check that the rank is at least 3 and all loops are parallel
+  unsigned numLoops = genericOp.getNumLoops();
+  unsigned numParallelLoops = genericOp.getNumParallelLoops();
+
+  // Argmax will require 1D reduction.
+  if (numParallelLoops != (numLoops - 1)) {
+    return failure();
+  }
+  // TODO: Add better affine map checks.
+  auto indexing_maps = genericOp.getIndexingMapsArray();
+  if (!indexing_maps[0].isIdentity())
+    return failure();
+
+  // Check that initial value is negative Infinite.
+  // TODO: Move this check to ukernel once we implement
+  //       variant to handle non neg-Inf initial value.
+  Value initVal = genericOp.getDpsInitOperand(0)->get();
+  auto fillOp = initVal.getDefiningOp<linalg::FillOp>();
+  if (!fillOp)
+    return failure();
+  Value fillVal = fillOp.getDpsInputOperand(0)->get();
+  if (!matchPattern(fillVal, m_NegInfFloat()))
+    return failure();
+
+  // Work back from linalg.yield and check body of genericOp.
+  // The genericOp should yield the result of an arith.select,
+  // preceded by an arith.cmpf, arith.maximumf, and arith.extui
+  auto yieldOp = cast<linalg::YieldOp>(genericOp.getBody()->getTerminator());
+  Value producerOutput;
+  Operation *producer;
+
+  // Producer of linalg.yield 1st arg is arith.maximumf
+  {
+    producerOutput = yieldOp->getOperand(0);
+    producer = producerOutput.getDefiningOp();
+    if (!producer || producer->getNumOperands() == 0) {
+      return failure();
+    }
+    if (!matchPattern(producer, m_Op<arith::MaximumFOp>())) {
+      return failure();
+    }
+  }
+
+  // Producer of linalg.yield op 2nd arg is arith.select
+  // TODO: Add check that select is selecting between linalg.index and index of
+  // current max.
+  {
+    producerOutput = yieldOp->getOperand(1);
+    producer = producerOutput.getDefiningOp();
+    if (!producer || producer->getNumOperands() == 0) {
+      return failure();
+    }
+    if (!matchPattern(producer, m_Op<arith::SelectOp>())) {
+      return failure();
+    }
+  }
+
+  // Producer of arith.select op is arith.cmpf
+  {
+    producerOutput = producer->getOperand(0);
+    producer = producerOutput.getDefiningOp();
+    if (!producer || producer->getNumOperands() == 0) {
+      return failure();
+    }
+    auto producerCmpFOp = dyn_cast<arith::CmpFOp>(producer);
+    if (!producerCmpFOp) {
+      return failure();
+    }
+    if (producerCmpFOp.getPredicate() != arith::CmpFPredicate::OGT) {
+      return failure();
+    }
+
+    // Check that in and out of cmpf are loop variables.
+    // Currently first operand is disabled because it may be mixed type
+    // which would lead it to be extf(%arg0).
+    // TODO: Add better mixed type support check.
+    if (producer->getOperand(1) != genericOp.getBody()->getArgument(1)) {
+      return failure();
+    }
+  }
+
+  return success();
 }
 
 //===---------------------------------------------------------------------===//
@@ -829,8 +1317,48 @@ replaceNonTrivialUse(RewriterBase &rewriter, Location loc, OpOperand &use,
       newSubviewOp->print(llvm::dbgs(), OpPrintingFlags().assumeVerified());
       llvm::dbgs() << "\n";
     });
-    return SmallVector<Value>(newSubviewOp->result_begin(),
-                              newSubviewOp->result_end());
+    return llvm::to_vector_of<Value>(newSubviewOp->getResults());
+  }
+  if (auto expandOp = dyn_cast<memref::ExpandShapeOp>(user)) {
+    auto currResultType =
+        llvm::cast<MemRefType>(expandOp.getResult().getType());
+    auto newSourceType = llvm::cast<MemRefType>(replacement.getType());
+
+    FailureOr<MemRefType> newResultType =
+        memref::ExpandShapeOp::computeExpandedType(
+            newSourceType, currResultType.getShape(),
+            expandOp.getReassociationIndices());
+    if (failed(newResultType)) {
+      return std::nullopt;
+    }
+
+    auto newExpandOp = rewriter.create<memref::ExpandShapeOp>(
+        loc, *newResultType, replacement, expandOp.getReassociation(),
+        expandOp.getOutputShape(), expandOp.getStaticOutputShape());
+    LLVM_DEBUG({
+      llvm::dbgs() << "\t\tNew user : ";
+      newExpandOp->print(llvm::dbgs(), OpPrintingFlags().assumeVerified());
+      llvm::dbgs() << "\n";
+    });
+    return llvm::to_vector_of<Value>(newExpandOp->getResults());
+  }
+  if (auto collapseOp = dyn_cast<memref::CollapseShapeOp>(user)) {
+    auto newSourceType = llvm::cast<MemRefType>(replacement.getType());
+    FailureOr<MemRefType> newResultType =
+        memref::CollapseShapeOp::computeCollapsedType(
+            newSourceType, collapseOp.getReassociationIndices());
+    if (failed(newResultType)) {
+      return std::nullopt;
+    }
+
+    auto newCollapseOp = rewriter.create<memref::CollapseShapeOp>(
+        loc, *newResultType, replacement, collapseOp.getReassociation());
+    LLVM_DEBUG({
+      llvm::dbgs() << "\t\tNew user : ";
+      newCollapseOp->print(llvm::dbgs(), OpPrintingFlags().assumeVerified());
+      llvm::dbgs() << "\n";
+    });
+    return llvm::to_vector_of<Value>(newCollapseOp->getResults());
   }
   return std::nullopt;
 }
@@ -858,7 +1386,7 @@ void replaceMemrefUsesAndPropagateType(RewriterBase &rewriter, Location loc,
       for (OpOperand &use : original.getUses()) {
         Operation *user = use.getOwner();
         // Some uses cannot be replaced.
-        if (isa<func::ReturnOp, scf::YieldOp>(user)) {
+        if (user->hasTrait<OpTrait::ReturnLike>()) {
           LLVM_DEBUG({
             llvm::dbgs() << "\tUnhandled user : ";
             user->print(llvm::dbgs(), OpPrintingFlags().assumeVerified());
@@ -944,10 +1472,10 @@ void sinkOpsInCFG(const SmallVector<Operation *> &allocs,
 }
 
 /// Infer the number of workgroups from exportOp.
-SmallVector<int64_t> getStaticNumWorkgroups(func::FuncOp funcOp) {
+SmallVector<int64_t> getStaticNumWorkgroups(mlir::FunctionOpInterface funcOp) {
   SmallVector<int64_t> result;
-  FailureOr<IREE::HAL::ExecutableExportOp> exportOp = getEntryPoint(funcOp);
-  if (failed(exportOp))
+  std::optional<IREE::HAL::ExecutableExportOp> exportOp = getEntryPoint(funcOp);
+  if (!exportOp)
     return result;
 
   Block *body = exportOp->getWorkgroupCountBody();
@@ -962,7 +1490,7 @@ SmallVector<int64_t> getStaticNumWorkgroups(func::FuncOp funcOp) {
     if (auto indexOp = dyn_cast_or_null<arith::ConstantIndexOp>(defOp)) {
       result.push_back(indexOp.value());
     } else {
-      return SmallVector<int64_t>();
+      result.push_back(ShapedType::kDynamic);
     }
   }
 
@@ -983,9 +1511,283 @@ bool hasFusedLeadingOp(linalg::LinalgOp rootOp) {
     backwardSlice.set_union(tmpBackwardSlice);
   }
 
-  return llvm::any_of(backwardSlice, [](Operation *op) {
-    return llvm::isa<linalg::LinalgOp>(op);
+  return llvm::any_of(backwardSlice, llvm::IsaPred<linalg::LinalgOp>);
+}
+
+std::optional<vector::VscaleRange>
+getDefaultVscaleRange(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  if (isAArch64(targetAttr)) {
+    // On AArch64 the scalable vector length will always be between 128-bit and
+    // 2048-bit. This works out as a vscale range of 1 to 16. See:
+    // https://developer.arm.com/Architectures/Scalable%20Vector%20Extensions
+    return vector::VscaleRange{1, 16};
+  }
+  // TODO: Implement for other architectures.
+  return std::nullopt;
+}
+
+FailureOr<DimBoundSize>
+computeDimUpperBound(Value shapedValue, unsigned dimNum,
+                     std::optional<vector::VscaleRange> vscaleRange,
+                     RoundUpVscaleMultiple roundUp) {
+  if (!vscaleRange.has_value()) {
+    FailureOr<int64_t> maybeDimBoundSize =
+        ValueBoundsConstraintSet::computeConstantBound(
+            presburger::BoundType::UB, {shapedValue, dimNum},
+            /*stopCondition=*/nullptr, /*closedUB=*/true);
+    if (succeeded(maybeDimBoundSize))
+      return DimBoundSize{/*baseSize=*/*maybeDimBoundSize,
+                          /*scalable=*/false};
+    return failure();
+  }
+  FailureOr<DimBound> maybeDimBound =
+      vector::ScalableValueBoundsConstraintSet::computeScalableBound(
+          shapedValue, dimNum,
+          /*vscaleMin=*/vscaleRange->vscaleMin,
+          /*vscaleMax=*/vscaleRange->vscaleMax, presburger::BoundType::UB);
+  if (failed(maybeDimBound))
+    return failure();
+  auto boundSize = maybeDimBound->getSize();
+  if (succeeded(boundSize))
+    return boundSize;
+  if (roundUp == RoundUpVscaleMultiple::No)
+    return failure();
+  // If the upper bound map is of the form `add(subExpr, cst)` (cst <= 0),
+  // round it up to `subExpr` (and try matching the bound again).
+  auto binOp = dyn_cast<AffineBinaryOpExpr>(maybeDimBound->map.getResult(0));
+  if (!binOp || binOp.getKind() != AffineExprKind::Add)
+    return failure();
+  auto cst = dyn_cast<AffineConstantExpr>(binOp.getRHS());
+  if (!cst || cst.getValue() > 0)
+    return failure();
+  DimBound roundedDimBound{AffineMap::get(maybeDimBound->map.getNumDims(),
+                                          maybeDimBound->map.getNumSymbols(),
+                                          binOp.getLHS())};
+  return roundedDimBound.getSize();
+}
+
+static bool isFullSlice(ArrayRef<OpFoldResult> mixedOffsets,
+                        ArrayRef<OpFoldResult> mixedSizes,
+                        ArrayRef<OpFoldResult> mixedStrides,
+                        IREE::Flow::DispatchTensorType tensorType,
+                        ValueRange dynamicDims) {
+  OpBuilder builder(tensorType.getContext());
+  SmallVector<int64_t> tensorShape = llvm::to_vector(tensorType.getShape());
+  SmallVector<OpFoldResult> mixedTensorShape =
+      mlir::getMixedValues(tensorShape, dynamicDims, builder);
+  return areAllConstantIntValue(mixedOffsets, 0) &&
+         areAllConstantIntValue(mixedStrides, 1) &&
+         mixedTensorShape == mixedSizes;
+}
+
+bool isFullSlice(OffsetSizeAndStrideOpInterface sliceLoadStoreOp,
+                 IREE::Flow::DispatchTensorType tensorType,
+                 ValueRange dynamicDims) {
+  return isFullSlice(
+      sliceLoadStoreOp.getMixedOffsets(), sliceLoadStoreOp.getMixedSizes(),
+      sliceLoadStoreOp.getMixedStrides(), tensorType, dynamicDims);
+}
+
+//===----------------------------------------------------------------------===//
+// Utility functions for vector size inference for dynamic shapes
+//===----------------------------------------------------------------------===//
+
+std::optional<VectorizationTileSizes>
+inferSizesFromIR(linalg::LinalgOp linalgOp, std::optional<OpResult> opResult) {
+  LLVM_DEBUG({
+    llvm::dbgs() << "Inferring sizes for:\n" << linalgOp;
+    if (opResult) {
+      llvm::dbgs() << " with OpResult.resultNumber="
+                   << opResult->getResultNumber();
+    }
+    llvm::dbgs() << '\n';
   });
+
+  std::optional<vector::VscaleRange> vscaleRange;
+  if (!opResult) {
+    // Note: Inferring scalable sizes is not supported is `opResult` is set
+    // (which is used to compute sizes for tensor.pack/unpack).
+    auto targetAttr = IREE::HAL::ExecutableTargetAttr::lookup(linalgOp);
+    vscaleRange = getDefaultVscaleRange(targetAttr);
+  }
+
+  VectorizationTileSizes result;
+  unsigned numDims = linalgOp.getNumLoops();
+  for (int dim = 0; dim < numDims; ++dim) {
+    // Map dimension `dim` to an operand dimension that we will use to
+    // traverse the U-D chain to get `dim` vector size information.
+    SmallVector<std::pair<Value, unsigned>> operandDimPairs;
+    linalgOp.mapIterationSpaceDimToAllOperandDims(dim, operandDimPairs);
+    if (operandDimPairs.empty()) {
+      return std::nullopt;
+    }
+
+    Value firstOperand = operandDimPairs[0].first;
+    unsigned firstOperandDim = operandDimPairs[0].second;
+
+    // Trivial case: `dim` size is available in the operand type.
+    int64_t dimSize = llvm::cast<ShapedType>(firstOperand.getType())
+                          .getShape()[firstOperandDim];
+    bool dimScalable = false;
+    if (!ShapedType::isDynamic(dimSize)) {
+      result.vectorSizes.push_back(dimSize);
+      result.vectorScalableFlags.push_back(dimScalable);
+      LLVM_DEBUG(llvm::dbgs() << "Inferred iteration size '" << dimSize
+                              << "' for dimension '" << dim << "'\n");
+      continue;
+    }
+
+    // Use ValueBounds analysis to infer `dim` size upper bound.
+    FailureOr<DimBoundSize> maybeDimBound;
+    for (auto operandDimPair : operandDimPairs) {
+      Value operand = operandDimPair.first;
+      unsigned operandDim = operandDimPair.second;
+      maybeDimBound = computeDimUpperBound(operand, operandDim, vscaleRange,
+                                           RoundUpVscaleMultiple::Yes);
+      if (succeeded(maybeDimBound)) {
+        break;
+      }
+    }
+
+    if (failed(maybeDimBound)) {
+      return std::nullopt;
+    }
+
+    dimSize = maybeDimBound->baseSize;
+    dimScalable = maybeDimBound->scalable;
+    result.vectorSizes.push_back(dimSize);
+    result.vectorScalableFlags.push_back(dimScalable);
+
+    LLVM_DEBUG(llvm::dbgs() << "Inferred iteration size '" << dimSize
+                            << (dimScalable ? " x vscale" : "")
+                            << "' for dimension '" << dim << "'\n");
+  }
+
+  if (opResult) {
+    assert(!llvm::is_contained(result.vectorScalableFlags, true) &&
+           "inferring scalable bounds with `opResult` not supported!");
+    result.destShape = linalgOp.getIndexingMapMatchingResult(opResult.value())
+                           .compose(result.vectorSizes);
+  }
+
+  return result;
+}
+
+std::optional<VectorizationTileSizes> inferSizesFromIR(tensor::PackOp op) {
+  LLVM_DEBUG(llvm::dbgs() << "Inferring dest sizes for:\n" << op << "\n");
+
+  if (llvm::any_of(op.getInnerTiles(), [](OpFoldResult v) {
+        return !getConstantIntValue(v).has_value();
+      })) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "skip, because inner_tiles are not all constant");
+    return std::nullopt;
+  }
+
+  VectorizationTileSizes result;
+  std::optional<VectorizationTileSizes> inferred =
+      inferSizesFromIR(op.getSource());
+  if (!inferred) {
+    return std::nullopt;
+  }
+  result.vectorSizes = inferred.value().destShape;
+
+  for (auto [dimPos, tileSize] :
+       llvm::zip_equal(op.getInnerDimsPos(), op.getStaticInnerTiles())) {
+    if (result.vectorSizes[dimPos] % tileSize != 0) {
+      return std::nullopt;
+    }
+    result.vectorSizes[dimPos] /= tileSize;
+  }
+  auto outerDimsPerm = op.getOuterDimsPerm();
+  if (!outerDimsPerm.empty()) {
+    applyPermutationToVector(result.vectorSizes, outerDimsPerm);
+  }
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "After adjustment with inner tiles and "
+                    "outer_dims_perm:\n";
+    for (auto [idx, val] : llvm::enumerate(result.vectorSizes)) {
+      llvm::dbgs() << "Dim #" << idx << ": " << val << "\n";
+    }
+  });
+  result.destShape = result.vectorSizes;
+
+  return result;
+}
+
+std::optional<VectorizationTileSizes> inferSizesFromIR(tensor::UnPackOp op) {
+  LLVM_DEBUG(llvm::dbgs() << "Inferring dest sizes for:\n" << op << "\n");
+
+  if (llvm::any_of(op.getInnerTiles(), [](OpFoldResult v) {
+        return !getConstantIntValue(v).has_value();
+      })) {
+    LLVM_DEBUG(
+        llvm::dbgs()
+        << "failed on inference because inner_tiles are not all constant");
+    return std::nullopt;
+  }
+
+  VectorizationTileSizes result;
+  std::optional<VectorizationTileSizes> inferred =
+      inferSizesFromIR(op.getSource());
+  if (!inferred) {
+    return std::nullopt;
+  }
+  result.vectorSizes = inferred.value().destShape;
+
+  result.vectorSizes.resize(op.getDestType().getRank());
+  auto outerDimsPerm = op.getOuterDimsPerm();
+  if (!outerDimsPerm.empty()) {
+    applyPermutationToVector(result.vectorSizes,
+                             invertPermutationVector(outerDimsPerm));
+  }
+  for (auto [dimPos, tileSize] :
+       llvm::zip_equal(op.getInnerDimsPos(), op.getStaticInnerTiles())) {
+    result.vectorSizes[dimPos] *= tileSize;
+  }
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "After adjustment with inner tiles and "
+                    "outer_dims_perm:\n";
+    for (auto [idx, val] : llvm::enumerate(result.vectorSizes)) {
+      llvm::dbgs() << "Dim #" << idx << ": " << val << "\n";
+    }
+  });
+  result.destShape = result.vectorSizes;
+
+  return result;
+}
+
+std::optional<VectorizationTileSizes> inferSizesFromIR(Value val) {
+  std::optional<VectorizationTileSizes> result;
+  TypeSwitch<Operation *, void>(val.getDefiningOp())
+      .Case<linalg::LinalgOp>(
+          [&](auto op) { result = inferSizesFromIR(op, cast<OpResult>(val)); })
+      .Case<tensor::PackOp>([&](auto op) { result = inferSizesFromIR(op); })
+      .Case<tensor::ExtractSliceOp>([&](tensor::ExtractSliceOp op) {
+        // tensor::ExtractSliceOp is not vectorizable, so only `destShape` has
+        // the values.
+        result = VectorizationTileSizes();
+        LLVM_DEBUG(llvm::dbgs() << "Inferring sizes for:\n" << op << "\n");
+        int64_t destRank = op.getResult().getType().getRank();
+        for (int dim = 0; dim < destRank; ++dim) {
+          LLVM_DEBUG(llvm::dbgs() << "Dim #" << dim << ": ");
+          FailureOr<int64_t> maybeDimBound =
+              ValueBoundsConstraintSet::computeConstantBound(
+                  presburger::BoundType::UB, {op, dim},
+                  /*stopCondition=*/nullptr, /*closedUB=*/true);
+          if (failed(maybeDimBound)) {
+            LLVM_DEBUG(llvm::dbgs() << "failed\n");
+            result = std::nullopt;
+            return;
+          }
+          LLVM_DEBUG(llvm::dbgs() << maybeDimBound.value() << "\n");
+          result->destShape.push_back(maybeDimBound.value());
+        }
+      })
+      .Default([&](Operation *) {});
+  return result;
 }
 
 } // namespace mlir::iree_compiler

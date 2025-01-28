@@ -47,7 +47,7 @@ graph LR
     [official documentation](https://www.tensorflow.org/install):
 
     ```shell
-    python -m pip install tf-nightly
+    python -m pip install tensorflow
     ```
 
 2. Install IREE packages, either by
@@ -56,27 +56,27 @@ graph LR
 
     === "Stable releases"
 
-        Stable release packages are
-        [published to PyPI](https://pypi.org/user/google-iree-pypi-deploy/).
+        Stable release packages are [published to PyPI](https://pypi.org/).
 
         ``` shell
         python -m pip install \
-          iree-compiler \
-          iree-runtime \
+          iree-base-compiler \
+          iree-base-runtime \
           iree-tools-tflite
         ```
 
     === ":material-alert: Nightly releases"
 
         Nightly releases are published on
-        [GitHub releases](https://github.com/openxla/iree/releases).
+        [GitHub releases](https://github.com/iree-org/iree/releases).
 
         ``` shell
         python -m pip install \
           --find-links https://iree.dev/pip-release-links.html \
           --upgrade \
-          iree-compiler \
-          iree-runtime \
+          --pre \
+          iree-base-compiler \
+          iree-base-runtime \
           iree-tools-tflite
         ```
 
@@ -200,19 +200,20 @@ print(iree_results)
 ## :octicons-code-16: Samples
 
 * The
-[tflitehub folder](https://github.com/iree-org/iree-samples/tree/main/tflitehub)
-in the [iree-samples repository](https://github.com/iree-org/iree-samples)
+[tflitehub folder](https://github.com/iree-org/iree-experimental/tree/main/tflitehub)
+in the
+[iree-experimental repository](https://github.com/iree-org/iree-experimental)
 contains test scripts to compile, run, and compare various TensorFlow Lite
 models sourced from [TensorFlow Hub](https://tfhub.dev/).
 
 * An example smoke test of the
-[TensorFlow Lite C API](https://github.com/openxla/iree/tree/main/runtime/bindings/tflite)
+[TensorFlow Lite C API](https://github.com/iree-org/iree/tree/main/runtime/bindings/tflite)
 is available
-[here](https://github.com/openxla/iree/blob/main/runtime/bindings/tflite/smoke_test.cc).
+[here](https://github.com/iree-org/iree/blob/main/runtime/bindings/tflite/smoke_test.cc).
 
 | Colab notebooks |  |
 | -- | -- |
-Text classification with TFLite and IREE | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openxla/iree/blob/main/samples/colab/tflite_text_classification.ipynb)
+Text classification with TFLite and IREE | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree/blob/main/samples/colab/tflite_text_classification.ipynb)
 
 ## :octicons-question-16: Troubleshooting
 

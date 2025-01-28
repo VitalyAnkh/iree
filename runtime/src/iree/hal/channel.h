@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 #include "iree/base/api.h"
-#include "iree/hal/allocator.h"
+#include "iree/hal/queue.h"
 #include "iree/hal/resource.h"
 
 #ifdef __cplusplus
@@ -30,11 +30,11 @@ enum iree_hal_channel_flag_bits_t {
 typedef uint32_t iree_hal_channel_flags_t;
 
 // Specifies that the channel should use environment settings if available.
-#define IREE_HAL_CHANNEL_RANK_DEFAULT ((int32_t)-1)
-#define IREE_HAL_CHANNEL_COUNT_DEFAULT ((int32_t)-1)
+#define IREE_HAL_CHANNEL_RANK_DEFAULT ((int32_t) - 1)
+#define IREE_HAL_CHANNEL_COUNT_DEFAULT ((int32_t) - 1)
 
 // Indicates that the rank will not be part of any group.
-#define IREE_HAL_CHANNEL_NO_COLOR ((int32_t)-1)
+#define IREE_HAL_CHANNEL_NO_COLOR ((int32_t) - 1)
 
 // Parameters defining how a channel should be configured.
 typedef struct {

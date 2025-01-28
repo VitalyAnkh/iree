@@ -147,19 +147,21 @@ void FuncOp::setReflectionAttr(StringRef name, Attribute value) {
   // TODO(benvanik): remove reflection attrs as a concept and use something more
   // MLIRish like an attribute interface/dialect interface.
   // DictionaryAttr is not very friendly for modification :/
-  auto existingAttr =
-      getOperation()->getAttrOfType<DictionaryAttr>("iree.reflection");
-  SmallVector<NamedAttribute> attrs(existingAttr.begin(), existingAttr.end());
+  SmallVector<NamedAttribute> attrs;
+  if (auto existingAttr =
+          getOperation()->getAttrOfType<DictionaryAttr>("iree.reflection")) {
+    llvm::append_range(attrs, existingAttr);
+  }
   bool didFind = false;
-  for (size_t i = 0; i < attrs.size(); ++i) {
-    if (attrs[i].getName() == name) {
-      attrs[i].setValue(value);
+  for (NamedAttribute &attr : attrs) {
+    if (attr.getName() == name) {
+      attr.setValue(value);
       didFind = true;
       break;
     }
   }
   if (!didFind) {
-    attrs.push_back(NamedAttribute(StringAttr::get(getContext(), name), value));
+    attrs.emplace_back(name, value);
     DictionaryAttr::sortInPlace(attrs);
   }
   getOperation()->setAttr("iree.reflection",
@@ -419,6 +421,60 @@ Block *InitializerOp::addBlock() {
 // Globals
 //===----------------------------------------------------------------------===//
 
+IREE::Util::GlobalLoadOpInterface
+GlobalI32Op::createLoadOp(Location loc, OpBuilder &builder) {
+  return builder.create<IREE::VM::GlobalLoadI32Op>(loc, builder.getI32Type(),
+                                                   getGlobalName());
+}
+IREE::Util::GlobalStoreOpInterface
+GlobalI32Op::createStoreOp(Location loc, Value value, OpBuilder &builder) {
+  return builder.create<IREE::VM::GlobalStoreI32Op>(loc, value,
+                                                    getGlobalName());
+}
+
+IREE::Util::GlobalLoadOpInterface
+GlobalI64Op::createLoadOp(Location loc, OpBuilder &builder) {
+  return builder.create<IREE::VM::GlobalLoadI64Op>(loc, builder.getI64Type(),
+                                                   getGlobalName());
+}
+IREE::Util::GlobalStoreOpInterface
+GlobalI64Op::createStoreOp(Location loc, Value value, OpBuilder &builder) {
+  return builder.create<IREE::VM::GlobalStoreI64Op>(loc, value,
+                                                    getGlobalName());
+}
+
+IREE::Util::GlobalLoadOpInterface
+GlobalF32Op::createLoadOp(Location loc, OpBuilder &builder) {
+  return builder.create<IREE::VM::GlobalLoadF32Op>(loc, builder.getF32Type(),
+                                                   getGlobalName());
+}
+IREE::Util::GlobalStoreOpInterface
+GlobalF32Op::createStoreOp(Location loc, Value value, OpBuilder &builder) {
+  return builder.create<IREE::VM::GlobalStoreF32Op>(loc, value,
+                                                    getGlobalName());
+}
+
+IREE::Util::GlobalLoadOpInterface
+GlobalF64Op::createLoadOp(Location loc, OpBuilder &builder) {
+  return builder.create<IREE::VM::GlobalLoadF64Op>(loc, builder.getF64Type(),
+                                                   getGlobalName());
+}
+IREE::Util::GlobalStoreOpInterface
+GlobalF64Op::createStoreOp(Location loc, Value value, OpBuilder &builder) {
+  return builder.create<IREE::VM::GlobalStoreF64Op>(loc, value,
+                                                    getGlobalName());
+}
+
+IREE::Util::GlobalLoadOpInterface
+GlobalRefOp::createLoadOp(Location loc, OpBuilder &builder) {
+  return builder.create<IREE::VM::GlobalLoadRefOp>(loc, getType(),
+                                                   getSymName());
+}
+IREE::Util::GlobalStoreOpInterface
+GlobalRefOp::createStoreOp(Location loc, Value value, OpBuilder &builder) {
+  return builder.create<IREE::VM::GlobalStoreRefOp>(loc, value, getSymName());
+}
+
 template <typename T>
 static void addMemoryEffectsForGlobal(
     Operation *op, mlir::FlatSymbolRefAttr global,
@@ -555,11 +611,11 @@ static TypedAttr convertConstIntegerValue(TypedAttr value) {
 static FloatType getFloatType(int bitwidth, MLIRContext *context) {
   switch (bitwidth) {
   case 16:
-    return FloatType::getF16(context);
+    return Float16Type::get(context);
   case 32:
-    return FloatType::getF32(context);
+    return Float32Type::get(context);
   case 64:
-    return FloatType::getF64(context);
+    return Float64Type::get(context);
   default:
     assert(false && "unhandled floating point type");
     return {};
@@ -735,12 +791,12 @@ void RodataOp::build(OpBuilder &builder, OperationState &result, StringRef name,
   result.addAttributes(attrs);
 }
 
-LogicalResult ConstRefRodataOp::verify() {
+LogicalResult
+ConstRefRodataOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   Operation *op = getOperation();
-  auto *rodataOp =
-      op->getParentOfType<VM::ModuleOp>().lookupSymbol(getRodata());
-  if (!rodataOp) {
-    return op->emitOpError() << "Undefined rodata section: " << getRodata();
+  if (!symbolTable.lookupNearestSymbolFrom(op, getRodataAttr())) {
+    return op->emitError() << "undefined rodata section: '" << getRodata()
+                           << "'";
   }
   return success();
 }
@@ -789,7 +845,7 @@ static std::string makeSafeIdentifier(StringRef unsafeIdentifier) {
     }
   }
   std::string prefix = os.str().substr(0, 32);
-  if (!StringRef(prefix).endswith("_")) {
+  if (!StringRef(prefix).ends_with("_")) {
     prefix += "_";
   }
   return prefix + llvm::utohexstr(static_cast<uint64_t>(
@@ -808,6 +864,34 @@ void RodataInlineOp::build(OpBuilder &builder, OperationState &result,
         /*mimeType=*/nullptr);
 }
 
+void RodataTableInlineOp::build(OpBuilder &builder, OperationState &result,
+                                StringAttr name, IntegerType tableType,
+                                ArrayAttr value) {
+  // Make an identifier-friendly version of the string so that the value is
+  // more readable in IR (so "I'm some string" becomes "im_some_string", etc).
+  auto safeIdentifier = makeSafeIdentifier(name.getValue());
+  // Make names for the table and data based on the safe identifier.
+  std::string tableName = safeIdentifier + "_table";
+  std::string dataName = safeIdentifier + "_data";
+  auto refType =
+      IREE::VM::RefType::get(IREE::VM::BufferType::get(builder.getContext()));
+  build(builder, result, TypeRange{refType, refType},
+        /*tableName=*/builder.getStringAttr(tableName),
+        /*dataName=*/builder.getStringAttr(dataName), /*tableType=*/tableType,
+        /*dataArray=*/value,
+        /*alignment=*/nullptr, /*dataAlignment=*/nullptr, /*mimeType=*/nullptr);
+}
+
+void RodataTableInlineOp::build(OpBuilder &builder, OperationState &result,
+                                IntegerType tableType, ArrayAttr value) {
+  auto refType =
+      IREE::VM::RefType::get(IREE::VM::BufferType::get(builder.getContext()));
+  build(builder, result, TypeRange{refType, refType},
+        /*tableName=*/nullptr, /*dataName=*/nullptr, /*tableType=*/tableType,
+        /*dataArray=*/value, /*alignment=*/nullptr, /*dataAlignment=*/nullptr,
+        /*mimeType=*/nullptr);
+}
+
 //===----------------------------------------------------------------------===//
 // Lists
 //===----------------------------------------------------------------------===//
@@ -815,7 +899,7 @@ void RodataInlineOp::build(OpBuilder &builder, OperationState &result,
 LogicalResult ListGetRefOp::verify() {
   Operation *op = getOperation();
   auto listType = llvm::cast<IREE::VM::ListType>(
-      getList().getType().cast<IREE::VM::RefType>().getObjectType());
+      cast<IREE::VM::RefType>(getList().getType()).getObjectType());
   auto elementType = listType.getElementType();
   auto resultType = getResult().getType();
   if (!llvm::isa<IREE::VM::OpaqueType>(elementType)) {
@@ -840,7 +924,7 @@ LogicalResult ListGetRefOp::verify() {
 LogicalResult ListSetRefOp::verify() {
   Operation *op = getOperation();
   auto listType = llvm::cast<IREE::VM::ListType>(
-      getList().getType().cast<IREE::VM::RefType>().getObjectType());
+      cast<IREE::VM::RefType>(getList().getType()).getObjectType());
   auto elementType = listType.getElementType();
   auto valueType = getValue().getType();
   if (!llvm::isa<IREE::VM::OpaqueType>(elementType)) {

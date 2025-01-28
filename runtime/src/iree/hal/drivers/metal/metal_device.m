@@ -14,12 +14,11 @@
 #include "iree/hal/drivers/metal/direct_allocator.h"
 #include "iree/hal/drivers/metal/direct_command_buffer.h"
 #include "iree/hal/drivers/metal/nop_executable_cache.h"
-#include "iree/hal/drivers/metal/pipeline_layout.h"
 #include "iree/hal/drivers/metal/shared_event.h"
 #include "iree/hal/drivers/metal/staging_buffer.h"
-#include "iree/hal/utils/buffer_transfer.h"
+#include "iree/hal/utils/deferred_command_buffer.h"
+#include "iree/hal/utils/file_registry.h"
 #include "iree/hal/utils/file_transfer.h"
-#include "iree/hal/utils/memory_file.h"
 #include "iree/hal/utils/resource_set.h"
 
 typedef struct iree_hal_metal_device_t {
@@ -123,7 +122,7 @@ static iree_status_t iree_hal_metal_device_create_internal(
       initWithDispatchQueue:device->semaphore_notification_queue];  // +1
   device->capture_manager = NULL;
 
-  iree_status_t status = iree_hal_metal_allocator_create(metal_device,
+  iree_status_t status = iree_hal_metal_allocator_create((iree_hal_device_t*)device, metal_device,
 #if defined(IREE_PLATFORM_MACOS)
                                                          metal_queue,
 #endif  // IREE_PLATFORM_MACOS
@@ -217,7 +216,13 @@ static iree_status_t iree_hal_metal_device_trim(iree_hal_device_t* base_device) 
 static iree_status_t iree_hal_metal_device_query_i64(iree_hal_device_t* base_device,
                                                      iree_string_view_t category,
                                                      iree_string_view_t key, int64_t* out_value) {
+  iree_hal_metal_device_t* device = iree_hal_metal_device_cast(base_device);
   *out_value = 0;
+
+  if (iree_string_view_equal(category, IREE_SV("hal.device.id"))) {
+    *out_value = iree_string_view_match_pattern(device->identifier, key) ? 1 : 0;
+    return iree_ok_status();
+  }
 
   if (iree_string_view_equal(category, iree_make_cstring_view("hal.executable.format"))) {
     *out_value = iree_string_view_equal(key, iree_make_cstring_view("metal-msl-fb")) ? 1 : 0;
@@ -242,11 +247,18 @@ static iree_status_t iree_hal_metal_device_create_command_buffer(
     iree_host_size_t binding_capacity, iree_hal_command_buffer_t** out_command_buffer) {
   iree_hal_metal_device_t* device = iree_hal_metal_device_cast(base_device);
 
-  if (iree_any_bit_set(mode, IREE_HAL_COMMAND_BUFFER_MODE_NESTED))
-    return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "nested command buffer not yet supported");
-  if (!iree_all_bits_set(mode, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT))
-    return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                            "multi-shot command buffer not yet supported");
+  // Native Metal command buffers are not reusable so we emulate by recording into our own reusable
+  // instance. This will be replayed against a Metal command buffer upon submission.
+  //
+  // TODO(indirect-cmd): natively support indirect command buffers in Metal via
+  // MTLIndirectCommandBuffer. We could switch to exclusively using that for all modes to keep the
+  // number of code paths down. MTLIndirectCommandBuffer is both reusable and has what we require
+  // for argument buffer updates to pass in binding tables.
+  if (!iree_all_bits_set(mode, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT) || binding_capacity > 0) {
+    return iree_hal_deferred_command_buffer_create(
+        device->device_allocator, mode, command_categories, queue_affinity, binding_capacity,
+        &device->block_pool, device->host_allocator, out_command_buffer);
+  }
 
   return iree_hal_metal_direct_command_buffer_create(
       base_device, mode, command_categories, binding_capacity,
@@ -255,16 +267,9 @@ static iree_status_t iree_hal_metal_device_create_command_buffer(
       out_command_buffer);
 }
 
-static iree_status_t iree_hal_metal_device_create_descriptor_set_layout(
-    iree_hal_device_t* base_device, iree_hal_descriptor_set_layout_flags_t flags,
-    iree_host_size_t binding_count, const iree_hal_descriptor_set_layout_binding_t* bindings,
-    iree_hal_descriptor_set_layout_t** out_descriptor_set_layout) {
-  iree_hal_metal_device_t* device = iree_hal_metal_device_cast(base_device);
-  return iree_hal_metal_descriptor_set_layout_create(
-      flags, binding_count, bindings, device->host_allocator, out_descriptor_set_layout);
-}
-
 static iree_status_t iree_hal_metal_device_create_event(iree_hal_device_t* base_device,
+                                                        iree_hal_queue_affinity_t queue_affinity,
+                                                        iree_hal_event_flags_t flags,
                                                         iree_hal_event_t** out_event) {
   return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "event not yet supported");
 }
@@ -283,26 +288,13 @@ static iree_status_t iree_hal_metal_device_import_file(iree_hal_device_t* base_d
                                                        iree_io_file_handle_t* handle,
                                                        iree_hal_external_file_flags_t flags,
                                                        iree_hal_file_t** out_file) {
-  if (iree_io_file_handle_type(handle) != IREE_IO_FILE_HANDLE_TYPE_HOST_ALLOCATION) {
-    return iree_make_status(IREE_STATUS_UNAVAILABLE,
-                            "implementation does not support the external file type");
-  }
-  return iree_hal_memory_file_wrap(queue_affinity, access, handle,
-                                   iree_hal_device_allocator(base_device),
-                                   iree_hal_device_host_allocator(base_device), out_file);
-}
-
-static iree_status_t iree_hal_metal_device_create_pipeline_layout(
-    iree_hal_device_t* base_device, iree_host_size_t push_constants,
-    iree_host_size_t set_layout_count, iree_hal_descriptor_set_layout_t* const* set_layouts,
-    iree_hal_pipeline_layout_t** out_pipeline_layout) {
-  iree_hal_metal_device_t* device = iree_hal_metal_device_cast(base_device);
-  return iree_hal_metal_pipeline_layout_create(set_layout_count, set_layouts, push_constants,
-                                               device->host_allocator, out_pipeline_layout);
+  return iree_hal_file_from_handle(iree_hal_device_allocator(base_device), queue_affinity, access,
+                                   handle, iree_hal_device_host_allocator(base_device), out_file);
 }
 
 static iree_status_t iree_hal_metal_device_create_semaphore(iree_hal_device_t* base_device,
                                                             uint64_t initial_value,
+                                                            iree_hal_semaphore_flags_t flags,
                                                             iree_hal_semaphore_t** out_semaphore) {
   iree_hal_metal_device_t* device = iree_hal_metal_device_cast(base_device);
   return iree_hal_metal_shared_event_create(device->device, initial_value, device->event_listener,
@@ -350,7 +342,7 @@ static iree_status_t iree_hal_metal_device_queue_read(
     const iree_hal_semaphore_list_t wait_semaphore_list,
     const iree_hal_semaphore_list_t signal_semaphore_list, iree_hal_file_t* source_file,
     uint64_t source_offset, iree_hal_buffer_t* target_buffer, iree_device_size_t target_offset,
-    iree_device_size_t length, uint32_t flags) {
+    iree_device_size_t length, iree_hal_read_flags_t flags) {
   // TODO: expose streaming chunk count/size options.
   iree_status_t loop_status = iree_ok_status();
   iree_hal_file_transfer_options_t options = {
@@ -369,7 +361,7 @@ static iree_status_t iree_hal_metal_device_queue_write(
     const iree_hal_semaphore_list_t wait_semaphore_list,
     const iree_hal_semaphore_list_t signal_semaphore_list, iree_hal_buffer_t* source_buffer,
     iree_device_size_t source_offset, iree_hal_file_t* target_file, uint64_t target_offset,
-    iree_device_size_t length, uint32_t flags) {
+    iree_device_size_t length, iree_hal_write_flags_t flags) {
   // TODO: expose streaming chunk count/size options.
   iree_status_t loop_status = iree_ok_status();
   iree_hal_file_transfer_options_t options = {
@@ -383,11 +375,43 @@ static iree_status_t iree_hal_metal_device_queue_write(
   return loop_status;
 }
 
+static iree_status_t iree_hal_metal_replay_command_buffer(
+    iree_hal_metal_device_t* device, iree_hal_command_buffer_t* deferred_command_buffer,
+    iree_hal_buffer_binding_table_t binding_table,
+    iree_hal_command_buffer_t** out_direct_command_buffer) {
+  IREE_TRACE_ZONE_BEGIN(z0);
+
+  // Create the transient command buffer. Note that it is one-shot and has no indirect bindings as
+  // we will be replaying it once with all the bindings resolved.
+  iree_hal_command_buffer_t* direct_command_buffer = NULL;
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_hal_metal_direct_command_buffer_create(
+              (iree_hal_device_t*)device, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+              iree_hal_command_buffer_allowed_categories(deferred_command_buffer),
+              /*binding_capacity=*/0, device->command_buffer_resource_reference_mode, device->queue,
+              &device->block_pool, &device->staging_buffer, device->builtin_executable,
+              device->host_allocator, &direct_command_buffer));
+
+  // Attempt to replay all commands against the transient command buffer. Note that this will fail
+  // if any binding does not meet the requirements - having succeeded when recording initially is
+  // not a guarantee that this will succeed.
+  iree_status_t status = iree_hal_deferred_command_buffer_apply(
+      deferred_command_buffer, direct_command_buffer, binding_table);
+
+  if (iree_status_is_ok(status)) {
+    *out_direct_command_buffer = direct_command_buffer;
+  } else {
+    iree_hal_command_buffer_release(direct_command_buffer);
+  }
+  IREE_TRACE_ZONE_END(z0);
+  return status;
+}
+
 static iree_status_t iree_hal_metal_device_queue_execute(
     iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
     const iree_hal_semaphore_list_t wait_semaphore_list,
-    const iree_hal_semaphore_list_t signal_semaphore_list, iree_host_size_t command_buffer_count,
-    iree_hal_command_buffer_t* const* command_buffers) {
+    const iree_hal_semaphore_list_t signal_semaphore_list,
+    iree_hal_command_buffer_t* command_buffer, iree_hal_buffer_binding_table_t binding_table) {
   iree_hal_metal_device_t* device = iree_hal_metal_device_cast(base_device);
   IREE_TRACE_ZONE_BEGIN(z0);
 
@@ -395,18 +419,39 @@ static iree_status_t iree_hal_metal_device_queue_execute(
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_hal_resource_set_allocate(&device->block_pool, &resource_set));
 
-  iree_status_t status =
-      iree_hal_resource_set_insert(resource_set, command_buffer_count, command_buffers);
-
   // Put the full semaphore list into a resource set, which retains them--we will need to access
   // them until the command buffer completes.
-  if (iree_status_is_ok(status)) {
-    status = iree_hal_resource_set_insert(resource_set, wait_semaphore_list.count,
-                                          wait_semaphore_list.semaphores);
-  }
+  iree_status_t status = iree_hal_resource_set_insert(resource_set, wait_semaphore_list.count,
+                                                      wait_semaphore_list.semaphores);
   if (iree_status_is_ok(status)) {
     status = iree_hal_resource_set_insert(resource_set, signal_semaphore_list.count,
                                           signal_semaphore_list.semaphores);
+  }
+
+  // Translate deferred command buffers into real Metal command buffers.
+  // We do this prior to beginning execution so that if we fail we don't leave the system in an
+  // inconsistent state.
+  iree_hal_command_buffer_t* direct_command_buffer = NULL;
+  if (iree_status_is_ok(status) && command_buffer) {
+    iree_hal_command_buffer_t* direct_command_buffer = NULL;
+    if (iree_hal_deferred_command_buffer_isa(command_buffer)) {
+      // Create a temporary command buffer and replay the deferred command buffer with the
+      // binding table provided. Note that any resources used will be retained by the command
+      // buffer so we only need to retain the command buffer itself instead of the binding
+      // tables provided.
+      @autoreleasepool {
+        status = iree_hal_metal_replay_command_buffer(device, command_buffer, binding_table,
+                                                      &direct_command_buffer);
+      }
+    } else {
+      // Retain the command buffer until the submission has completed.
+      iree_hal_command_buffer_retain(command_buffer);
+      direct_command_buffer = command_buffer;
+    }
+    if (iree_status_is_ok(status)) {
+      status = iree_hal_resource_set_insert(resource_set, 1, &direct_command_buffer);
+    }
+    iree_hal_command_buffer_release(direct_command_buffer);  // retained in resource set
   }
 
   if (iree_status_is_ok(status)) {
@@ -427,10 +472,14 @@ static iree_status_t iree_hal_metal_device_queue_execute(
       // Then commit all recorded compute command buffers, except the last one, which we will patch
       // up with semaphore signaling.
       id<MTLCommandBuffer> signal_command_buffer = nil;
-      for (iree_host_size_t i = 0; i < command_buffer_count; ++i) {
-        iree_hal_command_buffer_t* command_buffer = command_buffers[i];
-        id<MTLCommandBuffer> handle = iree_hal_metal_direct_command_buffer_handle(command_buffer);
-        if (i + 1 != command_buffer_count) [handle commit];
+      if (direct_command_buffer) {
+        // NOTE: translation happens above such that we always know these are direct command
+        // buffers.
+        //
+        // TODO(indirect-cmd): support indirect command buffers and switch here, or only use
+        // indirect command buffers and assume that instead.
+        id<MTLCommandBuffer> handle =
+            iree_hal_metal_direct_command_buffer_handle(direct_command_buffer);
         signal_command_buffer = handle;
       }
       if (signal_command_buffer == nil) {
@@ -556,16 +605,16 @@ static const iree_hal_device_vtable_t iree_hal_metal_device_vtable = {
     .query_i64 = iree_hal_metal_device_query_i64,
     .create_channel = iree_hal_metal_device_create_channel,
     .create_command_buffer = iree_hal_metal_device_create_command_buffer,
-    .create_descriptor_set_layout = iree_hal_metal_device_create_descriptor_set_layout,
     .create_event = iree_hal_metal_device_create_event,
     .create_executable_cache = iree_hal_metal_device_create_executable_cache,
     .import_file = iree_hal_metal_device_import_file,
-    .create_pipeline_layout = iree_hal_metal_device_create_pipeline_layout,
     .create_semaphore = iree_hal_metal_device_create_semaphore,
     .query_semaphore_compatibility = iree_hal_metal_device_query_semaphore_compatibility,
-    .transfer_range = iree_hal_device_submit_transfer_range_and_wait,
     .queue_alloca = iree_hal_metal_device_queue_alloca,
     .queue_dealloca = iree_hal_metal_device_queue_dealloca,
+    .queue_fill = iree_hal_device_queue_emulated_fill,
+    .queue_update = iree_hal_device_queue_emulated_update,
+    .queue_copy = iree_hal_device_queue_emulated_copy,
     .queue_read = iree_hal_metal_device_queue_read,
     .queue_write = iree_hal_metal_device_queue_write,
     .queue_execute = iree_hal_metal_device_queue_execute,

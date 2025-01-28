@@ -4,41 +4,57 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include <utility>
-
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree/compiler/Dialect/Encoding/IR/EncodingOps.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
-#include "iree/compiler/Dialect/Flow/Transforms/PassDetail.h"
-#include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
-#include "iree/compiler/Dialect/Util/IR/UtilOps.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Utils/StringUtils.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Debug.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StructuredOpsUtils.h"
+#include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
-#include "mlir/IR/IRMapping.h"
-#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/LogicalResult.h"
 
 #define DEBUG_TYPE "iree-dispatch"
 
 namespace mlir::iree_compiler::IREE::Flow {
+
+#define GEN_PASS_DEF_ANNOTATEDISPATCHESPASS
+#include "iree/compiler/Dialect/Flow/Transforms/Passes.h.inc"
+
+static constexpr int64_t kMaxCost = INT64_MAX;
+
 namespace {
 
+// This op estimates the cost of a list of perfectly nested loop ranges simply
+// as the product of ranges. Note that this does not take into account the cost
+// of the body of the op whose domain this computes.
 static int64_t costOfDomain(ArrayRef<int64_t> domain) {
   int64_t product = 1;
   for (int64_t size : domain) {
-    if (ShapedType::isDynamic(size))
-      return INT64_MAX;
-    product *= size;
+    int64_t multiplier = size;
+    if (ShapedType::isDynamic(size)) {
+      // HACK: Use a placeholder value for dynamic sizes. In practice, because
+      // we tend to require that iteration spaces of linalg ops line up for
+      // fusion to occur, more dynamic dims => a larger iteration domain.
+      // TODO: Query the upper bound of the dynamic size range instead.
+      multiplier = 1024;
+    }
+
+    // Preform saturating multiplication
+    if (product > kMaxCost / multiplier) {
+      return kMaxCost;
+    }
+    product *= multiplier;
   }
   return product;
-};
+}
 
 // Estimates the evaluation cost of a linalg op using a heuristic cost model.
 static int64_t estimateLinalgOpCost(linalg::LinalgOp op) {
@@ -80,7 +96,11 @@ static int64_t estimateLinalgExtOpCost(Operation *op) {
   // This is something like the extra log(N) factor for a sort or FFT, or
   // the amount of work done by a softmax vs a cheap elementwise on a tensor
   // of the same shape.
-  cost *= 10;
+  if (cost >= kMaxCost / 10) {
+    cost = kMaxCost;
+  } else {
+    cost *= 10;
+  }
   LLVM_DEBUG(llvm::dbgs() << "// " << op->getName() << " cost: " << cost
                           << "\n");
   return cost;
@@ -150,7 +170,7 @@ static std::string getLinalgDataTypes(linalg::LinalgOp op) {
 }
 
 /// Returns the op name without dialect name. E.g., it returns "set_encoding" if
-/// the input operation is iree_linalg_ext.set_encoding.
+/// the input operation is iree_encoding.set_encoding.
 static std::string getOpNameWithoutDialectName(Operation *op) {
   auto opName =
       op->getName().getStringRef().drop_until([](char c) { return c == '.'; });
@@ -159,13 +179,133 @@ static std::string getOpNameWithoutDialectName(Operation *op) {
   return opName.str();
 }
 
+static bool isMatvecLike(linalg::LinalgOp linalgOp) {
+  if (!linalg::isaContractionOpInterface(linalgOp))
+    return false;
+
+  FailureOr<linalg::ContractionDimensions> dims =
+      linalg::inferContractionDims(linalgOp);
+  if (failed(dims))
+    return false;
+
+  // One of the input should have all the parallel dimensions with size one.
+  SmallVector<int64_t, 4> bounds = linalgOp.getStaticLoopRanges();
+  SmallVector<AffineMap> maps = linalgOp.getIndexingMapsArray();
+  SmallVector<utils::IteratorType> iterators = linalgOp.getIteratorTypesArray();
+
+  auto areAllParallelDimsUnitSize = [&](AffineMap map) {
+    for (AffineExpr result : map.getResults()) {
+      // We have checked before that the affine map is projected permutation.
+      unsigned pos = cast<AffineDimExpr>(result).getPosition();
+      // For a parallel dim, the bounds can be non-one if it's batch dim.
+      if (iterators[pos] == utils::IteratorType::parallel && bounds[pos] != 1 &&
+          !llvm::is_contained(dims->batch, pos))
+        return false;
+    }
+    return true;
+  };
+
+  return areAllParallelDimsUnitSize(maps[0]) ||
+         areAllParallelDimsUnitSize(maps[1]);
+}
+
+static bool isMatmulLike(linalg::LinalgOp linalgOp) {
+  // Matmul should have at least 1 reduction, which is checked by the interface,
+  // and 2 parallel dimensions.
+  return linalg::isaContractionOpInterface(linalgOp) &&
+         linalgOp.getNumParallelLoops() >= 2;
+}
+
 static std::string summarizeLinalgOp(linalg::LinalgOp op) {
-  auto opName = op->getName().getStringRef();
-  if (!opName.consume_front("linalg."))
-    return "";
+  std::string prefix;
+
+  // Check if the op is a transpose and mark it as such for a better summary.
+  {
+    // Check if the body only contains a yield.
+    bool hasOnlyYield = op.getBlock()->without_terminator().empty();
+
+    // Check if the indexing maps are only permutations.
+    bool hasOnlyPermutation = true;
+    for (AffineMap map : op.getIndexingMapsArray()) {
+      if (!map.isPermutation()) {
+        hasOnlyPermutation = false;
+      }
+    }
+
+    if (hasOnlyYield && hasOnlyPermutation) {
+      prefix = "transpose";
+    }
+  }
+
+  // Categorize linalg.generic ops better. The following checks more specific
+  // cases before more general ones.
+  if (prefix.empty() && isa<linalg::GenericOp>(op)) {
+    SmallVector<AffineMap> indexingMaps = op.getIndexingMapsArray();
+    ArrayRef<AffineMap> inputMaps(indexingMaps.begin(),
+                                  indexingMaps.begin() + op.getNumDpsInputs());
+    ArrayRef<AffineMap> outputMaps(indexingMaps.begin() + op.getNumDpsInputs(),
+                                   indexingMaps.end());
+    bool isIdentityOuts =
+        llvm::all_of(outputMaps, [](AffineMap m) { return m.isIdentity(); });
+    bool isPermutationOuts =
+        llvm::all_of(outputMaps, [](AffineMap m) { return m.isPermutation(); });
+    bool isProjectedPermIns = llvm::all_of(
+        inputMaps, [](AffineMap m) { return m.isProjectedPermutation(true); });
+    int64_t numIdentityIn =
+        llvm::count_if(inputMaps, [](AffineMap m) { return m.isIdentity(); });
+    int64_t numPermutationIn = llvm::count_if(
+        inputMaps, [](AffineMap m) { return m.isPermutation(); });
+    // We categorize elementwise operations as follows:
+    //   1. All output maps are identity with the iteration space.
+    //   2. There is at least one input with an identity indexing map.
+    //   3. There are no permuted inputs that are not also broadcast.
+    //
+    // This categorization tells us that the dispatch includes limited or no
+    // non-trivial data movement.
+    bool hasIdentityInputRoot =
+        numIdentityIn > 0 && numIdentityIn == numPermutationIn;
+    if (isIdentityOuts && isProjectedPermIns && hasIdentityInputRoot) {
+      prefix = "elementwise";
+      // We draw a distinction between pure elementwise operations and
+      // elementwise operations that include a transpose. To separate
+      // transposes, there are two cases:
+      //   1. 2) and 3) hold for elementwise, but the output maps are instead
+      //      permutations.
+      //   2. The output maps are permutations or identity, and the most major
+      //      input indexing map is a permutation.
+    } else if (isPermutationOuts && isProjectedPermIns &&
+               ((hasIdentityInputRoot && !isIdentityOuts) ||
+                numPermutationIn > numIdentityIn)) {
+      prefix = "elementwise_transpose";
+      // Broadcasts are an indication that fusion went off the rails. We treat
+      // anything where all output maps are permutations, but the inputs are all
+      // projected permutations (without full rank) as a broadcast, which could
+      // potentially be fused with other elementwise operations/transposes.
+    } else if (isPermutationOuts && isProjectedPermIns &&
+               numPermutationIn == 0) {
+      prefix = "elementwise_broadcast";
+    } else if (isMatvecLike(op)) {
+      prefix = "matvec_like";
+    } else if (isMatmulLike(op)) {
+      prefix = "matmul_like";
+    } else if (linalg::isaContractionOpInterface(op)) {
+      prefix = "contract";
+    } else if (succeeded(linalg::inferConvolutionDims(op))) {
+      prefix = "conv";
+    }
+  }
+
+  if (prefix.empty()) {
+    // By default, use the op name as prefix.
+    auto opName = op->getName().getStringRef();
+    if (!opName.consume_front("linalg."))
+      return "";
+    prefix = opName.str();
+  }
+
   std::string opLoopRanges = loopRangesToString(op.getStaticLoopRanges());
   std::string opTypes = opLoopRanges.empty() ? "" : getLinalgDataTypes(op);
-  return opName.str() + (opLoopRanges.empty() ? "" : "_" + opLoopRanges) +
+  return prefix + (opLoopRanges.empty() ? "" : "_" + opLoopRanges) +
          (opTypes.empty() ? "" : "_" + opTypes);
 }
 
@@ -184,6 +324,15 @@ static std::string summarizeLinalgExtOp(Operation *op) {
     mainTensor.getElementType().print(sstream);
     sstream.flush();
   }
+
+  // append fused consumer (`linalg` or `linalg_ext`)
+  // e.g ..._1xDxDx1xf16_linalg_generic
+  auto users = op->getUsers();
+  if (op->hasOneUse()) {
+    auto user = *users.begin();
+    suffix += "_" + getOpNameWithoutDialectName(user);
+  }
+
   return opName.str() + suffix;
 }
 
@@ -231,7 +380,7 @@ static std::string summarizeDispatchRegion(Region &region) {
           LLVM_DEBUG(llvm::dbgs() << "// new best op: '" << bestOp->getName()
                                   << "', cost: " << bestEstimatedCost << "\n");
         })
-        .Case<IREE::LinalgExt::SetEncodingOp, IREE::LinalgExt::UnsetEncodingOp,
+        .Case<IREE::Encoding::SetEncodingOp, IREE::Encoding::UnsetEncodingOp,
               tensor::PackOp, tensor::UnPackOp>([&](auto op) {
           // SetEncoding/UnsetEncoding/PackOp/UnPackOp is the bestOp only if
           // there are no other operations.
@@ -284,28 +433,24 @@ static std::string summarizeDispatchRegion(Region &region) {
         auto opName = getOpNameWithoutDialectName(op);
         bestSummary = opName + "_" + operandTypeToString(op.getSource());
       })
-      .Case<IREE::LinalgExt::SetEncodingOp>([&](auto op) {
+      .Case<IREE::Encoding::SetEncodingOp>([&](auto op) {
         auto opName = getOpNameWithoutDialectName(op);
-        auto encoding = op.getResultType()
-                            .getEncoding()
-                            .template cast<IREE::LinalgExt::EncodingAttr>();
-        auto user = stringifyEnum(encoding.getUser().getValue());
-        auto role = stringifyEnum(encoding.getRole().getValue());
+        auto encoding = cast<IREE::Encoding::EncodingAttr>(
+            op.getResultType().getEncoding());
+        auto index =
+            IREE::Encoding::stringifyOperandIndex(encoding.getOperandIndex());
         ArrayRef<int64_t> shape = op.getSourceType().getShape();
-        bestSummary = opName + "_" + user.str() + "_" + role.str() + "_" +
-                      loopRangesToString(shape);
+        bestSummary = opName + "_" + index + "_" + loopRangesToString(shape);
         ;
       })
-      .Case<IREE::LinalgExt::UnsetEncodingOp>([&](auto op) {
+      .Case<IREE::Encoding::UnsetEncodingOp>([&](auto op) {
         auto opName = getOpNameWithoutDialectName(op);
-        auto encoding = op.getSourceType()
-                            .getEncoding()
-                            .template cast<IREE::LinalgExt::EncodingAttr>();
-        auto user = stringifyEnum(encoding.getUser().getValue());
-        auto role = stringifyEnum(encoding.getRole().getValue());
+        auto encoding = cast<IREE::Encoding::EncodingAttr>(
+            op.getSourceType().getEncoding());
+        auto index =
+            IREE::Encoding::stringifyOperandIndex(encoding.getOperandIndex());
         ArrayRef<int64_t> shape = op.getResultType().getShape();
-        bestSummary = opName + "_" + user.str() + "_" + role.str() + "_" +
-                      loopRangesToString(shape);
+        bestSummary = opName + "_" + index + "_" + loopRangesToString(shape);
       })
       .Case<IREE::LinalgExt::LinalgExtOp>(
           [&](auto op) { bestSummary = summarizeLinalgExtOp(op); })
@@ -336,10 +481,9 @@ static std::string summarizeDispatchRegion(Region &region) {
 
 } // namespace
 
-class AnnotateDispatchesPass
-    : public AnnotateDispatchesBase<AnnotateDispatchesPass> {
-public:
-  AnnotateDispatchesPass() = default;
+struct AnnotateDispatchesPass
+    : public IREE::Flow::impl::AnnotateDispatchesPassBase<
+          AnnotateDispatchesPass> {
 
   void runOnOperation() override {
     DenseMap<Attribute, SymbolRefAttr> entryPointRefReplacements;
@@ -354,7 +498,7 @@ public:
             &getContext(), executableOp.getName(),
             {SymbolRefAttr::get(&getContext(), exportOp.getSymName())});
 
-        auto funcOp = innerModuleOp.lookupSymbol<FunctionOpInterface>(
+        auto funcOp = innerModuleOp.lookupSymbol<mlir::FunctionOpInterface>(
             exportOp.getFunctionRef());
         if (!funcOp)
           continue; // extern module, maybe
@@ -377,8 +521,8 @@ public:
 
     // Replace each usage of an entry point with its original symbol name with a
     // new symbol name.
-    for (auto funcLikeOp : getOperation().getOps<FunctionOpInterface>()) {
-      funcLikeOp->walk([&](IREE::Flow::DispatchOp dispatchOp) {
+    for (auto funcOp : getOperation().getOps<mlir::FunctionOpInterface>()) {
+      funcOp->walk([&](IREE::Flow::DispatchOp dispatchOp) {
         SmallVector<Attribute> replacementRefs;
         for (auto originalRef : dispatchOp.getEntryPointRefs()) {
           auto it = entryPointRefReplacements.find(originalRef);
@@ -394,9 +538,5 @@ public:
     }
   }
 };
-
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createAnnotateDispatchesPass() {
-  return std::make_unique<AnnotateDispatchesPass>();
-}
 
 } // namespace mlir::iree_compiler::IREE::Flow

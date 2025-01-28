@@ -17,6 +17,7 @@ CUDA_TOOLKIT_ROOT_ENV_KEY = "IREE_CUDA_TOOLKIT_ROOT"
 # because CUDA toolkit detection differs depending on whether it is
 # stripped down or not).
 # TODO: Simplify this on the CMake/docker side and update here to match.
+# TODO(#15332): Dockerfiles no longer include these deps. Simplify.
 CUDA_DEPS_DIR_FOR_CI_ENV_KEY = "IREE_CUDA_DEPS_DIR"
 
 def cuda_auto_configure_impl(repository_ctx):
@@ -102,13 +103,6 @@ def configure_iree_submodule_deps(iree_repo_alias = "@", iree_path = "./"):
 
     maybe(
         native.new_local_repository,
-        name = "com_github_yaml_libyaml",
-        build_file = iree_repo_alias + "//:build_tools/third_party/libyaml/BUILD.overlay",
-        path = paths.join(iree_path, "third_party/libyaml"),
-    )
-
-    maybe(
-        native.new_local_repository,
         name = "vulkan_headers",
         build_file = iree_repo_alias + "//:build_tools/third_party/vulkan_headers/BUILD.overlay",
         path = paths.join(iree_path, "third_party/vulkan_headers"),
@@ -151,6 +145,13 @@ def configure_iree_submodule_deps(iree_repo_alias = "@", iree_path = "./"):
         name = "nccl",
         build_file = iree_repo_alias + "//:build_tools/third_party/nccl/BUILD.overlay",
         path = paths.join(iree_path, "third_party/nccl"),
+    )
+
+    maybe(
+        native.new_local_repository,
+        name = "hsa_runtime_headers",
+        build_file = iree_repo_alias + "//:build_tools/third_party/hsa-runtime-headers/BUILD.overlay",
+        path = paths.join(iree_path, "third_party/hsa-runtime-headers"),
     )
 
     maybe(

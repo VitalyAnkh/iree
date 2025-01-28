@@ -4,8 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
+#include "iree/compiler/Codegen/Common/Transforms.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -24,17 +24,20 @@
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_CONCRETIZEPADRESULTSHAPEPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
+
 /// Gets the given `attrOrValue` as an index value by creating constant ops
 /// for attributes.
 static Value getAsIndexValue(OpFoldResult attrOrValue, OpBuilder &builder,
                              Location loc) {
   IntegerAttr attr;
-  if (Value val = attrOrValue.dyn_cast<Value>()) {
+  if (Value val = dyn_cast<Value>(attrOrValue)) {
     if (val.getType().isIndex())
       return val;
     matchPattern(val, m_Constant(&attr));
   } else {
-    attr = llvm::cast<IntegerAttr>(attrOrValue.get<Attribute>());
+    attr = llvm::cast<IntegerAttr>(cast<Attribute>(attrOrValue));
   }
   return builder.createOrFold<arith::ConstantIndexOp>(
       loc, attr.getValue().getSExtValue());
@@ -73,12 +76,11 @@ struct ConcretizePadResultShape final : public OpRewritePattern<tensor::PadOp> {
     bindSymbols(context, sym0, sym1, sym2);
     auto addMap = AffineMap::get(0, 3, {sym0 + sym1 + sym2}, context);
 
-    SmallVector<Value, 3> valueSizes;
     for (int dimIndex = 0; dimIndex < rank; ++dimIndex) {
-      valueSizes.clear();
-      valueSizes.push_back(getAsIndexValue(lowPad[dimIndex], rewriter, loc));
-      valueSizes.push_back(getAsIndexValue(source[dimIndex], rewriter, loc));
-      valueSizes.push_back(getAsIndexValue(highPad[dimIndex], rewriter, loc));
+      SmallVector<Value, 3> valueSizes = {
+          getAsIndexValue(lowPad[dimIndex], rewriter, loc),
+          getAsIndexValue(source[dimIndex], rewriter, loc),
+          getAsIndexValue(highPad[dimIndex], rewriter, loc)};
 
       // The pad op's result shape is low padding + source size + high padding.
       // Try to see if we can get a constant number by composing and
@@ -120,27 +122,28 @@ struct ConcretizePadResultShape final : public OpRewritePattern<tensor::PadOp> {
         staticShape, padOp.getResultType().getElementType(),
         padOp.getResultType().getEncoding());
 
-    rewriter.updateRootInPlace(
-        padOp, [&]() { padOp.getResult().setType(resultType); });
+    rewriter.modifyOpInPlace(padOp,
+                             [&]() { padOp.getResult().setType(resultType); });
     return success();
   }
 };
 
 class ConcretizePadResultShapePass final
-    : public ConcretizePadResultShapeBase<ConcretizePadResultShapePass> {
+    : public impl::ConcretizePadResultShapePassBase<
+          ConcretizePadResultShapePass> {
 public:
-  ConcretizePadResultShapePass() = default;
-  ConcretizePadResultShapePass(const ConcretizePadResultShapePass &pass) =
-      default;
-
   void runOnOperation() override {
     MLIRContext *context = &getContext();
-    func::FuncOp funcOp = getOperation();
+    auto funcOp = getOperation();
+
+    ConfigTrackingListener listener;
+    GreedyRewriteConfig config;
+    config.listener = &listener;
 
     {
       RewritePatternSet patterns(context);
       populateConcretizePadResultShapePatterns(patterns);
-      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(funcOp, std::move(patterns), config))) {
         return signalPassFailure();
       }
     }
@@ -155,11 +158,6 @@ public:
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createConcretizePadResultShapePass() {
-  return std::make_unique<ConcretizePadResultShapePass>();
-}
 
 void populateConcretizePadResultShapePatterns(RewritePatternSet &patterns,
                                               ArrayRef<int64_t> numWorkgroups) {

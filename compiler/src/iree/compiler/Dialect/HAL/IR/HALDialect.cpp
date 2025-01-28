@@ -6,17 +6,20 @@
 
 #include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
 
+#include "iree/compiler/Dialect/Encoding/IR/EncodingTypes.h"
+#include "iree/compiler/Dialect/HAL/Analysis/DeviceAnalysis.h"
 #include "iree/compiler/Dialect/HAL/Conversion/HALToVM/Patterns.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
 #include "iree/compiler/Dialect/HAL/hal.imports.h"
+#include "iree/compiler/Dialect/Stream/IR/StreamInterfaces.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/VM/Conversion/ConversionDialectInterface.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/LogicalResult.h"
 #include "llvm/Support/SourceMgr.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -101,13 +104,9 @@ public:
     MLIRContext *context = attr.getContext();
     // TODO(benvanik): remove this interface or make it an attr interface.
     if (auto bindingAttr =
-            llvm::dyn_cast<IREE::HAL::DescriptorSetBindingAttr>(attr)) {
-      fn(IntegerAttr::get(IndexType::get(context),
-                          APInt(64, bindingAttr.getOrdinal())));
+            llvm::dyn_cast<IREE::HAL::PipelineBindingAttr>(attr)) {
       fn(IREE::HAL::DescriptorTypeAttr::get(context, bindingAttr.getType()));
-      fn(IREE::HAL::DescriptorFlagsAttr::get(
-          context,
-          bindingAttr.getFlags().value_or(IREE::HAL::DescriptorFlags::None)));
+      fn(IREE::HAL::DescriptorFlagsAttr::get(context, bindingAttr.getFlags()));
       return success();
     }
     if (auto dtAttr = llvm::dyn_cast<IREE::HAL::DescriptorTypeAttr>(attr)) {
@@ -118,6 +117,39 @@ public:
     }
     return failure();
   }
+};
+
+class HALAffinityAnalysisDialectInterface
+    : public IREE::Stream::AffinityAnalysisDialectInterface {
+public:
+  using AffinityAnalysisDialectInterface::AffinityAnalysisDialectInterface;
+  IREE::Stream::ResolveLayoutAttrFn
+  makeLayoutAttrResolver(ModuleOp moduleOp) const {
+    return [=](IREE::Stream::AffinityAttr affinityAttr, Operation *op,
+               SetVector<Attribute> &layoutAttrs) -> LogicalResult {
+      // This needs to be in the lambda because the moduleOp could be modified..
+      IREE::HAL::DeviceAnalysis deviceAnalysis(moduleOp);
+      if (failed(deviceAnalysis.run())) {
+        return op->emitError("failed to run DeviceAnalysis");
+      }
+      SetVector<IREE::HAL::ExecutableTargetAttr> resultSet;
+      deviceAnalysis.gatherRequiredExecutableTargets(affinityAttr, op,
+                                                     resultSet);
+      for (auto targetAttr : resultSet) {
+        Attribute result = targetAttr;
+        if (auto attr = targetAttr.getConfiguration().getNamed("encoding")) {
+          if (auto encodingLayoutAttr =
+                  dyn_cast<IREE::Encoding::EncodingLayoutAttrInterface>(
+                      attr->getValue())) {
+            result = encodingLayoutAttr.cloneWithSimplifiedConfig(
+                targetAttr.getConfiguration());
+          }
+        }
+        layoutAttrs.insert(result);
+      }
+      return success();
+    };
+  };
 };
 
 } // namespace
@@ -136,6 +168,7 @@ HALDialect::HALDialect(MLIRContext *context)
 #include "iree/compiler/Dialect/HAL/IR/HALOps.cpp.inc"
       >();
   addInterfaces<HALInlinerInterface, HALOpAsmInterface,
+                HALAffinityAnalysisDialectInterface,
                 HALToVMConversionInterface>();
 }
 

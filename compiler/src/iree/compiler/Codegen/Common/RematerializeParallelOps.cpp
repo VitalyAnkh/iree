@@ -4,16 +4,17 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenAttrs.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #define DEBUG_TYPE "iree-codegen-rematerialize-parallel-ops"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_REMATERIALIZEPARALLELOPSPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 namespace {
 
@@ -62,25 +63,18 @@ struct RematerializeParallelOpsPattern
   }
 };
 
-struct RematerializeParallelOpsPass
-    : public RematerializeParallelOpsBase<RematerializeParallelOpsPass> {
+struct RematerializeParallelOpsPass final
+    : impl::RematerializeParallelOpsPassBase<RematerializeParallelOpsPass> {
   void runOnOperation() override {
-    func::FuncOp funcOp = getOperation();
+    auto funcOp = getOperation();
     RewritePatternSet fusionPatterns(funcOp.getContext());
     fusionPatterns.insert<RematerializeParallelOpsPattern>(funcOp.getContext());
     linalg::populateEraseUnusedOperandsAndResultsPatterns(fusionPatterns);
-    if (failed(
-            applyPatternsAndFoldGreedily(funcOp, std::move(fusionPatterns)))) {
+    if (failed(applyPatternsGreedily(funcOp, std::move(fusionPatterns)))) {
       return signalPassFailure();
     }
   }
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createRematerializeParallelOpsPass() {
-  return std::make_unique<RematerializeParallelOpsPass>();
-}
-
 } // namespace mlir::iree_compiler

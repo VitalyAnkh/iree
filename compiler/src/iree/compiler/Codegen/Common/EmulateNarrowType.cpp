@@ -3,7 +3,7 @@
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-#include "iree/compiler/Codegen/Common/PassDetail.h"
+
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
 #include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
@@ -25,6 +25,9 @@
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_EMULATENARROWTYPEPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
+
 namespace {
 
 //===----------------------------------------------------------------------===//
@@ -38,17 +41,17 @@ struct ConvertHalInterfaceBindingSubspan final
   LogicalResult
   matchAndRewrite(IREE::HAL::InterfaceBindingSubspanOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto currentType = op.getType().dyn_cast<MemRefType>();
+    auto currentType = dyn_cast<MemRefType>(op.getType());
     if (!currentType) {
       return rewriter.notifyMatchFailure(op->getLoc(),
                                          "unhandled non-memref types");
     }
     auto newResultType =
-        getTypeConverter()->convertType(currentType).dyn_cast<MemRefType>();
+        dyn_cast<MemRefType>(getTypeConverter()->convertType(currentType));
     if (!newResultType) {
       return rewriter.notifyMatchFailure(
           op->getLoc(),
-          llvm::formatv("failed to legalize memref type: {0}", op.getType()));
+          llvm::formatv("failed to legalize memref type: {}", op.getType()));
     }
     Location loc = op.getLoc();
     OpFoldResult zero = rewriter.getIndexAttr(0);
@@ -78,9 +81,9 @@ struct ConvertHalInterfaceBindingSubspan final
     }
 
     rewriter.replaceOpWithNewOp<IREE::HAL::InterfaceBindingSubspanOp>(
-        op, newResultType, adaptor.getSet(), adaptor.getBinding(),
-        adaptor.getDescriptorType(), byteOffset, dynamicLinearizedSize,
-        adaptor.getAlignmentAttr(), adaptor.getDescriptorFlagsAttr());
+        op, newResultType, adaptor.getLayout(), adaptor.getBinding(),
+        byteOffset, dynamicLinearizedSize, adaptor.getAlignmentAttr(),
+        adaptor.getDescriptorFlagsAttr());
     return success();
   }
 };
@@ -96,8 +99,8 @@ static void populateIreeNarrowTypeEmulationPatterns(
 // Pass Definition
 //===----------------------------------------------------------------------===//
 
-struct EmulateNarrowTypePass
-    : public EmulateNarrowTypeBase<EmulateNarrowTypePass> {
+struct EmulateNarrowTypePass final
+    : impl::EmulateNarrowTypePassBase<EmulateNarrowTypePass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, func::FuncDialect,
                     memref::MemRefDialect, vector::VectorDialect,
@@ -132,7 +135,7 @@ struct EmulateNarrowTypePass
     RewritePatternSet patterns(ctx);
     arith::populateArithNarrowTypeEmulationPatterns(typeConverter, patterns);
     memref::populateMemRefNarrowTypeEmulationPatterns(typeConverter, patterns);
-    populateIREEResolveExtractStridedMetadataPatterns(ctx, patterns);
+    populateIREEResolveExtractStridedMetadataPatterns(patterns);
     vector::populateVectorNarrowTypeEmulationPatterns(typeConverter, patterns);
     populateIreeNarrowTypeEmulationPatterns(typeConverter, patterns);
 
@@ -143,9 +146,9 @@ struct EmulateNarrowTypePass
     }
 
     RewritePatternSet sinkBroadcast(ctx);
-    vector::populateSinkVectorBroadcastPatterns(sinkBroadcast);
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(sinkBroadcast)))) {
+    vector::populateSinkVectorOpsPatterns(sinkBroadcast);
+    if (failed(
+            applyPatternsGreedily(getOperation(), std::move(sinkBroadcast)))) {
       getOperation()->emitOpError("failed in sinking of broadcasts");
       return signalPassFailure();
     }
@@ -153,20 +156,11 @@ struct EmulateNarrowTypePass
     // Also do the `bitcast -> extui/extsi` rewrite.
     RewritePatternSet foldExtPatterns(ctx);
     vector::populateVectorNarrowTypeRewritePatterns(foldExtPatterns);
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(foldExtPatterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(),
+                                     std::move(foldExtPatterns)))) {
       return signalPassFailure();
     }
   }
 };
 } // namespace
-
-//===----------------------------------------------------------------------===//
-// Public interface
-//===----------------------------------------------------------------------===//
-
-std::unique_ptr<OperationPass<ModuleOp>> createEmulateNarrowTypePass() {
-  return std::make_unique<EmulateNarrowTypePass>();
-}
-
 } // namespace mlir::iree_compiler

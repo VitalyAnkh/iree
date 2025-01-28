@@ -1,9 +1,7 @@
 // An example LSTM exported from a python reference model with dummy weights.
 
+// RUN: iree-run-mlir --Xcompiler,iree-input-type=stablehlo --Xcompiler,iree-hal-target-backends=vmvx %s --input="1x5xf32=[0,1,0,3,4]" --input="1x5x2x2xf32=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]" | FileCheck %s
 // RUN: iree-run-mlir --Xcompiler,iree-input-type=stablehlo --Xcompiler,iree-hal-target-backends=llvm-cpu %s --input="1x5xf32=[0,1,0,3,4]" --input="1x5x2x2xf32=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]" | FileCheck %s
-// RUN: [[ $IREE_VMVX_DISABLE == 1 ]] || (iree-run-mlir --Xcompiler,iree-input-type=stablehlo --Xcompiler,iree-hal-target-backends=vmvx %s --input="1x5xf32=[0,1,0,3,4]" --input="1x5x2x2xf32=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]" | FileCheck %s)
-// RUN: [[ $IREE_VULKAN_DISABLE == 1 ]] || (iree-run-mlir --Xcompiler,iree-input-type=stablehlo --Xcompiler,iree-hal-target-backends=vulkan-spirv %s --input="1x5xf32=[0,1,0,3,4]" --input="1x5x2x2xf32=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]" | FileCheck %s)
-// RUN: [[ $IREE_METAL_DISABLE == 1 ]] || (iree-run-mlir --Xcompiler,iree-input-type=stablehlo --Xcompiler,iree-hal-target-backends=metal-spirv %s --input="1x5xf32=[0,1,0,3,4]" --input="1x5x2x2xf32=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]" | FileCheck %s)
 
 // Exported via the XLA HLO Importer
 // The resulting MLIR was modified by hand by changing all large constants to be
@@ -70,27 +68,27 @@ func.func private @Forward_o16DF3vQKaI__disable_call_shape_inference_true_.189(%
   cf.cond_br %extracted, ^bb2(%26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39 : tensor<i64>, tensor<i64>, tensor<40xf32>, tensor<i64>, tensor<74x40xf32>, tensor<i64>, tensor<1x10xf32>, tensor<1x10xf32>, tensor<5x1x64xf32>, tensor<5x1x1xf32>, tensor<5x1x1xf32>, tensor<5xi64>, tensor<5x1x10xf32>, tensor<5x1x10xf32>), ^bb3(%26, %31, %32, %33, %37, %38, %39 : tensor<i64>, tensor<i64>, tensor<1x10xf32>, tensor<1x10xf32>, tensor<5xi64>, tensor<5x1x10xf32>, tensor<5x1x10xf32>)
 ^bb2(%41: tensor<i64>, %42: tensor<i64>, %43: tensor<40xf32>, %44: tensor<i64>, %45: tensor<74x40xf32>, %46: tensor<i64>, %47: tensor<1x10xf32>, %48: tensor<1x10xf32>, %49: tensor<5x1x64xf32>, %50: tensor<5x1x1xf32>, %51: tensor<5x1x1xf32>, %52: tensor<5xi64>, %53: tensor<5x1x10xf32>, %54: tensor<5x1x10xf32>):  // pred: ^bb1
   %55 = stablehlo.add %41, %cst_5 : tensor<i64>
-  %56 = "stablehlo.gather"(%50, %41) {dimension_numbers = #stablehlo.gather<offset_dims = [0, 1], collapsed_slice_dims = [0], start_index_map = [0]>, slice_sizes = dense<1> : tensor<3xi64>} : (tensor<5x1x1xf32>, tensor<i64>) -> tensor<1x1xf32>
+  %56 = "stablehlo.gather"(%50, %41) {dimension_numbers = #stablehlo.gather<offset_dims = [0, 1], collapsed_slice_dims = [0], start_index_map = [0]>, slice_sizes = array<i64: 1, 1, 1>} : (tensor<5x1x1xf32>, tensor<i64>) -> tensor<1x1xf32>
   %57 = stablehlo.reshape %56 : (tensor<1x1xf32>) -> tensor<1xf32>
   %58 = stablehlo.broadcast_in_dim %57, dims = [0] : (tensor<1xf32>) -> tensor<1x10xf32>
   %59 = stablehlo.compare  GT, %58, %7 : (tensor<1x10xf32>, tensor<1x10xf32>) -> tensor<1x10xi1>
-  %60 = "stablehlo.gather"(%49, %41) {dimension_numbers = #stablehlo.gather<offset_dims = [0, 1], collapsed_slice_dims = [0], start_index_map = [0]>, slice_sizes = dense<[1, 1, 64]> : tensor<3xi64>} : (tensor<5x1x64xf32>, tensor<i64>) -> tensor<1x64xf32>
+  %60 = "stablehlo.gather"(%49, %41) {dimension_numbers = #stablehlo.gather<offset_dims = [0, 1], collapsed_slice_dims = [0], start_index_map = [0]>, slice_sizes = array<i64: 1, 1, 64>} : (tensor<5x1x64xf32>, tensor<i64>) -> tensor<1x64xf32>
   %61 = stablehlo.concatenate %60, %48, dim = 1 : (tensor<1x64xf32>, tensor<1x10xf32>) -> tensor<1x74xf32>
   %62 = stablehlo.dot %61, %45, precision = [DEFAULT] : (tensor<1x74xf32>, tensor<74x40xf32>) -> tensor<1x40xf32>
   %63 = stablehlo.reshape %43 : (tensor<40xf32>) -> tensor<1x40xf32>
   %64 = stablehlo.add %62, %63 : tensor<1x40xf32>
-  %65 = "stablehlo.slice"(%64) {limit_indices = dense<[1, 30]> : tensor<2xi64>, start_indices = dense<[0, 20]> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>} : (tensor<1x40xf32>) -> tensor<1x10xf32>
+  %65 = "stablehlo.slice"(%64) {limit_indices = array<i64: 1, 30>, start_indices = array<i64: 0, 20>, strides = array<i64: 1, 1>} : (tensor<1x40xf32>) -> tensor<1x10xf32>
   %66 = stablehlo.multiply %65, %8 : tensor<1x10xf32>
   %67 = stablehlo.tanh %66 : tensor<1x10xf32>
   %68 = stablehlo.multiply %67, %8 : tensor<1x10xf32>
   %69 = stablehlo.add %68, %8 : tensor<1x10xf32>
   %70 = stablehlo.multiply %69, %47 : tensor<1x10xf32>
-  %71 = "stablehlo.slice"(%64) {limit_indices = dense<[1, 20]> : tensor<2xi64>, start_indices = dense<[0, 10]> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>} : (tensor<1x40xf32>) -> tensor<1x10xf32>
+  %71 = "stablehlo.slice"(%64) {limit_indices = array<i64: 1, 20>, start_indices = array<i64: 0, 10>, strides = array<i64: 1, 1>} : (tensor<1x40xf32>) -> tensor<1x10xf32>
   %72 = stablehlo.multiply %71, %8 : tensor<1x10xf32>
   %73 = stablehlo.tanh %72 : tensor<1x10xf32>
   %74 = stablehlo.multiply %73, %8 : tensor<1x10xf32>
   %75 = stablehlo.add %74, %8 : tensor<1x10xf32>
-  %76 = "stablehlo.slice"(%64) {limit_indices = dense<[1, 10]> : tensor<2xi64>, start_indices = dense<0> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>} : (tensor<1x40xf32>) -> tensor<1x10xf32>
+  %76 = "stablehlo.slice"(%64) {limit_indices = array<i64: 1, 10>, start_indices = array<i64: 0, 0>, strides = array<i64: 1, 1>} : (tensor<1x40xf32>) -> tensor<1x10xf32>
   %77 = stablehlo.tanh %76 : tensor<1x10xf32>
   %78 = stablehlo.multiply %75, %77 : tensor<1x10xf32>
   %79 = stablehlo.add %70, %78 : tensor<1x10xf32>
@@ -100,7 +98,7 @@ func.func private @Forward_o16DF3vQKaI__disable_call_shape_inference_true_.189(%
   %83 = stablehlo.reshape %56 : (tensor<1x1xf32>) -> tensor<1xf32>
   %84 = stablehlo.broadcast_in_dim %83, dims = [0] : (tensor<1xf32>) -> tensor<1x10xf32>
   %85 = stablehlo.compare  GT, %84, %7 : (tensor<1x10xf32>, tensor<1x10xf32>) -> tensor<1x10xi1>
-  %86 = "stablehlo.slice"(%64) {limit_indices = dense<[1, 40]> : tensor<2xi64>, start_indices = dense<[0, 30]> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>} : (tensor<1x40xf32>) -> tensor<1x10xf32>
+  %86 = "stablehlo.slice"(%64) {limit_indices = array<i64: 1, 40>, start_indices = array<i64: 0, 30>, strides = array<i64: 1, 1>} : (tensor<1x40xf32>) -> tensor<1x10xf32>
   %87 = stablehlo.multiply %86, %8 : tensor<1x10xf32>
   %88 = stablehlo.tanh %87 : tensor<1x10xf32>
   %89 = stablehlo.multiply %88, %8 : tensor<1x10xf32>

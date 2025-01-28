@@ -12,15 +12,14 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Codegen/Common/BufferizationAnalysis.h"
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Transforms/Transforms.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowTypes.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "llvm/ADT/DenseSet.h"
@@ -48,18 +47,20 @@
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_CONVERTTODESTINATIONPASSINGSTYLEPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
+
 namespace {
-class ConvertToDestinationPassingStylePass
-    : public ConvertToDestinationPassingStyleBase<
+class ConvertToDestinationPassingStylePass final
+    : public impl::ConvertToDestinationPassingStylePassBase<
           ConvertToDestinationPassingStylePass> {
 public:
-  ConvertToDestinationPassingStylePass() = default;
-  ConvertToDestinationPassingStylePass(bool useWARForCooperativeMatrixCodegen) {
+  using impl::ConvertToDestinationPassingStylePassBase<
+      ConvertToDestinationPassingStylePass>::
+      ConvertToDestinationPassingStylePassBase;
+  explicit ConvertToDestinationPassingStylePass(
+      bool useWARForCooperativeMatrixCodegen) {
     this->useWARForCooperativeMatrixCodegen = useWARForCooperativeMatrixCodegen;
-  }
-  ConvertToDestinationPassingStylePass(
-      const ConvertToDestinationPassingStylePass &pass) {
-    useWARForCooperativeMatrixCodegen = pass.useWARForCooperativeMatrixCodegen;
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -97,7 +98,7 @@ static Value getReverseOfReshapeOp(OpBuilder &b, TensorReshapeOpTy reshapeOp,
       tensor::ExpandShapeOp, tensor::CollapseShapeOp>::type;
   return b.create<ReverseReshapeOpTy>(reshapeOp.getLoc(),
                                       reshapeOp.getSrcType(), resultBuffer,
-                                      reshapeOp.getReassociation());
+                                      reshapeOp.getReassociationIndices());
 }
 
 /// Gets the reverse of a `tensor.cast` op to get a memref type that
@@ -247,8 +248,9 @@ modifyResultToUseStoreBuffer(OpBuilder &b, OpResult resultValue,
 
 /// Main entry point to convert dispatch region to use destination passing
 /// style.
-static LogicalResult convertToDestinationPassingStyle(OpBuilder &b,
-                                                      func::FuncOp funcOp) {
+static LogicalResult
+convertToDestinationPassingStyle(OpBuilder &b,
+                                 mlir::FunctionOpInterface funcOp) {
   BufferizationPlan plan;
   if (failed(createTensorEquivalenceClasses(funcOp, plan))) {
     return failure();
@@ -267,25 +269,6 @@ static LogicalResult convertToDestinationPassingStyle(OpBuilder &b,
         return success();
       });
   return success(!walkResult.wasInterrupted());
-}
-
-/// Multiple uses of `tensor.empty()` results in a copy since upstream
-/// treats `tensor.empty()` as an allocation and sees uses as a data-hazard
-/// creating copies/allocations. Since the `empty` op is a proxy for
-/// undef, these could just be duplicated to have a single use. This removes
-/// unnecessary data-hazards.
-static LogicalResult duplicateTensorEmptyOps(OpBuilder &b,
-                                             tensor::EmptyOp emptyOp) {
-  OpBuilder::InsertionGuard g(b);
-  b.setInsertionPoint(emptyOp);
-  SmallVector<OpOperand *> uses = llvm::map_to_vector(
-      emptyOp->getUses(), [](OpOperand &use) { return &use; });
-  for (auto use : llvm::make_range(std::next(uses.begin()), uses.end())) {
-    auto newOp = cast<tensor::EmptyOp>(b.clone(*emptyOp.getOperation()));
-    Operation *user = use->getOwner();
-    user->setOperand(use->getOperandNumber(), newOp);
-  }
-  return success();
 }
 
 // Checks if the `inOperand` can be used in place of the `initOperand`
@@ -429,9 +412,9 @@ static LogicalResult modifyUseToGetValueIntoStoreSet(RewriterBase &rewriter,
 ///    the new use is tied to the result of the user.
 /// This makes the result of the compute op be in the store set, and
 /// bufferizable without using a new stack. See
-/// https://github.com/openxla/iree/issues/8303.
+/// https://github.com/iree-org/iree/issues/8303.
 static LogicalResult adaptComputeConsumerToAvoidStackAllocation(
-    func::FuncOp funcOp, bool useWARForCooperativeMatrixCodegen) {
+    mlir::FunctionOpInterface funcOp, bool useWARForCooperativeMatrixCodegen) {
   IRRewriter rewriter(funcOp.getContext());
 
   constexpr int kMaxNumIterations = 6;
@@ -483,8 +466,9 @@ static LogicalResult adaptComputeConsumerToAvoidStackAllocation(
 /// created by tiling tensor.unpack op. It is intended because tiling unpack ops
 /// with non-perfect sizes needs extra elements. See the tiling implementation
 /// of tensor.unpack op for more details.
-static LogicalResult replaceUnpackEmptyWithAllocTensor(OpBuilder &b,
-                                                       func::FuncOp funcOp) {
+static LogicalResult
+replaceUnpackEmptyWithAllocTensor(OpBuilder &b,
+                                  mlir::FunctionOpInterface funcOp) {
   funcOp.walk([&](tensor::UnPackOp unpackOp) {
     if (!unpackOp->hasOneUse() ||
         !isa<tensor::ExtractSliceOp>(*(unpackOp->user_begin()))) {
@@ -511,7 +495,7 @@ struct RemoveCstOutsDependency
 
   LogicalResult matchAndRewrite(linalg::LinalgOp op,
                                 PatternRewriter &rewriter) const override {
-    rewriter.startRootUpdate(op);
+    rewriter.startOpModification(op);
     bool modifiedOutput = false;
     Location loc = op.getLoc();
     for (OpOperand &opOperand : op.getDpsInitsMutable()) {
@@ -534,10 +518,10 @@ struct RemoveCstOutsDependency
       op->setOperand(opOperand.getOperandNumber(), fillOp);
     }
     if (!modifiedOutput) {
-      rewriter.cancelRootUpdate(op);
+      rewriter.cancelOpModification(op);
       return failure();
     }
-    rewriter.finalizeRootUpdate(op);
+    rewriter.finalizeOpModification(op);
     return success();
   }
 };
@@ -603,12 +587,12 @@ struct SwitchStoreOfIfResultValue
 } // namespace
 
 void ConvertToDestinationPassingStylePass::runOnOperation() {
-  func::FuncOp funcOp = getOperation();
+  auto funcOp = getOperation();
   MLIRContext *context = &getContext();
 
   // Dont do anything for functions that have multiple blocks for now.
   // TODO: This needs to be fixed, but need to proceed incrementally.
-  if (!llvm::hasSingleElement(funcOp.getBody())) {
+  if (!llvm::hasSingleElement(funcOp.getFunctionBody())) {
     return;
   }
 
@@ -621,15 +605,17 @@ void ConvertToDestinationPassingStylePass::runOnOperation() {
     return signalPassFailure();
   }
 
-  if (failed(adaptComputeConsumerToAvoidStackAllocation(
-          funcOp, useWARForCooperativeMatrixCodegen))) {
-    return signalPassFailure();
+  if (convertInputsToDestinations) {
+    if (failed(adaptComputeConsumerToAvoidStackAllocation(
+            funcOp, useWARForCooperativeMatrixCodegen))) {
+      return signalPassFailure();
+    }
   }
 
   {
     RewritePatternSet patterns(context);
     patterns.insert<RemoveCstOutsDependency>(context);
-    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
       return signalPassFailure();
     }
   }
@@ -646,7 +632,7 @@ void ConvertToDestinationPassingStylePass::runOnOperation() {
   {
     RewritePatternSet patterns(context);
     linalg::populateEraseUnusedOperandsAndResultsPatterns(patterns);
-    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
       return signalPassFailure();
     }
   }
@@ -654,13 +640,13 @@ void ConvertToDestinationPassingStylePass::runOnOperation() {
   {
     RewritePatternSet patterns(context);
     patterns.insert<SwitchStoreOfIfResultValue>(context);
-    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
       return signalPassFailure();
     }
   }
 }
 
-std::unique_ptr<OperationPass<func::FuncOp>>
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 createConvertToDestinationPassingStylePass(
     bool useWARForCooperativeMatrixCodegen) {
   return std::make_unique<ConvertToDestinationPassingStylePass>(

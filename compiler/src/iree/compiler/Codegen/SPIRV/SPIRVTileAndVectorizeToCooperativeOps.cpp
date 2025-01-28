@@ -13,23 +13,19 @@
 
 #include <algorithm>
 
-#include "iree-dialects/Dialect/LinalgExt/Passes/Passes.h"
-#include "iree-dialects/Dialect/LinalgExt/Transforms/Transforms.h"
 #include "iree/compiler/Codegen/Common/GPU/GPUPatterns.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUDialect.h"
 #include "iree/compiler/Codegen/SPIRV/KernelConfig.h"
-#include "iree/compiler/Codegen/SPIRV/PassDetail.h"
 #include "iree/compiler/Codegen/SPIRV/Passes.h"
-#include "iree/compiler/Codegen/SPIRV/Utils.h"
+#include "iree/compiler/Codegen/Transforms/Transforms.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/MarkerUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
-#include "mlir/Conversion/MemRefToSPIRV/MemRefToSPIRV.h"
 #include "mlir/Conversion/VectorToGPU/VectorToGPU.h"
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -40,22 +36,23 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
 #include "mlir/Dialect/Vector/Transforms/VectorTransforms.h"
-#include "mlir/Interfaces/VectorInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-
-using mlir::iree_compiler::IREE::LinalgExt::TilingPatterns;
 
 #define DEBUG_TYPE "iree-spirv-tile-and-vectorize-to-cooperative-ops"
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_SPIRVTILETOCOOPERATIVEOPSPASS
+#define GEN_PASS_DEF_SPIRVVECTORIZETOCOOPERATIVEOPSPASS
+#include "iree/compiler/Codegen/SPIRV/Passes.h.inc"
+
 namespace {
 
-void debugPrint(func::FuncOp funcOp, const char *message) {
+void debugPrint(Operation *op, const char *message) {
   LLVM_DEBUG({
     llvm::dbgs() << "//--- " << message << " ---//\n";
-    funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
+    op->print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
     llvm::dbgs() << "\n\n";
   });
 }
@@ -70,26 +67,28 @@ static SmallVector<int64_t> getTargetCooperativeOpSize(linalg::LinalgOp op) {
   return getTileSizes(op, 3); // For native vector sizes
 }
 
-constexpr char coopMatShapeAttrName[] = "iree.spirv.coop_mat_shape";
+constexpr char coopMatTypeAttrName[] = "iree.spirv.coopmatrix.type";
+constexpr char coopMatShapeAttrName[] = "iree.spirv.coopmatrix.shape";
 
-/// Sets the chosen cooperative matrix shape for CodeGen onto the
-/// hal.executable.export op for the given `funcOp`.
-void setSPIRVCooperativeMatrixShape(func::FuncOp funcOp,
-                                    ArrayRef<int64_t> shape) {
-  auto moduleOp = funcOp->getParentOfType<ModuleOp>();
-  auto exportOp = getAllEntryPoints(moduleOp).lookup(funcOp.getName());
-
+/// Sets the chosen cooperative matrix type/shape for CodeGen onto the
+/// the given `funcOp`.
+void setSPIRVCooperativeMatrixInfo(mlir::FunctionOpInterface funcOp,
+                                   linalg::LinalgOp rootOp,
+                                   ArrayRef<int64_t> shape) {
   Builder b(funcOp.getContext());
-  exportOp->setAttr(coopMatShapeAttrName, b.getDenseI64ArrayAttr(shape));
+  funcOp->setAttr(coopMatShapeAttrName, b.getDenseI64ArrayAttr(shape));
+  auto inputType = cast<ShapedType>(rootOp.getDpsInputs().front().getType());
+  auto outputType = cast<ShapedType>(rootOp.getDpsInits().front().getType());
+  auto elementTypes = b.getTypeArrayAttr(
+      {inputType.getElementType(), outputType.getElementType()});
+  funcOp->setAttr(coopMatTypeAttrName, elementTypes);
 }
 
-/// Returns the chosen cooperative matrix shape for CodeGen from the
-/// hal.executable.export op for the given `funcOp`. Returns an empty
-/// ArrayRef if cannot query.
-ArrayRef<int64_t> getSPIRVCooperativeMatrixShape(func::FuncOp funcOp) {
-  auto moduleOp = funcOp->getParentOfType<ModuleOp>();
-  auto exportOp = getAllEntryPoints(moduleOp).lookup(funcOp.getName());
-  auto attr = exportOp->getAttrOfType<DenseI64ArrayAttr>(coopMatShapeAttrName);
+/// Returns the chosen cooperative matrix shape for CodeGen from the given
+/// `funcOp`. Returns an empty ArrayRef if cannot query.
+ArrayRef<int64_t>
+getSPIRVCooperativeMatrixShape(mlir::FunctionOpInterface funcOp) {
+  auto attr = funcOp->getAttrOfType<DenseI64ArrayAttr>(coopMatShapeAttrName);
   if (!attr)
     return {};
   return attr.asArrayRef();
@@ -125,11 +124,12 @@ static SmallVector<int64_t> deduceSubgroupCounts(linalg::LinalgOp op) {
   return subgroupCounts;
 }
 
-/// Adds patterns to tile Linalg ops with workgroup markers to subgroups.
-static void populateTilingToSubgroupPatterns(
-    ArrayRef<int64_t> subgroupCounts, const unsigned subgroupSize,
-    ArrayRef<int64_t> subgroupTileSizes, RewritePatternSet &patterns) {
-  MLIRContext *context = patterns.getContext();
+/// Tiles Linalg ops with workgroup markers to subgroups.
+static LogicalResult tileToSubgroup(mlir::FunctionOpInterface funcOp,
+                                    ArrayRef<int64_t> subgroupCounts,
+                                    const unsigned subgroupSize,
+                                    ArrayRef<int64_t> subgroupTileSizes) {
+  MLIRContext *context = funcOp.getContext();
 
   auto getSubgroupProcInfoFn =
       [subgroupCounts, subgroupSize](OpBuilder &builder, Location loc,
@@ -160,12 +160,11 @@ static void populateTilingToSubgroupPatterns(
                            .setTileSizeComputationFunction(setTileSizesFn)
                            .setDistributionOptions(distributionOptions);
 
-  IREE::LinalgExt::LinalgTransformationFilter filter(
+  LinalgTransformationFilter filter(
       {StringAttr::get(context, getWorkgroupKTiledMarker()),
        StringAttr::get(context, getWorkgroupMemoryMarker())},
       StringAttr::get(context, getVectorizeMarker()));
-  TilingPatterns<linalg::BatchMatmulOp, linalg::FillOp, linalg::MatmulOp,
-                 linalg::GenericOp>::insert(patterns, tilingOptions, filter);
+  return distributeLinalgOpsWithFilter(funcOp, tilingOptions, filter);
 }
 
 //===----------------------------------------------------------------------===//
@@ -328,16 +327,17 @@ public:
 //===----------------------------------------------------------------------===//
 
 class SPIRVTileToCooperativeOpsPass final
-    : public SPIRVTileToCooperativeOpsBase<SPIRVTileToCooperativeOpsPass> {
+    : public impl::SPIRVTileToCooperativeOpsPassBase<
+          SPIRVTileToCooperativeOpsPass> {
 public:
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<gpu::GPUDialect, linalg::LinalgDialect,
-                    vector::VectorDialect>();
+    registry.insert<gpu::GPUDialect, IREE::GPU::IREEGPUDialect,
+                    linalg::LinalgDialect, vector::VectorDialect>();
   }
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
-    func::FuncOp funcOp = getOperation();
+    auto funcOp = getOperation();
 
     // First we need to discover the CodeGen lowering configuration. It was
     // decided earlier and attached to a linalg op as an attribute.
@@ -359,25 +359,22 @@ public:
     // given that after tiling and vectorization we won't have the root Linalg
     // op anymore.
     SmallVector<int64_t> cooperativeOpSize = getTargetCooperativeOpSize(rootOp);
-    setSPIRVCooperativeMatrixShape(funcOp, cooperativeOpSize);
+    setSPIRVCooperativeMatrixInfo(funcOp, rootOp, cooperativeOpSize);
 
     SmallVector<int64_t> subgroupCounts = deduceSubgroupCounts(rootOp);
 
     // Then tile and distribute to subgroups.
 
     {
-      std::optional<int> subgroupSize = getSPIRVSubgroupSize(funcOp);
+      std::optional<int> subgroupSize = getGPUSubgroupSize(funcOp);
       if (!subgroupSize) {
         funcOp.emitError("failed to query subgroup size");
         return signalPassFailure();
       }
-      RewritePatternSet subgroupTilingPatterns(context);
+
       SmallVector<int64_t> subgroupTileSizes = getTileSizes(rootOp, 1);
-      populateTilingToSubgroupPatterns(subgroupCounts, *subgroupSize,
-                                       subgroupTileSizes,
-                                       subgroupTilingPatterns);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(subgroupTilingPatterns)))) {
+      if (failed(tileToSubgroup(funcOp, subgroupCounts, *subgroupSize,
+                                subgroupTileSizes))) {
         return signalPassFailure();
       }
 
@@ -386,8 +383,8 @@ public:
       SmallVector<int64_t> numWorkgroups = getStaticNumWorkgroups(funcOp);
       populateFoldAffineMinInDistributedLoopsPatterns(canonicalizationPatterns,
                                                       numWorkgroups);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(canonicalizationPatterns)))) {
+      if (failed(applyPatternsGreedily(funcOp,
+                                       std::move(canonicalizationPatterns)))) {
         return signalPassFailure();
       }
     }
@@ -397,7 +394,7 @@ public:
 };
 
 class SPIRVVectorizeToCooperativeOpsPass final
-    : public SPIRVVectorizeToCooperativeOpsBase<
+    : public impl::SPIRVVectorizeToCooperativeOpsPassBase<
           SPIRVVectorizeToCooperativeOpsPass> {
 public:
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -407,7 +404,7 @@ public:
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
-    func::FuncOp funcOp = getOperation();
+    auto funcOp = getOperation();
 
     // First discover the chosen cooperative matrix shape. It was decided
     // earlier and attached to the export op as an attribute.
@@ -427,7 +424,7 @@ public:
       populateCombineVectorTransferReadBroadcastPatterns(patterns);
       populatePrepareVectorToMMAPatterns(patterns,
                                          /*useNvGPU=*/false);
-      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
@@ -437,7 +434,7 @@ public:
     {
       RewritePatternSet patterns(context);
       populateVectorUnrollPatterns(cooperativeOpSize, patterns);
-      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
@@ -450,7 +447,7 @@ public:
     {
       RewritePatternSet patterns(context);
       patterns.add<CombineContractTranspose>(context);
-      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
@@ -460,15 +457,4 @@ public:
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createSPIRVTileToCooperativeOpsPass() {
-  return std::make_unique<SPIRVTileToCooperativeOpsPass>();
-}
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createSPIRVVectorizeToCooperativeOpsPass() {
-  return std::make_unique<SPIRVVectorizeToCooperativeOpsPass>();
-}
-
 } // namespace mlir::iree_compiler

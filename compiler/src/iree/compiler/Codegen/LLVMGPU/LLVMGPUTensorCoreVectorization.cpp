@@ -4,17 +4,16 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree-dialects/Dialect/LinalgExt/Passes/Passes.h"
-#include "iree-dialects/Dialect/LinalgExt/Transforms/Transforms.h"
 #include "iree/compiler/Codegen/Common/GPU/GPUPatterns.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenAttrs.h"
-#include "iree/compiler/Codegen/LLVMGPU/PassDetail.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/MarkerUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
+#include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Conversion/VectorToGPU/VectorToGPU.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/NVGPU/Utils/MMAUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
@@ -24,26 +23,29 @@
 
 #define DEBUG_TYPE "iree-codegen-gpu-tensorcore-vectorization"
 
-using mlir::iree_compiler::IREE::LinalgExt::LinalgVectorizationPattern;
-using mlir::iree_compiler::IREE::LinalgExt::VectorizationPatterns;
-
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_LLVMGPUTENSORCOREVECTORIZATIONPASS
+#include "iree/compiler/Codegen/LLVMGPU/Passes.h.inc"
 
 //====---------------------------------------------------------------------===//
 // Patterns for vectorization
 //====---------------------------------------------------------------------===//
 
-static void populateVectorizationPatterns(RewritePatternSet &patterns) {
-  IREE::LinalgExt::LinalgTransformationFilter f(
-      StringAttr::get(patterns.getContext(), getVectorizeMarker()));
-  IREE::LinalgExt::LinalgVectorizationOptions vectorizationOptions;
-  VectorizationPatterns<linalg::FillOp, linalg::GenericOp>::insert(
-      patterns, vectorizationOptions, f);
-  patterns.add<LinalgVectorizationPattern>(
-      patterns.getContext(), vectorizationOptions,
-      f.addOpFilter<linalg::ContractionOpInterface>());
-  vector::populateVectorTransferPermutationMapLoweringPatterns(patterns);
-  vector::populateVectorReductionToContractPatterns(patterns);
+static void vectorizeLinalgOps(mlir::FunctionOpInterface funcOp) {
+  MLIRContext *context = funcOp.getContext();
+  IRRewriter rewriter(context);
+  LinalgTransformationFilter f(StringAttr::get(context, getVectorizeMarker()));
+
+  funcOp.walk([&](Operation *op) {
+    if (failed(f.checkAndNotify(rewriter, op)) ||
+        !isa<linalg::FillOp, linalg::GenericOp, linalg::ContractionOpInterface>(
+            op)) {
+      return WalkResult::advance();
+    }
+    (void)linalg::vectorize(rewriter, op);
+    return WalkResult::advance();
+  });
 }
 
 static void populateVectorUnrollPatterns(RewritePatternSet &patterns,
@@ -66,11 +68,16 @@ static void populateVectorUnrollPatterns(RewritePatternSet &patterns,
 }
 
 namespace {
-struct LLVMGPUTensorCoreVectorizationPass
-    : public LLVMGPUTensorCoreVectorizationBase<
+class LLVMGPUTensorCoreVectorizationPass final
+    : public impl::LLVMGPUTensorCoreVectorizationPassBase<
           LLVMGPUTensorCoreVectorizationPass> {
-  LLVMGPUTensorCoreVectorizationPass(GPUTensorCoreType tensorCoreType)
+public:
+  using impl::LLVMGPUTensorCoreVectorizationPassBase<
+      LLVMGPUTensorCoreVectorizationPass>::
+      LLVMGPUTensorCoreVectorizationPassBase;
+  explicit LLVMGPUTensorCoreVectorizationPass(GPUTensorCoreType tensorCoreType)
       : tensorCoreType(tensorCoreType) {}
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<vector::VectorDialect>();
   }
@@ -84,10 +91,14 @@ struct LLVMGPUTensorCoreVectorizationPass
     MLIRContext *context = &getContext();
     {
       // Step 1(a). Vectorize (linalg to vector).
-      RewritePatternSet vectorizationPatterns(context);
-      populateVectorizationPatterns(vectorizationPatterns);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(vectorizationPatterns)))) {
+      vectorizeLinalgOps(funcOp);
+      RewritePatternSet contractionPatterns(context);
+      vector::populateVectorTransferPermutationMapLoweringPatterns(
+          contractionPatterns);
+      vector::populateVectorReductionToContractPatterns(contractionPatterns);
+      vector::populateSinkVectorOpsPatterns(contractionPatterns);
+      if (failed(
+              applyPatternsGreedily(funcOp, std::move(contractionPatterns)))) {
         return signalPassFailure();
       }
       LLVM_DEBUG({
@@ -101,8 +112,8 @@ struct LLVMGPUTensorCoreVectorizationPass
       // This pattern folds the arithmetic extensions into the vector.contract.
       RewritePatternSet foldArithExtPatterns(context);
       vector::populateFoldArithExtensionPatterns(foldArithExtPatterns);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(foldArithExtPatterns)))) {
+      if (failed(
+              applyPatternsGreedily(funcOp, std::move(foldArithExtPatterns)))) {
         return signalPassFailure();
       }
 
@@ -112,8 +123,8 @@ struct LLVMGPUTensorCoreVectorizationPass
           canonicalizationPatterns, context);
       populateCombineVectorTransferReadBroadcastPatterns(
           canonicalizationPatterns);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(canonicalizationPatterns)))) {
+      if (failed(applyPatternsGreedily(funcOp,
+                                       std::move(canonicalizationPatterns)))) {
         return signalPassFailure();
       }
       LLVM_DEBUG({
@@ -130,8 +141,8 @@ struct LLVMGPUTensorCoreVectorizationPass
             vectorContractPatterns);
         mlir::populatePrepareVectorToMMAPatterns(vectorContractPatterns,
                                                  /*useMMASync=*/true);
-        if (failed(applyPatternsAndFoldGreedily(
-                getOperation(), std::move(vectorContractPatterns)))) {
+        if (failed(applyPatternsGreedily(getOperation(),
+                                         std::move(vectorContractPatterns)))) {
           return signalPassFailure();
         }
       }
@@ -146,8 +157,8 @@ struct LLVMGPUTensorCoreVectorizationPass
       // Step 4. Break and unroll warp tile size to native math and load sizes.
       RewritePatternSet vectorUnrollPatterns(context);
       populateVectorUnrollPatterns(vectorUnrollPatterns, useMmaSyncShape);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(vectorUnrollPatterns)))) {
+      if (failed(
+              applyPatternsGreedily(funcOp, std::move(vectorUnrollPatterns)))) {
         return signalPassFailure();
       }
       LLVM_DEBUG({
@@ -162,7 +173,7 @@ private:
 };
 } // namespace
 
-std::unique_ptr<OperationPass<func::FuncOp>>
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 createLLVMGPUTensorCoreVectorizationPass(GPUTensorCoreType tensorCoreType) {
   return std::make_unique<LLVMGPUTensorCoreVectorizationPass>(tensorCoreType);
 }

@@ -30,45 +30,30 @@ iree_cc_library(
     "RegionOpUtils.h"
   SRCS
     "AnnotateDispatches.cpp"
-    "CaptureDispatchDynamicDims.cpp"
+    "Canonicalizer.cpp"
+    "CaptureDynamicDims.cpp"
     "CleanupTensorShapes.cpp"
-    "CloneProducersIntoDispatchRegions.cpp"
-    "CollapseDimensions.cpp"
-    "CollapseReductionDims.cpp"
+    "ConvertMeshToFlow.cpp"
     "ConvertRegionToWorkgroups.cpp"
     "ConvertToFlow.cpp"
     "DeduplicateExecutables.cpp"
-    "DispatchWithTransformDialect.cpp"
     "DumpDispatchGraph.cpp"
     "ExportBenchmarkFuncs.cpp"
-    "FoldUnitExtentDims.cpp"
     "FormDispatchRegions.cpp"
-    "FormDispatchWorkgroups.cpp"
-    "FormScalarDispatches.cpp"
-    "FusionOfTensorOps.cpp"
     "InitializeEmptyTensors.cpp"
     "InjectDispatchTracing.cpp"
+    "InjectTensorTracing.cpp"
     "InsertDispatchDebugTargets.cpp"
-    "InterchangeGenericOps.cpp"
-    "InterchangeTransposeGenericOps.cpp"
+    "OutlineConstants.cpp"
     "OutlineDispatchExterns.cpp"
     "OutlineDispatchRegions.cpp"
-    "PassDetail.h"
     "Passes.cpp"
-    "RaiseSpecialOps.cpp"
     "RegionOpUtils.cpp"
-    "SplitReduction.cpp"
-    "TensorPadToTensorInsertSlice.cpp"
     "TopLevelSCFToCFG.cpp"
     "VerifyInputLegality.cpp"
   DEPS
     ::PassesIncGen
     IREEDialectsTransforms
-    IREELinalgExtDialect
-    IREELinalgExtPasses
-    IREELinalgExtTransformOps
-    IREELinalgExtTransforms
-    IREELinalgExtUtils
     IREELinalgTransformDialect
     LLVMSupport
     MLIRAffineDialect
@@ -77,6 +62,7 @@ iree_cc_library(
     MLIRArithDialect
     MLIRArithUtils
     MLIRComplexDialect
+    MLIRDestinationStyleOpInterface
     MLIRFuncDialect
     MLIRFunctionInterfaces
     MLIRIR
@@ -86,8 +72,7 @@ iree_cc_library(
     MLIRMathDialect
     MLIRMemRefDialect
     MLIRMemRefTransforms
-    MLIRPDLDialect
-    MLIRPDLInterpDialect
+    MLIRMeshDialect
     MLIRParser
     MLIRPass
     MLIRSCFDialect
@@ -98,13 +83,19 @@ iree_cc_library(
     MLIRTensorUtils
     MLIRTilingInterface
     MLIRTosaDialect
-    MLIRTransformDialect
-    MLIRTransformDialectTransforms
     MLIRTransformUtils
     MLIRTransforms
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
+    iree::compiler::Dialect::Encoding::IR
+    iree::compiler::Dialect::Flow::Conversion::MeshToFlow
     iree::compiler::Dialect::Flow::Conversion::TensorToFlow
     iree::compiler::Dialect::Flow::IR
     iree::compiler::Dialect::HAL::IR
+    iree::compiler::Dialect::LinalgExt::IR
+    iree::compiler::Dialect::LinalgExt::TransformExtensions::LinalgExtExtensions
+    iree::compiler::Dialect::LinalgExt::Transforms
+    iree::compiler::Dialect::LinalgExt::Utils
+    iree::compiler::Dialect::Stream::IR
     iree::compiler::Dialect::Util::Analysis
     iree::compiler::Dialect::Util::IR
     iree::compiler::Dialect::Util::Transforms

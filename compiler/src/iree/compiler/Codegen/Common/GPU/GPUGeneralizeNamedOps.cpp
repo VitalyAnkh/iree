@@ -11,45 +11,59 @@
 //
 //===---------------------------------------------------------------------===//
 
-#include "iree/compiler/Codegen/Common/GPU/PassDetail.h"
 #include "iree/compiler/Codegen/Common/GPU/Passes.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::iree_compiler {
 
-namespace {
-struct GPUGeneralizeNamedOpsPass
-    : public GPUGeneralizeNamedOpsBase<GPUGeneralizeNamedOpsPass> {
+#define GEN_PASS_DEF_GPUGENERALIZENAMEDOPSPASS
+#include "iree/compiler/Codegen/Common/GPU/Passes.h.inc"
 
-  void runOnOperation() override;
-};
-} // namespace
-
-void GPUGeneralizeNamedOpsPass::runOnOperation() {
-  auto funcOp = getOperation();
-  SmallVector<linalg::LinalgOp> namedOpCandidates;
-  funcOp.walk([&](linalg::LinalgOp linalgOp) {
-    if (isa<linalg::BatchMatmulTransposeBOp, linalg::MatmulTransposeBOp,
-            linalg::VecmatOp, linalg::MatvecOp>(linalgOp))
-      namedOpCandidates.push_back(linalgOp);
-  });
-
-  IRRewriter rewriter(&getContext());
+LogicalResult
+generalizeCandidates(MLIRContext *context,
+                     ArrayRef<linalg::LinalgOp> namedOpCandidates) {
+  IRRewriter rewriter(context);
   for (auto linalgOp : namedOpCandidates) {
+    // Pass down lowering configuration. It can exist due to user set
+    // configuration from the input.
+    IREE::Codegen::LoweringConfigAttrInterface config =
+        getLoweringConfig(linalgOp);
     rewriter.setInsertionPoint(linalgOp);
     FailureOr<linalg::GenericOp> generalizedOp =
         linalg::generalizeNamedOp(rewriter, linalgOp);
     if (failed(generalizedOp)) {
       linalgOp->emitOpError("failed to generalize operation");
+      return failure();
+    }
+    if (config) {
+      setLoweringConfig(*generalizedOp, config);
+    }
+  }
+  return success();
+}
+
+namespace {
+struct GPUGeneralizeNamedOpsPass final
+    : impl::GPUGeneralizeNamedOpsPassBase<GPUGeneralizeNamedOpsPass> {
+  void runOnOperation() override {
+    FunctionOpInterface funcOp = getOperation();
+    SmallVector<linalg::LinalgOp> namedOpCandidates;
+    funcOp.walk([&](linalg::LinalgOp linalgOp) {
+      if (isa<linalg::BatchMatmulTransposeBOp, linalg::MatmulTransposeBOp,
+              linalg::VecmatOp, linalg::MatvecOp>(linalgOp))
+        namedOpCandidates.push_back(linalgOp);
+    });
+
+    if (failed(generalizeCandidates(&getContext(), namedOpCandidates))) {
       return signalPassFailure();
     }
   }
-}
-
-std::unique_ptr<OperationPass<func::FuncOp>> createGPUGeneralizeNamedOpsPass() {
-  return std::make_unique<GPUGeneralizeNamedOpsPass>();
-}
+};
+} // namespace
 
 } // namespace mlir::iree_compiler

@@ -19,16 +19,14 @@ iree_cc_library(
     "direct_allocator.m"
     "direct_command_buffer.h"
     "direct_command_buffer.m"
-    "kernel_library.h"
-    "kernel_library.m"
+    "executable.h"
+    "executable.m"
     "metal_buffer.h"
     "metal_buffer.m"
     "metal_device.m"
     "metal_driver.m"
     "nop_executable_cache.h"
     "nop_executable_cache.m"
-    "pipeline_layout.h"
-    "pipeline_layout.m"
     "shared_event.h"
     "shared_event.m"
     "staging_buffer.h"
@@ -41,10 +39,12 @@ iree_cc_library(
     iree::base::internal::flatcc::parsing
     iree::hal
     iree::hal::drivers::metal::builtin
-    iree::hal::utils::buffer_transfer
+    iree::hal::utils::deferred_command_buffer
+    iree::hal::utils::executable_debug_info
     iree::hal::utils::file_transfer
-    iree::hal::utils::memory_file
+    iree::hal::utils::files
     iree::hal::utils::resource_set
+    iree::schemas::executable_debug_info_c_fbs
     iree::schemas::metal_executable_def_c_fbs
     "-framework Foundation"
     "-framework Metal"

@@ -27,7 +27,7 @@ GPU Vendor | Category | Performance | Focus Architecture
 ARM Mali GPU | Mobile |  Good | Valhall+
 Qualcomm Adreno GPU | Mobile | Reasonable | 640+
 AMD GPU | Desktop/server | Good | RDNA+
-NVIDIA GPU | Desktop/server | Good | Turing+
+NVIDIA GPU | Desktop/server | Reasonable | Turing+
 
 ## :octicons-download-16: Prerequisites
 
@@ -76,42 +76,14 @@ Vulkan expects the program running on GPU to be expressed by the
 [SPIR-V](https://www.khronos.org/registry/spir-v/) binary exchange format, which
 the model must be compiled into.
 
-#### :octicons-package-16: Download the compiler from a release
+#### :octicons-download-16: Download the compiler from a release
 
-Python packages are regularly published to
-[PyPI](https://pypi.org/user/google-iree-pypi-deploy/). See the
+Python packages are distributed through multiple channels. See the
 [Python Bindings](../../reference/bindings/python.md) page for more details.
-The core `iree-compiler` package includes the SPIR-V compiler:
+The core [`iree-base-compiler`](https://pypi.org/project/iree-base-compiler/)
+package includes the SPIR-V compiler:
 
-=== "Stable releases"
-
-    Stable release packages are
-    [published to PyPI](https://pypi.org/user/google-iree-pypi-deploy/).
-
-    ``` shell
-    python -m pip install iree-compiler
-    ```
-
-=== ":material-alert: Nightly releases"
-
-    Nightly releases are published on
-    [GitHub releases](https://github.com/openxla/iree/releases).
-
-    ``` shell
-    python -m pip install \
-      --find-links https://iree.dev/pip-release-links.html \
-      --upgrade iree-compiler
-    ```
-
-!!! tip
-    `iree-compile` is installed to your python module installation path. If you
-    pip install with the user mode, it is under `${HOME}/.local/bin`, or
-    `%APPDATA%Python` on Windows. You may want to include the path in your
-    system's `PATH` environment variable:
-
-    ```shell
-    export PATH=${HOME}/.local/bin:${PATH}
-    ```
+--8<-- "docs/website/docs/guides/deployment-configurations/snippets/_iree-compiler-from-release.md"
 
 #### :material-hammer-wrench: Build the compiler from source
 
@@ -135,13 +107,8 @@ Next you will need to get an IREE runtime that supports the Vulkan HAL driver.
 
 You can check for Vulkan support by looking for a matching driver and device:
 
-```console hl_lines="6"
-$ iree-run-module --list_drivers
-
-        cuda: CUDA (dynamic)
-  local-sync: Local execution using a lightweight inline synchronous queue
-  local-task: Local execution using the IREE multithreading task system
-      vulkan: Vulkan 1.x (dynamic)
+```console hl_lines="7"
+--8<-- "docs/website/docs/guides/deployment-configurations/snippets/_iree-run-module-driver-list.md"
 ```
 
 ```console hl_lines="6"
@@ -152,6 +119,15 @@ $ iree-run-module --list_devices
   local-task://
   vulkan://00000000-1111-2222-3333-444444444444
 ```
+
+#### :octicons-download-16: Download the runtime from a release
+
+Python packages are distributed through multiple channels. See the
+[Python Bindings](../../reference/bindings/python.md) page for more details.
+The core [`iree-base-runtime`](https://pypi.org/project/iree-base-runtime/)
+package includes the Vulkan HAL driver:
+
+--8<-- "docs/website/docs/guides/deployment-configurations/snippets/_iree-runtime-from-release.md"
 
 #### :material-hammer-wrench: Build the runtime from source
 
@@ -186,34 +162,50 @@ command to compile with the `vulkan-spirv` target:
 ``` shell hl_lines="2 3"
 iree-compile \
     --iree-hal-target-backends=vulkan-spirv \
-    --iree-vulkan-target-triple=<...> \
+    --iree-vulkan-target=<...> \
     mobilenet_iree_input.mlir -o mobilenet_vulkan.vmfb
 ```
 
+`iree-vulkan-target` specifies the GPU architecture to target. It accepts a few
+schemes:
+
+* LLVM CodeGen backend style: this is using LLVM AMDGPU/NVPTX CodeGen targets
+  like `gfx1100` for AMD RX 7900XTX and `sm_86` for NVIDIA RTX 3090 GPUs.
+* Architecture code name style: e.g., using `rdna3`/`valhall4`/`ampere`/`adreno`
+  for AMD/ARM/NVIDIA/Qualcomm GPUs.
+* Product name style(1): e.g., using `rx7900xtx`/`a100` for corresponding GPUs.
+
+Here are a few examples showing how you can target various recent common GPUs:
+
+| GPU                 | Target Architecture | Architecture Code Name | Product Name
+| ------------------- | ------------------- | ---------------------- | ------------
+| AMD RX7900XTX       | `gfx1100`           | `rdna3`                | `rx7900xtx`
+| AMD RX7900XT        | `gfx1100`           | `rdna3`                | `rx7900xt`
+| AMD RX7800XT        | `gfx1101`           | `rdna3`                | `rx7800xt`
+| AMD RX7700XT        | `gfx1101`           | `rdna3`                | `rx7700xt`
+| AMD RX6000 series   |                     | `rdna2`                |
+| AMD RX5000 series   |                     | `rdna1`                |
+| ARM Mali G715       |                     | `valhall4`             | e.g., `mali-g715`
+| ARM Mali G510       |                     | `valhall3`             | e.g., `mali-g510`
+| ARM GPUs            |                     | `valhall`              |
+| NVIDIA RTX40 series | `sm_89`             | `ada`                  | e.g., `rtx4090`
+| NVIDIA RTX30 series | `sm_86`             | `ampere`               | e.g., `rtx3080ti`
+| NVIDIA RTX20 series | `sm_75`             | `turing`               | e.g., `rtx2070super`
+| Qualcomm GPUs       |                     | `adreno`               |
+
+If no target is specified, then a safe but more limited default will be used.
+
 !!! note annotate
-    Currently a target triple of the form `<vendor/arch>-<product>-<os>` is needed
-    to compile towards a specific GPU architecture.
-
-    We don't support the full spectrum here(1); the following table summarizes
-    the currently recognized ones.
-
-    If no triple is specified, then a safe but more limited default will be used.
-
+    Note that We don't support the full spectrum of GPUs here(2).
     This is more of a mechanism to help us develop IREE itself--in the long term
     we want to perform multiple targetting to generate to multiple architectures
-    if no target triple is given.
+    if no target is given.
 
-1. It's also impossible to capture all details of a Vulkan implementation
+1. Note that we only support very limited GPUs that we are actively developing
+   against in this category, particularly for desktops.
+2. It's also impossible to capture all details of a Vulkan implementation
    with a target triple, given the allowed variances on extensions, properties,
    limits, etc. So the target triple is just an approximation for usage.
-
-| GPU Vendor          | Target Triple                                 |
-| ------------------- | --------------------------------------------- |
-| ARM Mali GPU        | e.g. `valhall-unknown-{android30|android31}`  |
-| Qualcomm Adreno GPU | e.g. `adreno-unknown-{android30|android31}`   |
-| AMD GPU             | e.g. `{rdna1|rdna2|rdna3}-unknown-unknown`    |
-| NVIDIA GPU          | e.g. `{turing|ampere}-unknown-unknown`        |
-| SwiftShader CPU     | `cpu-swiftshader-unknown`                     |
 
 ### :octicons-terminal-16: Run a compiled program
 

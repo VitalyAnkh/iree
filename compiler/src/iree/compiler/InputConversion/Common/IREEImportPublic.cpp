@@ -14,7 +14,6 @@
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
-#include "iree/compiler/InputConversion/Common/PassDetail.h"
 #include "iree/compiler/InputConversion/Common/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -23,20 +22,16 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/DialectConversion.h"
 
-namespace mlir::iree_compiler {
+namespace mlir::iree_compiler::InputConversion {
+
+#define GEN_PASS_DEF_IREEIMPORTPUBLICPASS
+#include "iree/compiler/InputConversion/Common/Passes.h.inc"
 
 namespace {
 
-// Allowlist of function attributes to retain when importing funcs.
-constexpr const char *kRetainedAttributes[] = {
-    "iree.abi",
-    "iree.reflection",
-    "sym_visibility",
-    "noinline",
-};
-
-struct IREEImportPublicPass
-    : public IREEImportPublicBase<IREEImportPublicPass> {
+class IREEImportPublicPass final
+    : public impl::IREEImportPublicPassBase<IREEImportPublicPass> {
+public:
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<IREE::Input::IREEInputDialect, IREE::Flow::FlowDialect,
                     IREE::HAL::HALDialect, IREE::Util::UtilDialect,
@@ -65,10 +60,10 @@ template <typename To, typename From, typename Converter>
 static ArrayAttr convertArrayAttribute(ArrayAttr src, Converter fn) {
   SmallVector<Attribute> result;
   for (auto attr : src) {
-    if (auto arr = attr.dyn_cast<ArrayAttr>()) {
+    if (auto arr = dyn_cast<ArrayAttr>(attr)) {
       result.push_back(convertArrayAttribute<To, From, Converter>(arr, fn));
     } else {
-      result.push_back(fn(attr.template cast<From>()));
+      result.push_back(fn(cast<From>(attr)));
     }
   }
   return ArrayAttr::get(src.getContext(), result);
@@ -86,63 +81,55 @@ convertDescriptorType(IREE::Input::DescriptorType src) {
   }
 }
 
-static std::optional<IREE::HAL::DescriptorFlags>
+static IREE::HAL::DescriptorFlags
 convertDescriptorFlags(std::optional<IREE::Input::DescriptorFlags> src) {
   if (!src.has_value())
-    return std::nullopt;
+    return IREE::HAL::DescriptorFlags::None;
   switch (*src) {
+  default:
   case IREE::Input::DescriptorFlags::None:
     return IREE::HAL::DescriptorFlags::None;
   case IREE::Input::DescriptorFlags::ReadOnly:
     return IREE::HAL::DescriptorFlags::ReadOnly;
-  default:
-    return std::nullopt;
   }
 }
 
-static IREE::HAL::DescriptorSetBindingAttr
-convertDescriptorSetBinding(IREE::Input::DescriptorSetBindingAttr src) {
-  return IREE::HAL::DescriptorSetBindingAttr::get(
-      src.getContext(), src.getOrdinal(), convertDescriptorType(src.getType()),
+static IREE::HAL::PipelineBindingAttr
+convertPipelineBinding(IREE::Input::PipelineBindingAttr src) {
+  return IREE::HAL::PipelineBindingAttr::get(
+      src.getContext(), convertDescriptorType(src.getType()),
       convertDescriptorFlags(src.getFlags()));
 }
 
-static std::optional<IREE::HAL::DescriptorSetLayoutFlags>
-convertDescriptorSetLayoutFlags(
-    std::optional<IREE::Input::DescriptorSetLayoutFlags> src) {
+static std::optional<IREE::HAL::PipelineLayoutFlags> convertPipelineLayoutFlags(
+    std::optional<IREE::Input::PipelineLayoutFlags> src) {
   if (!src.has_value())
     return std::nullopt;
   switch (*src) {
-  case IREE::Input::DescriptorSetLayoutFlags::None:
-    return IREE::HAL::DescriptorSetLayoutFlags::None;
-  case IREE::Input::DescriptorSetLayoutFlags::Indirect:
-    return IREE::HAL::DescriptorSetLayoutFlags::Indirect;
+  case IREE::Input::PipelineLayoutFlags::None:
+    return IREE::HAL::PipelineLayoutFlags::None;
+  case IREE::Input::PipelineLayoutFlags::Indirect:
+    return IREE::HAL::PipelineLayoutFlags::Indirect;
   default:
     return std::nullopt;
   }
-}
-
-static IREE::HAL::DescriptorSetLayoutAttr
-convertDescriptorSetLayout(IREE::Input::DescriptorSetLayoutAttr src) {
-  return IREE::HAL::DescriptorSetLayoutAttr::get(
-      src.getContext(), src.getOrdinal(),
-      convertAttributes<IREE::HAL::DescriptorSetBindingAttr>(
-          src.getBindings(), convertDescriptorSetBinding),
-      convertDescriptorSetLayoutFlags(src.getFlags()));
 }
 
 static IREE::HAL::PipelineLayoutAttr
 convertPipelineLayout(IREE::Input::PipelineLayoutAttr src) {
   return IREE::HAL::PipelineLayoutAttr::get(
-      src.getContext(), src.getPushConstants(),
-      convertAttributes<IREE::HAL::DescriptorSetLayoutAttr>(
-          src.getSetLayouts(), convertDescriptorSetLayout));
+      src.getContext(),
+      convertAttributes<IREE::HAL::PipelineBindingAttr>(src.getBindings(),
+                                                        convertPipelineBinding),
+      src.getConstants(), convertPipelineLayoutFlags(src.getFlags()));
 }
 
 static IREE::HAL::ExecutableObjectAttr
 convertExecutableObject(IREE::Input::ExecutableObjectAttr src) {
-  return IREE::HAL::ExecutableObjectAttr::get(src.getContext(), src.getPath(),
-                                              src.getData());
+  return IREE::HAL::ExecutableObjectAttr::get(
+      src.getContext(), src.getPath(),
+      dyn_cast_if_present<IREE::Util::SerializableAttrInterface>(
+          src.getData()));
 }
 
 static IREE::HAL::ExecutableTargetAttr
@@ -217,13 +204,15 @@ class TensorImportPattern
       // the work.
       rewriter.replaceOpWithNewOp<IREE::HAL::TensorImportOp>(
           srcOp, resultType, adaptor.getSource(), TypeAttr::get(resultType),
-          /*name=*/nullptr);
+          /*name=*/nullptr,
+          /*affinity=*/nullptr);
     } else {
       // Dynamic dims explicitly provided (or wrong, in which case the verifier
       // will get it).
       rewriter.replaceOpWithNewOp<IREE::HAL::TensorImportOp>(
           srcOp, resultType, adaptor.getSource(), TypeAttr::get(resultType),
-          adaptor.getTargetDims(), /*wait_fence=*/Value{}, /*name=*/nullptr);
+          adaptor.getTargetDims(), /*wait_fence=*/Value{}, /*name=*/nullptr,
+          /*affinity=*/nullptr);
     }
     return success();
   }
@@ -245,14 +234,16 @@ class TensorExportPattern
       // the work.
       rewriter.replaceOpWithNewOp<IREE::HAL::TensorExportOp>(
           srcOp, resultType, adaptor.getSource(),
-          TypeAttr::get(adaptor.getSource().getType()), /*name=*/nullptr);
+          TypeAttr::get(adaptor.getSource().getType()), /*name=*/nullptr,
+          /*affinity=*/nullptr);
     } else {
       // Dynamic dims explicitly provided (or wrong, in which case the verifier
       // will get it).
       rewriter.replaceOpWithNewOp<IREE::HAL::TensorExportOp>(
           srcOp, resultType, adaptor.getSource(),
           TypeAttr::get(adaptor.getSource().getType()), adaptor.getSourceDims(),
-          /*target_storage=*/nullptr, /*name=*/nullptr);
+          /*name=*/nullptr,
+          /*affinity=*/nullptr);
     }
     return success();
   }
@@ -295,8 +286,10 @@ class ExecutableExportPattern
 };
 
 //===----------------------------------------------------------------------===//
+// Func dialect -> Util patterns
+//===----------------------------------------------------------------------===//
 
-class BuiltinFuncOpPattern : public OpConversionPattern<func::FuncOp> {
+class FuncFuncOpPattern : public OpConversionPattern<func::FuncOp> {
   using OpConversionPattern<func::FuncOp>::OpConversionPattern;
   LogicalResult
   matchAndRewrite(func::FuncOp srcOp, OpAdaptor adaptor,
@@ -320,26 +313,60 @@ class BuiltinFuncOpPattern : public OpConversionPattern<func::FuncOp> {
       return rewriter.notifyMatchFailure(srcOp, "results failed to convert");
     }
 
+    // Build tied operands index mapping results back to operands.
+    SmallVector<int64_t> tiedOperands;
+    bool anyTiedOperands = false;
+    for (unsigned i = 0; i < srcFuncType.getNumResults(); ++i) {
+      auto tiedAttr =
+          srcOp.getResultAttrOfType<IntegerAttr>(i, "iree.abi.tied");
+      if (tiedAttr) {
+        tiedOperands.push_back(tiedAttr.getInt());
+      } else {
+        tiedOperands.push_back(-1);
+      }
+    }
+    auto tiedOperandsAttr = anyTiedOperands
+                                ? rewriter.getIndexArrayAttr(tiedOperands)
+                                : ArrayAttr{};
+
     // Create new function with converted argument and result types.
     // Note that attributes are dropped. Consider preserving some if needed.
     auto newFuncType = mlir::FunctionType::get(
         srcOp.getContext(), signatureConversion.getConvertedTypes(),
         convertedResultTypes);
-    auto newFuncOp = rewriter.create<func::FuncOp>(
-        srcOp.getLoc(), srcOp.getName(), newFuncType);
+    auto newFuncOp = rewriter.create<IREE::Util::FuncOp>(
+        srcOp.getLoc(), srcOp.getName(), newFuncType, tiedOperandsAttr);
+    newFuncOp.setSymVisibilityAttr(srcOp.getSymVisibilityAttr());
     rewriter.inlineRegionBefore(srcOp.getBody(), newFuncOp.getFunctionBody(),
                                 newFuncOp.end());
 
-    // Retain function attributes in the allowlist.
+    // Handle defacto attrs to specialized ones.
+    if (srcOp->hasAttr("noinline")) {
+      newFuncOp.setInliningPolicyAttr(
+          rewriter.getAttr<IREE::Util::InlineNeverAttr>());
+    }
+
+    // Allowlist of function attributes to retain when importing funcs.
+    constexpr const char *kRetainedAttributes[] = {
+        "iree.reflection", "stream.affinity", "vm.fallback",
+        "vm.signature",    "vm.version",      "nosideeffects",
+    };
     auto retainedAttributes = ArrayRef<const char *>(
         kRetainedAttributes,
         sizeof(kRetainedAttributes) / sizeof(kRetainedAttributes[0]));
     for (auto retainAttrName : retainedAttributes) {
       StringRef attrName(retainAttrName);
       Attribute attr = srcOp->getAttr(attrName);
-      if (attr) {
+      if (attr)
         newFuncOp->setAttr(attrName, attr);
-      }
+    }
+
+    // Copy all arg/result attrs. We could filter these.
+    if (auto argAttrs = srcOp.getAllArgAttrs()) {
+      newFuncOp.setAllArgAttrs(argAttrs);
+    }
+    if (auto resultAttrs = srcOp.getAllResultAttrs()) {
+      newFuncOp.setAllResultAttrs(resultAttrs);
     }
 
     // Tell the rewriter to convert the region signature.
@@ -354,6 +381,40 @@ class BuiltinFuncOpPattern : public OpConversionPattern<func::FuncOp> {
     return success();
   }
 };
+
+class FuncCallOpPattern : public OpConversionPattern<func::CallOp> {
+  using OpConversionPattern<func::CallOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(func::CallOp srcOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type, 1> resultTypes;
+    if (failed(getTypeConverter()->convertTypes(srcOp.getResultTypes(),
+                                                resultTypes))) {
+      return rewriter.notifyMatchFailure(srcOp, "results failed to convert");
+    }
+    auto tiedOperandsAttr =
+        srcOp->getAttrOfType<ArrayAttr>("iree.abi.tied_operands");
+    rewriter.replaceOpWithNewOp<IREE::Util::CallOp>(
+        srcOp, resultTypes, srcOp.getCallee(), adaptor.getOperands(),
+        tiedOperandsAttr);
+    return success();
+  }
+};
+
+class FuncReturnOpPattern : public OpConversionPattern<func::ReturnOp> {
+  using OpConversionPattern<func::ReturnOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(func::ReturnOp srcOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<IREE::Util::ReturnOp>(srcOp,
+                                                      adaptor.getOperands());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Generic conversion
+//===----------------------------------------------------------------------===//
 
 class GlobalOpPattern : public OpConversionPattern<IREE::Input::GlobalOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -376,7 +437,7 @@ class GlobalOpPattern : public OpConversionPattern<IREE::Input::GlobalOp> {
           srcOp.getLoc(), srcOp.getInitializerAttr(), TypeRange{newType});
       rewriter.create<IREE::Util::GlobalStoreOp>(
           srcOp.getLoc(), callOp.getResult(0), srcOp.getName());
-      rewriter.create<IREE::Util::InitializerReturnOp>(srcOp.getLoc());
+      rewriter.create<IREE::Util::ReturnOp>(srcOp.getLoc());
       rewriter.restoreInsertionPoint(ip);
     }
     return success();
@@ -404,7 +465,7 @@ public:
       TypeConverter::SignatureConversion result(newRegion->getNumArguments());
       (void)getTypeConverter()->convertSignatureArgs(
           newRegion->getArgumentTypes(), result);
-      rewriter.applySignatureConversion(newRegion, result);
+      rewriter.applySignatureConversion(&newRegion->front(), result);
     }
     Operation *newOp = rewriter.create(state);
     rewriter.replaceOp(op, newOp->getResults());
@@ -466,36 +527,29 @@ void IREEImportPublicPass::runOnOperation() {
     }
     return true;
   };
-
-  target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp funcOp) {
-    for (Type type : funcOp.getFunctionType().getInputs()) {
-      if (isIllegalType(type))
-        return false;
-    }
-    for (Type type : funcOp.getFunctionType().getResults()) {
-      if (isIllegalType(type))
-        return false;
-    }
-    for (Block &block : funcOp.getFunctionBody()) {
-      for (Type type : block.getArgumentTypes()) {
-        if (isIllegalType(type))
-          return false;
-      }
-    }
-    return true;
-  });
   target.markUnknownOpDynamicallyLegal(isLegallyTypedOp);
 
   IREETypeConverter typeConverter;
   PatternBenefit specific_benefit = 100;
   patterns.insert<GenericTypeConvert>(typeConverter, &getContext(), 0);
-  patterns.insert<BuiltinFuncOpPattern>(typeConverter, &getContext(),
-                                        specific_benefit);
   patterns.insert<GlobalOpPattern>(typeConverter, &getContext(), 0);
   patterns.insert<TensorExportPattern, TensorImportPattern>(
       typeConverter, &getContext(), specific_benefit);
   patterns.insert<ExecutableSourcePattern, ExecutableExportPattern>(
       typeConverter, &getContext(), specific_benefit);
+
+  target.addDynamicallyLegalDialect<func::FuncDialect>(
+      [&](Operation *op) -> std::optional<bool> {
+        // Allow the func dialect within nested modules but not in the top-level
+        // one that represents the host program.
+        return op->getParentOfType<mlir::ModuleOp>() != getOperation();
+      });
+  patterns.insert<FuncFuncOpPattern>(typeConverter, &getContext(),
+                                     specific_benefit);
+  patterns.insert<FuncCallOpPattern>(typeConverter, &getContext(),
+                                     specific_benefit);
+  patterns.insert<FuncReturnOpPattern>(typeConverter, &getContext(),
+                                       specific_benefit);
 
 #define ONE_TO_ONE(SrcOpTy, TargetOpTy)                                        \
   patterns.insert<OneToOneConverionPattern>(                                   \
@@ -539,8 +593,4 @@ void IREEImportPublicPass::runOnOperation() {
     signalPassFailure();
 }
 
-std::unique_ptr<OperationPass<ModuleOp>> createIREEImportPublicPass() {
-  return std::make_unique<IREEImportPublicPass>();
-}
-
-} // namespace mlir::iree_compiler
+} // namespace mlir::iree_compiler::InputConversion

@@ -91,6 +91,13 @@ iree_vmvx_module_free_state(void* self, iree_vm_module_state_t* module_state) {
   iree_allocator_free(state->host_allocator, state);
 }
 
+static iree_status_t IREE_API_PTR iree_vmvx_module_fork_state(
+    void* self, iree_vm_module_state_t* parent_state,
+    iree_allocator_t allocator, iree_vm_module_state_t** out_child_state) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                          "vmvx module forking not implemented");
+}
+
 //===----------------------------------------------------------------------===//
 // Argument validation and marshalling
 //===----------------------------------------------------------------------===//
@@ -577,23 +584,9 @@ IREE_VMVX_ABI_EXPORT(iree_vmvx_mmt4d, mmt4d, v) {
                            /*stride1=*/1,
                            /*size0=*/M,
                            /*size1=*/N * out_tile_size);
-  iree_uk_mmt4d_params_t ukernel_params = {
-      .flags = args->flags,
-      .lhs_buffer = lhs,
-      .rhs_buffer = rhs,
-      .out_buffer = out,
-      .lhs_stride0 = lhs_stride0,
-      .rhs_stride0 = rhs_stride0,
-      .out_stride0 = out_stride0,
-      .M = M,
-      .N = N,
-      .K = K,
-      .M0 = M0,
-      .N0 = N0,
-      .K0 = K0,
-      .cpu_data = (const iree_uk_uint64_t*)iree_cpu_data_fields(),
-  };
-  iree_uk_mmt4d(&ukernel_params);
+  iree_uk_mmt4d(lhs, 0 /*offsets already accounted for*/, lhs_stride0, rhs, 0,
+                rhs_stride0, out, 0, out_stride0, M, N, K, M0, N0, K0,
+                args->flags, (const iree_uk_uint64_t*)iree_cpu_data_fields());
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();
 }
@@ -606,9 +599,11 @@ IREE_VMVX_ABI_FIXED_STRUCT(pack, rIIIrIIIIIIIIIi, {
   iree_vm_ref_t in_ref;
   int64_t in_offset;
   int64_t in_stride0;
+  int64_t in_stride1;
   iree_vm_ref_t out_ref;
   int64_t out_offset;
   int64_t out_stride0;
+  int64_t out_stride1;
   int64_t in_size0;
   int64_t in_size1;
   int64_t out_size0;
@@ -640,7 +635,7 @@ IREE_VMVX_ABI_EXPORT(iree_vmvx_pack, pack, v) {
                            /*buffer_ref=*/args->in_ref,
                            /*offset=*/args->in_offset,
                            /*stride0=*/args->in_stride0,
-                           /*stride1=*/1,
+                           /*stride1=*/args->in_stride1,
                            /*size0=*/args->in_size0,
                            /*size1=*/args->in_size1);
   MAP_BUFFER_2D_UNTYPED_RW(out, /*dtype_size=*/elem_size,
@@ -650,22 +645,11 @@ IREE_VMVX_ABI_EXPORT(iree_vmvx_pack, pack, v) {
                            /*stride1=*/1,
                            /*size0=*/args->out_size0,
                            /*size1=*/args->out_size1 * out_tile_size);
-  iree_uk_pack_params_t ukernel_params = {
-      .in_buffer = in,
-      .out_buffer = out,
-      .in_stride0 = args->in_stride0,
-      .out_stride0 = args->out_stride0,
-      .in_size0 = args->in_size0,
-      .in_size1 = args->in_size1,
-      .out_size0 = args->out_size0,
-      .out_size1 = args->out_size1,
-      .out_size2 = args->out_size2,
-      .out_size3 = args->out_size3,
-      .padding_value = args->padding_value,
-      .flags = args->flags,
-      .cpu_data = (const iree_uk_uint64_t*)iree_cpu_data_fields(),
-  };
-  iree_uk_pack(&ukernel_params);
+  iree_uk_pack(in, 0, args->in_stride0, args->in_stride1, out, 0,
+               args->out_stride0, args->out_stride1, args->in_size0,
+               args->in_size1, args->out_size0, args->out_size1,
+               args->out_size2, args->out_size3, args->padding_value,
+               args->flags, (const iree_uk_uint64_t*)iree_cpu_data_fields());
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();
 }
@@ -678,9 +662,11 @@ IREE_VMVX_ABI_FIXED_STRUCT(unpack, rIIIrIIIIIIIIi, {
   iree_vm_ref_t in_ref;
   int64_t in_offset;
   int64_t in_stride0;
+  int64_t in_stride1;
   iree_vm_ref_t out_ref;
   int64_t out_offset;
   int64_t out_stride0;
+  int64_t out_stride1;
   int64_t in_size0;
   int64_t in_size1;
   int64_t in_size2;
@@ -715,24 +701,14 @@ IREE_VMVX_ABI_EXPORT(iree_vmvx_unpack, unpack, v) {
                            /*buffer_ref=*/args->out_ref,
                            /*offset=*/args->out_offset,
                            /*stride0=*/args->out_stride0,
-                           /*stride1=*/1,
+                           /*stride1=*/args->out_stride1,
                            /*size0=*/args->out_size0,
                            /*size1=*/args->out_size1);
-  iree_uk_unpack_params_t ukernel_params = {
-      .in_buffer = in,
-      .out_buffer = out,
-      .in_stride0 = args->in_stride0,
-      .out_stride0 = args->out_stride0,
-      .in_size0 = args->in_size0,
-      .in_size1 = args->in_size1,
-      .in_size2 = args->in_size2,
-      .in_size3 = args->in_size3,
-      .out_size0 = args->out_size0,
-      .out_size1 = args->out_size1,
-      .flags = args->flags,
-      .cpu_data = (const iree_uk_uint64_t*)iree_cpu_data_fields(),
-  };
-  iree_uk_unpack(&ukernel_params);
+  iree_uk_unpack(in, 0, args->in_stride0, args->in_stride1, out, 0,
+                 args->out_stride0, args->out_stride1, args->in_size0,
+                 args->in_size1, args->in_size2, args->in_size3,
+                 args->out_size0, args->out_size1, args->flags,
+                 (const iree_uk_uint64_t*)iree_cpu_data_fields());
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();
 }
@@ -827,6 +803,7 @@ IREE_API_EXPORT iree_status_t iree_vmvx_module_create(
       .destroy = iree_vmvx_module_destroy,
       .alloc_state = iree_vmvx_module_alloc_state,
       .free_state = iree_vmvx_module_free_state,
+      .fork_state = iree_vmvx_module_fork_state,
   };
 
   // Allocate shared module state.

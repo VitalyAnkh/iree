@@ -24,16 +24,15 @@
 #include "iree/hal/drivers/vulkan/handle_util.h"
 #include "iree/hal/drivers/vulkan/native_allocator.h"
 #include "iree/hal/drivers/vulkan/native_event.h"
-#include "iree/hal/drivers/vulkan/native_pipeline_layout.h"
 #include "iree/hal/drivers/vulkan/native_semaphore.h"
 #include "iree/hal/drivers/vulkan/nop_executable_cache.h"
 #include "iree/hal/drivers/vulkan/status_util.h"
 #include "iree/hal/drivers/vulkan/tracing.h"
 #include "iree/hal/drivers/vulkan/util/arena.h"
 #include "iree/hal/drivers/vulkan/util/ref_ptr.h"
-#include "iree/hal/utils/buffer_transfer.h"
+#include "iree/hal/utils/deferred_command_buffer.h"
+#include "iree/hal/utils/file_registry.h"
 #include "iree/hal/utils/file_transfer.h"
-#include "iree/hal/utils/memory_file.h"
 
 using namespace iree::hal::vulkan;
 
@@ -499,6 +498,8 @@ typedef struct iree_hal_vulkan_device_t {
   iree_hal_vulkan_device_flags_t flags;
   // Which optional extensions are active and available on the device.
   iree_hal_vulkan_device_extensions_t device_extensions;
+  // Device properties for various optional features.
+  iree_hal_vulkan_device_properties_t device_properties;
 
   VkInstance instance;
   VkPhysicalDevice physical_device;
@@ -691,6 +692,7 @@ static iree_status_t iree_hal_vulkan_device_create_internal(
     const iree_hal_vulkan_device_options_t* options, VkInstance instance,
     VkPhysicalDevice physical_device, VkDeviceHandle* logical_device,
     const iree_hal_vulkan_device_extensions_t* device_extensions,
+    const iree_hal_vulkan_device_properties_t* device_properties,
     const iree_hal_vulkan_queue_set_t* compute_queue_set,
     const iree_hal_vulkan_queue_set_t* transfer_queue_set,
     iree_allocator_t host_allocator, iree_hal_device_t** out_device) {
@@ -722,6 +724,7 @@ static iree_status_t iree_hal_vulkan_device_create_internal(
   device->flags = options->flags;
 
   device->device_extensions = *device_extensions;
+  device->device_properties = *device_properties;
   device->instance = instance;
   device->physical_device = physical_device;
   device->logical_device = logical_device;
@@ -752,8 +755,8 @@ static iree_status_t iree_hal_vulkan_device_create_internal(
   // Create the device memory allocator that will service all buffer
   // allocation requests.
   iree_status_t status = iree_hal_vulkan_native_allocator_create(
-      options, instance, physical_device, logical_device,
-      &device->device_allocator);
+      options, (iree_hal_device_t*)device, instance, physical_device,
+      logical_device, &device->device_allocator);
 
   // Create command pools for each queue family. If we don't have a transfer
   // queue then we'll ignore that one and just use the dispatch pool.
@@ -844,6 +847,177 @@ static iree_status_t iree_hal_vulkan_device_query_extensibility_set(
   IREE_RETURN_IF_ERROR(iree_hal_vulkan_query_extensibility_set(
       requested_features, set, out_string_list->count, &out_string_list->count,
       out_string_list->values));
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_vulkan_query_device_properties(
+    DynamicSymbols* instance_syms, VkPhysicalDevice physical_device,
+    iree_hal_vulkan_device_properties_t* out_properties) {
+  memset(out_properties, 0, sizeof(*out_properties));
+
+  VkPhysicalDeviceFeatures2 physical_device_features;
+  memset(&physical_device_features, 0, sizeof(physical_device_features));
+  physical_device_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+
+  // + Shader float16 and int8 features.
+  VkPhysicalDeviceShaderFloat16Int8Features shader_float16_int8_features;
+  memset(&shader_float16_int8_features, 0,
+         sizeof(shader_float16_int8_features));
+  shader_float16_int8_features.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+  shader_float16_int8_features.pNext = physical_device_features.pNext;
+  physical_device_features.pNext = &shader_float16_int8_features;
+
+  // + Shader 8 bit storage features.
+  VkPhysicalDevice8BitStorageFeatures supported_8bit_storage_features;
+  memset(&supported_8bit_storage_features, 0,
+         sizeof(supported_8bit_storage_features));
+  supported_8bit_storage_features.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
+  supported_8bit_storage_features.pNext = physical_device_features.pNext;
+  physical_device_features.pNext = &supported_8bit_storage_features;
+
+  // + Shader 16 bit storage features.
+  VkPhysicalDevice16BitStorageFeatures supported_16bit_storage_features;
+  memset(&supported_16bit_storage_features, 0,
+         sizeof(supported_16bit_storage_features));
+  supported_16bit_storage_features.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+  supported_16bit_storage_features.pNext = physical_device_features.pNext;
+  physical_device_features.pNext = &supported_16bit_storage_features;
+
+  // + Shader integer dot product features.
+  VkPhysicalDeviceShaderIntegerDotProductFeatures dot_product_features;
+  memset(&dot_product_features, 0, sizeof(dot_product_features));
+  dot_product_features.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+  dot_product_features.pNext = physical_device_features.pNext;
+  physical_device_features.pNext = &dot_product_features;
+
+  // + Cooperative matrix features.
+  VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop_matrix_features;
+  memset(&coop_matrix_features, 0, sizeof(coop_matrix_features));
+  coop_matrix_features.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+  coop_matrix_features.pNext = physical_device_features.pNext;
+  physical_device_features.pNext = &coop_matrix_features;
+
+  // + Physical storage buffer features.
+  VkPhysicalDeviceBufferDeviceAddressFeatures address_features;
+  memset(&address_features, 0, sizeof(address_features));
+  address_features.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+  address_features.pNext = physical_device_features.pNext;
+  physical_device_features.pNext = &address_features;
+
+  instance_syms->vkGetPhysicalDeviceFeatures2(physical_device,
+                                              &physical_device_features);
+
+  // + Coop matrix properties.
+  VkPhysicalDeviceProperties2 physical_device_properties;
+  memset(&physical_device_properties, 0, sizeof(physical_device_properties));
+  physical_device_properties.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  physical_device_properties.pNext = NULL;
+
+  // + Subgroup properties.
+  VkPhysicalDeviceSubgroupProperties subgroup_properties;
+  memset(&subgroup_properties, 0, sizeof(subgroup_properties));
+  subgroup_properties.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+  subgroup_properties.pNext = physical_device_properties.pNext;
+  physical_device_properties.pNext = &subgroup_properties;
+
+  // + Shader integer dot product properties.
+  VkPhysicalDeviceShaderIntegerDotProductProperties dot_product_properties;
+  memset(&dot_product_properties, 0, sizeof(dot_product_properties));
+  dot_product_properties.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
+  dot_product_properties.pNext = physical_device_properties.pNext;
+  physical_device_properties.pNext = &dot_product_properties;
+
+  instance_syms->vkGetPhysicalDeviceProperties2(physical_device,
+                                                &physical_device_properties);
+
+  if (shader_float16_int8_features.shaderFloat16) {
+    out_properties->compute_float |= 0x1u;
+  }
+  if (physical_device_features.features.shaderFloat64) {
+    out_properties->compute_float |= 0x2u;
+  }
+  if (shader_float16_int8_features.shaderInt8) {
+    out_properties->compute_int |= 0x1u;
+  }
+  if (physical_device_features.features.shaderInt16) {
+    out_properties->compute_int |= 0x2u;
+  }
+  if (physical_device_features.features.shaderInt64) {
+    out_properties->compute_int |= 0x4u;
+  }
+  if (supported_8bit_storage_features.storageBuffer8BitAccess &&
+      supported_8bit_storage_features.uniformAndStorageBuffer8BitAccess) {
+    out_properties->storage |= 0x1u;
+  }
+  if (supported_16bit_storage_features.storageBuffer16BitAccess &&
+      supported_16bit_storage_features.uniformAndStorageBuffer16BitAccess) {
+    out_properties->storage |= 0x2u;
+  }
+
+  if (iree_all_bits_set(subgroup_properties.supportedOperations,
+                        VK_SUBGROUP_FEATURE_SHUFFLE_BIT)) {
+    out_properties->subgroup |= 0x1u;
+  }
+  if (iree_all_bits_set(subgroup_properties.supportedOperations,
+                        VK_SUBGROUP_FEATURE_ARITHMETIC_BIT)) {
+    out_properties->subgroup |= 0x2u;
+  }
+
+  if (dot_product_features.shaderIntegerDotProduct) {
+    out_properties->dot_product |= 0x1u;
+  }
+
+  if (coop_matrix_features.cooperativeMatrix &&
+      instance_syms->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) {
+    uint32_t count = 0;
+    IREE_RETURN_IF_ERROR(VK_RESULT_TO_STATUS(
+        instance_syms->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+            physical_device, &count, NULL)));
+    VkCooperativeMatrixPropertiesKHR* properties =
+        (VkCooperativeMatrixPropertiesKHR*)iree_alloca(
+            count * sizeof(VkCooperativeMatrixPropertiesKHR));
+    memset(properties, 0, count * sizeof(VkCooperativeMatrixPropertiesKHR));
+    for (uint32_t i = 0; i < count; ++i) {
+      properties[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    }
+    IREE_RETURN_IF_ERROR(VK_RESULT_TO_STATUS(
+        instance_syms->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+            physical_device, &count, properties)));
+    for (uint32_t i = 0; i < count; ++i) {
+      VkCooperativeMatrixPropertiesKHR* p = properties + i;
+      if (p->AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+          p->BType == VK_COMPONENT_TYPE_FLOAT16_KHR) {
+        if (p->CType == VK_COMPONENT_TYPE_FLOAT16_KHR) {
+          if (p->MSize == 16 && p->NSize == 16 && p->KSize == 16) {
+            out_properties->cooperative_matrix |= 0x1u;
+          }
+        }
+      }
+    }
+  }
+
+  if (address_features.bufferDeviceAddress) {
+    out_properties->address |= 0x1u;
+  }
+
+  out_properties->limits.max_push_constants_size =
+      physical_device_properties.properties.limits.maxPushConstantsSize;
+  out_properties->limits.max_per_stage_descriptor_uniform_buffers =
+      physical_device_properties.properties.limits
+          .maxPerStageDescriptorUniformBuffers;
+  out_properties->limits.max_per_stage_descriptor_storage_buffers =
+      physical_device_properties.properties.limits
+          .maxPerStageDescriptorStorageBuffers;
+
   return iree_ok_status();
 }
 
@@ -966,6 +1140,15 @@ iree_status_t iree_hal_vulkan_device_create(
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
   available_shader_float16_int8_features.pNext = available_features2.pNext;
   available_features2.pNext = &available_shader_float16_int8_features;
+
+  // + Subgroup matrix features.
+  VkPhysicalDeviceSubgroupProperties available_subgroup_properties;
+  memset(&available_subgroup_properties, 0,
+         sizeof(available_subgroup_properties));
+  available_subgroup_properties.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+  available_subgroup_properties.pNext = available_features2.pNext;
+  available_features2.pNext = &available_subgroup_properties;
 
   // + Cooperative matrix features.
   VkPhysicalDeviceCooperativeMatrixFeaturesKHR available_coop_matrix_features;
@@ -1095,15 +1278,19 @@ iree_status_t iree_hal_vulkan_device_create(
     enabled_features2.pNext = &available_shader_float16_int8_features;
   }
 
-  // Enable all available coop matrix features.
+  // Enable all available cooperative matrix features.
   if (enabled_device_extensions.cooperative_matrix) {
     available_coop_matrix_features.pNext = enabled_features2.pNext;
     enabled_features2.pNext = &available_coop_matrix_features;
   }
 
+  iree_hal_vulkan_device_properties_t device_properties;
+  IREE_RETURN_IF_ERROR(iree_hal_vulkan_query_device_properties(
+      instance_syms, physical_device, &device_properties));
+
   auto logical_device = new VkDeviceHandle(
       instance_syms, physical_device, enabled_features,
-      enabled_device_extensions,
+      enabled_device_extensions, device_properties,
       /*owns_device=*/true, host_allocator, /*allocator=*/NULL);
 
   iree_status_t status = VK_RESULT_TO_STATUS(
@@ -1130,7 +1317,8 @@ iree_status_t iree_hal_vulkan_device_create(
     status = iree_hal_vulkan_device_create_internal(
         driver, identifier, enabled_features, options, instance,
         physical_device, logical_device, &enabled_device_extensions,
-        &compute_queue_set, &transfer_queue_set, host_allocator, out_device);
+        &device_properties, &compute_queue_set, &transfer_queue_set,
+        host_allocator, out_device);
   }
 
   logical_device->ReleaseReference();
@@ -1170,6 +1358,11 @@ IREE_API_EXPORT iree_status_t iree_hal_vulkan_wrap_device(
   iree_hal_vulkan_device_extensions_t enabled_device_extensions =
       iree_hal_vulkan_infer_enabled_device_extensions(device_syms.get());
 
+  // We can retrieve the device properties and limits from the wrapped handle.
+  iree_hal_vulkan_device_properties_t device_properties;
+  IREE_RETURN_IF_ERROR(iree_hal_vulkan_query_device_properties(
+      device_syms.get(), physical_device, &device_properties));
+
   iree_hal_vulkan_features_t enabled_features = 0;
 #if IREE_TRACING_FEATURES & IREE_TRACING_FEATURE_INSTRUMENTATION_DEVICE
   enabled_features |= IREE_HAL_VULKAN_FEATURE_ENABLE_TRACING;
@@ -1178,7 +1371,7 @@ IREE_API_EXPORT iree_status_t iree_hal_vulkan_wrap_device(
   // Wrap the provided VkDevice with a VkDeviceHandle for use within the HAL.
   auto logical_device_handle = new VkDeviceHandle(
       device_syms.get(), physical_device, enabled_features,
-      enabled_device_extensions,
+      enabled_device_extensions, device_properties,
       /*owns_device=*/false, host_allocator, /*allocator=*/NULL);
   *logical_device_handle->mutable_value() = logical_device;
 
@@ -1186,7 +1379,8 @@ IREE_API_EXPORT iree_status_t iree_hal_vulkan_wrap_device(
   iree_status_t status = iree_hal_vulkan_device_create_internal(
       /*driver=*/NULL, identifier, enabled_features, options, instance,
       physical_device, logical_device_handle, &enabled_device_extensions,
-      compute_queue_set, transfer_queue_set, host_allocator, out_device);
+      &device_properties, compute_queue_set, transfer_queue_set, host_allocator,
+      out_device);
 
   logical_device_handle->ReleaseReference();
   return status;
@@ -1239,14 +1433,19 @@ static iree_status_t iree_hal_vulkan_device_query_i64(
   iree_hal_vulkan_device_t* device = iree_hal_vulkan_device_cast(base_device);
   *out_value = 0;
 
-  if (iree_string_view_equal(category,
-                             iree_make_cstring_view("hal.executable.format"))) {
-    if (iree_string_view_equal(key,
-                               iree_make_cstring_view("vulkan-spirv-fb"))) {
+  if (iree_string_view_equal(category, IREE_SV("hal.device.id"))) {
+    *out_value =
+        iree_string_view_match_pattern(device->identifier, key) ? 1 : 0;
+    return iree_ok_status();
+  }
+
+  if (iree_string_view_equal(category, IREE_SV("hal.executable.format"))) {
+    if (iree_string_view_equal(key, IREE_SV("vulkan-spirv-fb"))) {
       // Base SPIR-V always supported.
       *out_value = 1;
-    } else if (iree_string_view_equal(
-                   key, iree_make_cstring_view("vulkan-spirv-fb-ptr"))) {
+      return iree_ok_status();
+    }
+    if (iree_string_view_equal(key, IREE_SV("vulkan-spirv-fb-ptr"))) {
       // SPIR-V with device addresses is optionally supported based on whether
       // we have device feature support.
       *out_value = iree_all_bits_set(
@@ -1254,8 +1453,42 @@ static iree_status_t iree_hal_vulkan_device_query_i64(
                        IREE_HAL_VULKAN_FEATURE_ENABLE_BUFFER_DEVICE_ADDRESSES)
                        ? 1
                        : 0;
+      return iree_ok_status();
     }
-    return iree_ok_status();
+  }
+
+  // Note that the device queries used here should match the ones used in
+  // buildDeviceQueryRegion() on the compiler side.
+  if (iree_string_view_equal(category, IREE_SV("hal.dispatch"))) {
+    if (iree_string_view_equal(key, IREE_SV("compute.bitwidths.fp"))) {
+      *out_value = device->logical_device->supported_properties().compute_float;
+      return iree_ok_status();
+    }
+    if (iree_string_view_equal(key, IREE_SV("compute.bitwidths.int"))) {
+      *out_value = device->logical_device->supported_properties().compute_int;
+      return iree_ok_status();
+    }
+    if (iree_string_view_equal(key, IREE_SV("storage.bitwidths"))) {
+      *out_value = device->logical_device->supported_properties().storage;
+      return iree_ok_status();
+    }
+    if (iree_string_view_equal(key, IREE_SV("subgroup.ops"))) {
+      *out_value = device->logical_device->supported_properties().subgroup;
+      return iree_ok_status();
+    }
+    if (iree_string_view_equal(key, IREE_SV("dotprod.ops"))) {
+      *out_value = device->logical_device->supported_properties().dot_product;
+      return iree_ok_status();
+    }
+    if (iree_string_view_equal(key, IREE_SV("coopmatrix.ops"))) {
+      *out_value =
+          device->logical_device->supported_properties().cooperative_matrix;
+      return iree_ok_status();
+    }
+    if (iree_string_view_equal(key, IREE_SV("address.mode"))) {
+      *out_value = device->logical_device->supported_properties().address;
+      return iree_ok_status();
+    }
   }
 
   return iree_make_status(
@@ -1301,6 +1534,16 @@ static iree_status_t iree_hal_vulkan_device_create_command_buffer(
     iree_hal_command_buffer_t** out_command_buffer) {
   iree_hal_vulkan_device_t* device = iree_hal_vulkan_device_cast(base_device);
 
+  // TODO(indirect-cmd): until implemented through the whole stack we use a
+  // deferred command buffer and then translate that to a concrete Vulkan
+  // command buffer when submitted with bindings.
+  if (binding_capacity > 0) {
+    return iree_hal_deferred_command_buffer_create(
+        iree_hal_device_allocator(base_device), mode, command_categories,
+        queue_affinity, binding_capacity, &device->block_pool,
+        iree_hal_device_host_allocator(base_device), out_command_buffer);
+  }
+
   // TODO(scotttodd): revisit queue selection logic and remove this
   //   * the unaligned buffer fill polyfill and tracing timestamp queries may
   //     both insert dispatches into command buffers that at compile time are
@@ -1330,28 +1573,18 @@ static iree_status_t iree_hal_vulkan_device_create_command_buffer(
       device, command_categories, queue_affinity);
 
   return iree_hal_vulkan_direct_command_buffer_allocate(
-      base_device, device->logical_device, command_pool, mode,
-      command_categories, queue_affinity, binding_capacity,
+      iree_hal_device_allocator(base_device), device->logical_device,
+      command_pool, mode, command_categories, queue_affinity, binding_capacity,
       queue->tracing_context(), device->descriptor_pool_cache,
       device->builtin_executables, &device->block_pool, out_command_buffer);
 }
 
-static iree_status_t iree_hal_vulkan_device_create_descriptor_set_layout(
-    iree_hal_device_t* base_device,
-    iree_hal_descriptor_set_layout_flags_t flags,
-    iree_host_size_t binding_count,
-    const iree_hal_descriptor_set_layout_binding_t* bindings,
-    iree_hal_descriptor_set_layout_t** out_descriptor_set_layout) {
-  iree_hal_vulkan_device_t* device = iree_hal_vulkan_device_cast(base_device);
-  return iree_hal_vulkan_native_descriptor_set_layout_create(
-      device->logical_device, flags, binding_count, bindings,
-      out_descriptor_set_layout);
-}
-
 static iree_status_t iree_hal_vulkan_device_create_event(
-    iree_hal_device_t* base_device, iree_hal_event_t** out_event) {
+    iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+    iree_hal_event_flags_t flags, iree_hal_event_t** out_event) {
   iree_hal_vulkan_device_t* device = iree_hal_vulkan_device_cast(base_device);
-  return iree_hal_vulkan_native_event_create(device->logical_device, out_event);
+  return iree_hal_vulkan_native_event_create(device->logical_device,
+                                             queue_affinity, flags, out_event);
 }
 
 static iree_status_t iree_hal_vulkan_device_create_executable_cache(
@@ -1366,31 +1599,14 @@ static iree_status_t iree_hal_vulkan_device_import_file(
     iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
     iree_hal_memory_access_t access, iree_io_file_handle_t* handle,
     iree_hal_external_file_flags_t flags, iree_hal_file_t** out_file) {
-  if (iree_io_file_handle_type(handle) !=
-      IREE_IO_FILE_HANDLE_TYPE_HOST_ALLOCATION) {
-    return iree_make_status(
-        IREE_STATUS_UNAVAILABLE,
-        "implementation does not support the external file type");
-  }
-  return iree_hal_memory_file_wrap(
-      queue_affinity, access, handle, iree_hal_device_allocator(base_device),
+  return iree_hal_file_from_handle(
+      iree_hal_device_allocator(base_device), queue_affinity, access, handle,
       iree_hal_device_host_allocator(base_device), out_file);
-}
-
-static iree_status_t iree_hal_vulkan_device_create_pipeline_layout(
-    iree_hal_device_t* base_device, iree_host_size_t push_constants,
-    iree_host_size_t set_layout_count,
-    iree_hal_descriptor_set_layout_t* const* set_layouts,
-    iree_hal_pipeline_layout_t** out_pipeline_layout) {
-  iree_hal_vulkan_device_t* device = iree_hal_vulkan_device_cast(base_device);
-  return iree_hal_vulkan_native_pipeline_layout_create(
-      device->logical_device, push_constants, set_layout_count, set_layouts,
-      out_pipeline_layout);
 }
 
 static iree_status_t iree_hal_vulkan_device_create_semaphore(
     iree_hal_device_t* base_device, uint64_t initial_value,
-    iree_hal_semaphore_t** out_semaphore) {
+    iree_hal_semaphore_flags_t flags, iree_hal_semaphore_t** out_semaphore) {
   iree_hal_vulkan_device_t* device = iree_hal_vulkan_device_cast(base_device);
   return iree_hal_vulkan_native_semaphore_create(device->logical_device,
                                                  initial_value, out_semaphore);
@@ -1444,7 +1660,7 @@ static iree_status_t iree_hal_vulkan_device_queue_read(
     const iree_hal_semaphore_list_t signal_semaphore_list,
     iree_hal_file_t* source_file, uint64_t source_offset,
     iree_hal_buffer_t* target_buffer, iree_device_size_t target_offset,
-    iree_device_size_t length, uint32_t flags) {
+    iree_device_size_t length, iree_hal_read_flags_t flags) {
   // TODO: expose streaming chunk count/size options.
   iree_status_t loop_status = iree_ok_status();
   iree_hal_file_transfer_options_t options = {
@@ -1465,7 +1681,7 @@ static iree_status_t iree_hal_vulkan_device_queue_write(
     const iree_hal_semaphore_list_t signal_semaphore_list,
     iree_hal_buffer_t* source_buffer, iree_device_size_t source_offset,
     iree_hal_file_t* target_file, uint64_t target_offset,
-    iree_device_size_t length, uint32_t flags) {
+    iree_device_size_t length, iree_hal_write_flags_t flags) {
   // TODO: expose streaming chunk count/size options.
   iree_status_t loop_status = iree_ok_status();
   iree_hal_file_transfer_options_t options = {
@@ -1484,22 +1700,67 @@ static iree_status_t iree_hal_vulkan_device_queue_execute(
     iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
     const iree_hal_semaphore_list_t wait_semaphore_list,
     const iree_hal_semaphore_list_t signal_semaphore_list,
-    iree_host_size_t command_buffer_count,
-    iree_hal_command_buffer_t* const* command_buffers) {
+    iree_hal_command_buffer_t* command_buffer,
+    iree_hal_buffer_binding_table_t binding_table) {
   iree_hal_vulkan_device_t* device = iree_hal_vulkan_device_cast(base_device);
+
   // NOTE: today we are not discriminating queues based on command type.
   CommandQueue* queue = iree_hal_vulkan_device_select_queue(
       device, IREE_HAL_COMMAND_CATEGORY_DISPATCH, queue_affinity);
-  iree_hal_submission_batch_t batch = {
-      /*.wait_semaphores=*/wait_semaphore_list,
-      /*.command_buffer_count=*/command_buffer_count,
-      /*.command_buffers=*/command_buffers,
-      /*.signal_semaphores=*/signal_semaphore_list,
-  };
-  IREE_RETURN_IF_ERROR(queue->Submit(1, &batch));
+
+  // TODO(indirect-cmd): today we are using deferred command buffers to emulate
+  // indirect command buffers - this requires that we materialize real command
+  // buffers on demand here. When we natively support them we'll still need to
+  // process the binding table prior to submission but that can be done in a
+  // much more lightweight way depending on our concurrency needs.
+  iree_hal_command_buffer_t* translated_command_buffer = NULL;
+  iree_status_t status = iree_ok_status();
+  if (command_buffer != NULL) {
+    if (iree_hal_deferred_command_buffer_isa(command_buffer)) {
+      status = iree_hal_vulkan_device_create_command_buffer(
+          base_device,
+          iree_hal_command_buffer_mode(command_buffer) |
+              IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT |
+              // NOTE: we need to validate if a binding table is provided as the
+              // bindings were not known when it was originally recorded.
+              (iree_hal_buffer_binding_table_is_empty(binding_table)
+                   ? IREE_HAL_COMMAND_BUFFER_MODE_UNVALIDATED
+                   : 0),
+          iree_hal_command_buffer_allowed_categories(command_buffer),
+          queue_affinity, /*binding_capacity=*/0, &translated_command_buffer);
+      if (iree_status_is_ok(status)) {
+        status = iree_hal_deferred_command_buffer_apply(
+            command_buffer, translated_command_buffer, binding_table);
+      }
+    } else {
+      translated_command_buffer = command_buffer;
+      iree_hal_command_buffer_retain(command_buffer);
+    }
+  }
+
+  if (iree_status_is_ok(status)) {
+    iree_hal_vulkan_submission_batch_t batch = {
+        /*.wait_semaphores=*/wait_semaphore_list,
+        /*.command_buffer_count=*/
+        (iree_host_size_t)(translated_command_buffer ? 1 : 0),
+        /*.command_buffers=*/
+        translated_command_buffer ? &translated_command_buffer : NULL,
+        /*.signal_semaphores=*/signal_semaphore_list,
+    };
+    status = queue->Submit(1, &batch);
+  }
+
   // HACK: we don't track async resource lifetimes so we have to block.
-  return iree_hal_semaphore_list_wait(signal_semaphore_list,
-                                      iree_infinite_timeout());
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_semaphore_list_wait(signal_semaphore_list,
+                                          iree_infinite_timeout());
+  }
+
+  // TODO(indirect-cmd): when async these need to be retained until the
+  // submission completes.
+  iree_hal_command_buffer_release(translated_command_buffer);
+
+  return status;
 }
 
 static iree_status_t iree_hal_vulkan_device_queue_flush(
@@ -1616,20 +1877,18 @@ const iree_hal_device_vtable_t iree_hal_vulkan_device_vtable = {
     /*.query_i64=*/iree_hal_vulkan_device_query_i64,
     /*.create_channel=*/iree_hal_vulkan_device_create_channel,
     /*.create_command_buffer=*/iree_hal_vulkan_device_create_command_buffer,
-    /*.create_descriptor_set_layout=*/
-    iree_hal_vulkan_device_create_descriptor_set_layout,
     /*.create_event=*/iree_hal_vulkan_device_create_event,
     /*.create_executable_cache=*/
     iree_hal_vulkan_device_create_executable_cache,
     /*.import_file=*/iree_hal_vulkan_device_import_file,
-    /*.create_pipeline_layout=*/
-    iree_hal_vulkan_device_create_pipeline_layout,
     /*.create_semaphore=*/iree_hal_vulkan_device_create_semaphore,
     /*.query_semaphore_compatibility=*/
     iree_hal_vulkan_device_query_semaphore_compatibility,
-    /*.transfer_range=*/iree_hal_device_submit_transfer_range_and_wait,
     /*.queue_alloca=*/iree_hal_vulkan_device_queue_alloca,
     /*.queue_dealloca=*/iree_hal_vulkan_device_queue_dealloca,
+    /*.queue_fill=*/iree_hal_device_queue_emulated_fill,
+    /*.queue_update=*/iree_hal_device_queue_emulated_update,
+    /*.queue_copy=*/iree_hal_device_queue_emulated_copy,
     /*.queue_read=*/iree_hal_vulkan_device_queue_read,
     /*.queue_write=*/iree_hal_vulkan_device_queue_write,
     /*.queue_execute=*/iree_hal_vulkan_device_queue_execute,

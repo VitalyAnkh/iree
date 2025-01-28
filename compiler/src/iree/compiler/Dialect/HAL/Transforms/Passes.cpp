@@ -8,14 +8,16 @@
 
 #include <memory>
 
-#include "iree/compiler/Codegen/Common/CPU/Passes.h"
 #include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "iree/compiler/Dialect/HAL/Target/Devices/LocalDevice.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
 #include "iree/compiler/Utils/OptionUtils.h"
 #include "iree/compiler/Utils/PassUtils.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Dialect/Affine/Passes.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/Passes.h"
 
@@ -24,10 +26,6 @@ namespace mlir::iree_compiler::IREE::HAL {
 namespace {
 
 struct TransformOptions : public PassPipelineOptions<TransformOptions> {
-  // TODO(benvanik): replace the global iree-hal-target-backends flag with this.
-  // ListOption<std::string> targets{
-  //     *this, "targets", llvm::cl::desc("One or more HAL devices to target."),
-  //     llvm::cl::ZeroOrMore};
   Option<bool> serializeExecutables{
       *this,
       "serialize-executables",
@@ -41,6 +39,13 @@ struct TransformOptions : public PassPipelineOptions<TransformOptions> {
       llvm::cl::desc("Whether to link hal.executable ops together."),
       llvm::cl::init(true),
   };
+};
+
+static llvm::cl::opt<bool> clMemoization{
+    "iree-hal-memoization",
+    llvm::cl::desc(
+        "Whether to memoize device resources such as command buffers."),
+    llvm::cl::init(true),
 };
 
 static llvm::cl::opt<unsigned> clBenchmarkDispatchRepeatCount{
@@ -134,30 +139,114 @@ static llvm::cl::list<std::string> clPreprocessExecutablesWith{
         "will fail compilation."),
 };
 
+static llvm::cl::opt<bool> clLinkExecutables{
+    "iree-hal-link-executables",
+    llvm::cl::desc(
+        "Controls linking of executables. The default is to always link, "
+        "however disabling linking allows inspecting serialization "
+        "of each executable in isolation and will dump a single binary per "
+        "executable when used in conjunction with "
+        "`--iree-hal-dump-executable-binaries-to`."),
+    llvm::cl::init(true),
+};
+
 } // namespace
 
-using FunctionLikeNest = MultiOpNest<func::FuncOp, IREE::Util::InitializerOp>;
+using FunctionLikeNest =
+    MultiOpNest<func::FuncOp, IREE::Util::InitializerOp, IREE::Util::FuncOp>;
+
+//===----------------------------------------------------------------------===//
+// Utilities
+//===----------------------------------------------------------------------===//
 
 static void addCleanupPatterns(OpPassManager &passManager) {
-  // Standard MLIR cleanup.
-  passManager.addPass(mlir::createCSEPass());
-  passManager.addPass(mlir::createCanonicalizerPass());
-  passManager.addPass(mlir::createCSEPass());
 
-  // Simplify util.global accesses; this can help with data flow tracking as
-  // redundant store-loads are removed.
   FunctionLikeNest(passManager)
-      .addPass(IREE::Util::createSimplifyGlobalAccessesPass);
+      // Standard MLIR cleanup.
+      .addPass(mlir::createCanonicalizerPass)
+      .addPass(mlir::createCSEPass)
+
+      // Simplify util.global accesses; this can help with data flow tracking as
+      // redundant store-loads are removed.
+      .addPass(IREE::Util::createSimplifyGlobalAccessesPass)
+
+      // Aggressive cleanup.
+      .addPass(IREE::Util::createApplyPatternsPass);
 
   // Cleanup and canonicalization of util.global (and other util ops).
-  passManager.addPass(IREE::Util::createApplyPatternsPass());
   passManager.addPass(IREE::Util::createFoldGlobalsPass());
   passManager.addPass(IREE::Util::createFuseGlobalsPass());
 }
 
-void buildHALConfigurationPassPipeline(
-    OpPassManager &passManager, const TargetBackendRegistry &targetRegistry,
-    const TargetOptions &targetOptions) {
+static void addExecutableSubstitutionPasses(OpPassManager &passManager,
+                                            ArrayRef<std::string> substitutions,
+                                            StringRef fromPath) {
+  if (!fromPath.empty()) {
+    SubstituteExecutablesPassOptions substituteOptions;
+    substituteOptions.searchPath = fromPath;
+    passManager.addPass(
+        IREE::HAL::createSubstituteExecutablesPass(substituteOptions));
+  }
+  if (!substitutions.empty()) {
+    SubstituteExecutablesPassOptions substituteOptions;
+    substituteOptions.substitutions.assign(substitutions.begin(),
+                                           substitutions.end());
+    passManager.addPass(
+        IREE::HAL::createSubstituteExecutablesPass(substituteOptions));
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// --iree-hal-device-assignment-pipeline
+//===----------------------------------------------------------------------===//
+
+void buildHALDeviceAssignmentPassPipeline(
+    OpPassManager &passManager, const TargetRegistry &targetRegistry,
+    const AssignmentOptions &assignmentOptions) {
+  // The HAL must know its targets early on in the process. This pass discovers/
+  // derives/specifies the target devices and annotates the module with that
+  // information. This allows subsequent passes to lookup which devices they are
+  // targeting.
+  if (!assignmentOptions.legacyTargetBackends.empty()) {
+    // Today we just assign devices from parameters but we should instead be
+    // performing analysis at the flow level and then doing magic device
+    // database lookups here.
+    AssignLegacyTargetDevicesPassOptions options;
+    options.targetRegistry = &targetRegistry;
+    options.targetBackends.assign(
+        assignmentOptions.legacyTargetBackends.begin(),
+        assignmentOptions.legacyTargetBackends.end());
+    passManager.addPass(
+        IREE::HAL::createAssignLegacyTargetDevicesPass(options));
+  }
+  if (!assignmentOptions.targetDevices.empty()) {
+    AssignTargetDevicesPassOptions options;
+    options.targetDevices.assign(assignmentOptions.targetDevices.begin(),
+                                 assignmentOptions.targetDevices.end());
+    passManager.addPass(IREE::HAL::createAssignTargetDevicesPass(options));
+  }
+
+  // Create globals for each device (if needed).
+  passManager.addPass(IREE::HAL::createMaterializeTargetDevicesPass(
+      {assignmentOptions.defaultDevice}));
+
+  // Resolve #hal.device.promise and #hal.device.alias attributes.
+  passManager.addPass(IREE::HAL::createResolveDevicePromisesPass());
+  passManager.addPass(
+      IREE::HAL::createResolveDeviceAliasesPass({&targetRegistry}));
+
+  // Verify devices are valid.
+  passManager.addPass(IREE::HAL::createVerifyDevicesPass({&targetRegistry}));
+}
+
+//===----------------------------------------------------------------------===//
+// --iree-hal-configuration-pipeline
+//===----------------------------------------------------------------------===//
+
+void buildHALConfigurationPassPipeline(OpPassManager &passManager,
+                                       const TargetRegistry &targetRegistry,
+                                       const TargetOptions &targetOptions,
+                                       PipelineHooks hooks) {
   //----------------------------------------------------------------------------
   // Input cleanup and simplification
   //----------------------------------------------------------------------------
@@ -166,41 +255,34 @@ void buildHALConfigurationPassPipeline(
   // and initial interface analysis (we rely on CSE and such having been run).
   addCleanupPatterns(passManager);
 
-  //----------------------------------------------------------------------------
-  // Device assignment and interface materialization
-  //----------------------------------------------------------------------------
+  // Verify devices are valid.
+  passManager.addPass(IREE::HAL::createVerifyDevicesPass({&targetRegistry}));
 
-  // The HAL must know its targets early on in the process. This pass discovers/
-  // derives/specifies the target devices and annotates the module with that
-  // information. This allows subsequent passes to lookup which devices they are
-  // targeting.
-  if (!targetOptions.targets.empty()) {
-    // Today we just assign devices from parameters but we should instead be
-    // performing analysis at the flow level and then doing magic device
-    // database lookups here.
-    passManager.addPass(
-        createAssignTargetDevicesPass(targetRegistry, targetOptions.targets));
-  }
-  passManager.addPass(createVerifyTargetEnvironmentPass(targetRegistry));
+  //----------------------------------------------------------------------------
+  // Device-specific interface materialization
+  //----------------------------------------------------------------------------
 
   // Add dispatch instrumentation prior to materializing interfaces so we can
   // more easily mutate the stream dispatch ops and exports.
   if (auto bufferSize = clInstrumentDispatchBufferSize.getValue()) {
-    passManager.addPass(
-        createMaterializeDispatchInstrumentationPass(bufferSize.value));
+    passManager.addPass(IREE::HAL::createMaterializeDispatchInstrumentationPass(
+        {bufferSize.value}));
   }
 
   // Each executable needs a hal.interface to specify how the host and
   // device communicate across the ABI boundary.
-  passManager.addPass(createMaterializeInterfacesPass());
+  passManager.addPass(IREE::HAL::createMaterializeInterfacesPass());
+
+  // Prune unused executables and their contents.
+  passManager.addPass(IREE::HAL::createPruneExecutablesPass());
 
   // Dump a source listing of each hal.executable and update the source
   // locations in the IR. This will allow us to easily inspect each executable
   // and give downstream tools that can display source information something
   // more useful and slim than the entire original source model.
   if (!targetOptions.executableSourcesPath.empty()) {
-    passManager.addPass(
-        createDumpExecutableSourcesPass(targetOptions.executableSourcesPath));
+    passManager.addPass(IREE::HAL::createDumpExecutableSourcesPass(
+        {targetOptions.executableSourcesPath}));
   }
 
   // Substitute hal.executables we've generated from earlier phases of
@@ -209,48 +291,70 @@ void buildHALConfigurationPassPipeline(
   // in various forms without modifying the end-to-end compiler. Note that we do
   // this prior to dumping benchmarks in order to allow generating new
   // benchmarks using the substituted executables.
-  if (!clSubstituteExecutableSourcesFrom.empty()) {
-    passManager.addPass(createSubstituteExecutablesPass(
-        clSubstituteExecutableSourcesFrom.getValue()));
-  }
-  if (!clSubstituteExecutableSource.empty()) {
+  addExecutableSubstitutionPasses(passManager, clSubstituteExecutableSource,
+                                  clSubstituteExecutableSourcesFrom);
+
+  // If debug information is requested capture the MLIR source text of each
+  // executable variant and associate it with the entry points. This allows us
+  // to preserve this information after translation and the original input IR
+  // has been erased.
+  if (targetOptions.debugLevel >= 3) {
     passManager.addPass(
-        createSubstituteExecutablesPass(clSubstituteExecutableSource));
+        IREE::HAL::createCaptureExecutableSourcesPass({"0.source"}));
   }
 }
 
+//===----------------------------------------------------------------------===//
+// --iree-hal-transformation-pipeline
+//===----------------------------------------------------------------------===//
+
 void buildHALTransformPassPipeline(OpPassManager &passManager,
-                                   const TargetBackendRegistry &targetRegistry,
+                                   const TargetRegistry &targetRegistry,
                                    const TargetOptions &targetOptions,
                                    const TransformOptions &transformOptions,
+                                   PipelineHooks hooks,
                                    PipelinePhase compileFrom,
                                    PipelinePhase compileTo) {
   //----------------------------------------------------------------------------
   // Device assignment and interface materialization
   //----------------------------------------------------------------------------
 
-  if (compileFrom < PipelinePhase::ExecutableSources) {
-    buildHALConfigurationPassPipeline(passManager, targetRegistry,
-                                      targetOptions);
+  if (hooks.beforePhase) {
+    hooks.beforePhase(PipelinePhase::ExecutableSources, passManager);
+  }
 
-    FunctionLikeNest(passManager).addPass([]() {
-      return createCPUMaterializeUpperBoundTileSizePass();
-    });
+  if (compileFrom < PipelinePhase::ExecutableSources) {
+    AssignmentOptions assignmentOptions;
+    assignmentOptions.legacyTargetBackends = targetOptions.legacyTargetBackends;
+    assignmentOptions.targetDevices = targetOptions.targetDevices;
+    assignmentOptions.defaultDevice = targetOptions.defaultDevice;
+    buildHALDeviceAssignmentPassPipeline(passManager, targetRegistry,
+                                         assignmentOptions);
+    buildHALConfigurationPassPipeline(passManager, targetRegistry,
+                                      targetOptions, hooks);
 
     // Preprocess executables using an external tool. The tool may mutate one or
     // more variants and even insert or remove variants.
     for (auto command : clPreprocessExecutablesWith) {
       passManager.addNestedPass<IREE::HAL::ExecutableOp>(
-          createPreprocessExecutablesPass(command));
+          IREE::HAL::createPreprocessExecutablesPass(command));
     }
   }
 
-  if (compileTo == PipelinePhase::ExecutableSources)
+  if (hooks.afterPhase) {
+    hooks.afterPhase(PipelinePhase::ExecutableSources, passManager);
+  }
+  if (compileTo == PipelinePhase::ExecutableSources) {
     return;
+  }
 
   //----------------------------------------------------------------------------
   // Executable translation
   //----------------------------------------------------------------------------
+
+  if (hooks.beforePhase) {
+    hooks.beforePhase(PipelinePhase::ExecutableConfigurations, passManager);
+  }
 
   if (compileFrom < PipelinePhase::ExecutableConfigurations) {
     // Select a translation strategy for each hal.executable.variant and
@@ -259,30 +363,28 @@ void buildHALTransformPassPipeline(OpPassManager &passManager,
     // selected translation strategies and the features each translation
     // strategy are known to require or not require.
     passManager.addNestedPass<IREE::HAL::ExecutableOp>(
-        createConfigureExecutablesPass(targetRegistry));
+        IREE::HAL::createConfigureExecutablesPass({targetRegistry}));
 
     // Dump a second listing of each hal.executable after preprocessing and
     // configuration of executables, as well as update locations in the IR.
     if (!targetOptions.executableConfigurationsPath.empty()) {
-      passManager.addPass(createDumpExecutableSourcesPass(
-          targetOptions.executableConfigurationsPath, "configured"));
+      passManager.addPass(IREE::HAL::createDumpExecutableSourcesPass(
+          {targetOptions.executableConfigurationsPath, "configured"}));
     }
 
-    if (!clSubstituteExecutableConfiguration.empty()) {
+    // If debug information is requested capture the MLIR source text of each
+    // configured executable variant and associate it with the entry points.
+    if (targetOptions.debugLevel >= 3) {
       passManager.addPass(
-          createSubstituteExecutablesPass(clSubstituteExecutableConfiguration));
+          IREE::HAL::createCaptureExecutableSourcesPass({"1.configured"}));
     }
+
     // Substitute hal.executables we've configured with those specified on the
     // command line. This developer feature allows for hand editing the
     // configured executable with different lowering parameters.
-    if (!clSubstituteExecutableConfigurationsFrom.empty()) {
-      passManager.addPass(createSubstituteExecutablesPass(
-          clSubstituteExecutableConfigurationsFrom.getValue()));
-    }
-    if (!clSubstituteExecutableConfiguration.empty()) {
-      passManager.addPass(
-          createSubstituteExecutablesPass(clSubstituteExecutableConfiguration));
-    }
+    addExecutableSubstitutionPasses(passManager,
+                                    clSubstituteExecutableConfiguration,
+                                    clSubstituteExecutableConfigurationsFrom);
 
     // Dump standalone hal.executable benchmark modules.
     // Today this only works for executables that have static dispatch
@@ -290,13 +392,17 @@ void buildHALTransformPassPipeline(OpPassManager &passManager,
     // after configuration to make it easy to tweak configurations directly
     // from the benchmark.
     if (!targetOptions.executableBenchmarksPath.empty()) {
-      passManager.addPass(createDumpExecutableBenchmarksPass(
-          targetOptions.executableBenchmarksPath));
+      passManager.addPass(IREE::HAL::createDumpExecutableBenchmarksPass(
+          {targetOptions.executableBenchmarksPath}));
     }
   }
 
-  if (compileTo == PipelinePhase::ExecutableConfigurations)
+  if (hooks.afterPhase) {
+    hooks.afterPhase(PipelinePhase::ExecutableConfigurations, passManager);
+  }
+  if (compileTo == PipelinePhase::ExecutableConfigurations) {
     return;
+  }
 
   // TODO(benvanik): move translation after conversion; today translation
   // inserts the workgroup count logic we need to convert but we could instead
@@ -309,13 +415,30 @@ void buildHALTransformPassPipeline(OpPassManager &passManager,
   // After this point the executables are opaque blobs and we cannot change
   // their interfaces.
 
-  if (compileFrom < PipelinePhase::ExecutableTargets) {
-    passManager.addNestedPass<IREE::HAL::ExecutableOp>(
-        createTranslateExecutablesPass(targetRegistry));
+  if (hooks.beforePhase) {
+    hooks.beforePhase(PipelinePhase::ExecutableTargets, passManager);
   }
 
-  if (compileTo == PipelinePhase::ExecutableTargets)
+  if (compileFrom < PipelinePhase::ExecutableTargets) {
+    passManager.addNestedPass<IREE::HAL::ExecutableOp>(
+        IREE::HAL::createTranslateAllExecutablesPass({targetRegistry}));
+  }
+
+  // If debug information is requested capture the translated MLIR source text
+  // of each executable variant and associate it with the entry points. This
+  // allows us to compare the input IR with the translated IR before
+  // serialization (LLVM dialect, SPIR-V dialect, etc).
+  if (targetOptions.debugLevel >= 3) {
+    passManager.addPass(
+        IREE::HAL::createCaptureExecutableSourcesPass({"2.translated"}));
+  }
+
+  if (hooks.afterPhase) {
+    hooks.afterPhase(PipelinePhase::ExecutableTargets, passManager);
+  }
+  if (compileTo == PipelinePhase::ExecutableTargets) {
     return;
+  }
 
   // Substitute hal.executables we've translated with those specified on the
   // command line. This developer feature allows for splicing in hand-authored
@@ -324,25 +447,27 @@ void buildHALTransformPassPipeline(OpPassManager &passManager,
   // but sometimes translation is required to produce the host code required
   // for specialization and workgroup counts and we need to perform the
   // substitution later.
-  if (!clSubstituteExecutableObjectsFrom.empty()) {
-    passManager.addPass(createSubstituteExecutablesPass(
-        clSubstituteExecutableObjectsFrom.getValue()));
-  }
-  if (!clSubstituteExecutableObject.empty()) {
-    passManager.addPass(
-        createSubstituteExecutablesPass(clSubstituteExecutableObject));
-  }
+  addExecutableSubstitutionPasses(passManager, clSubstituteExecutableObject,
+                                  clSubstituteExecutableObjectsFrom);
 
   //----------------------------------------------------------------------------
   // Host program conversion
   //----------------------------------------------------------------------------
 
   // Convert supported input dialects (std, stream, etc) into the HAL dialect.
-  passManager.addPass(createConvertToHALPass());
+  passManager.addPass(IREE::HAL::createConvertToHALPass());
 
-  // If any devices require the legacy synchronous execution behavior then
-  // make all async operations blocking.
-  passManager.addPass(createFixupLegacySyncPass());
+  // If memoization is disabled then inline any regions that were created during
+  // conversion.
+  if (!clMemoization) {
+    FunctionLikeNest(passManager)
+        .addPass(IREE::HAL::createInlineMemoizeRegionsPass);
+  } else {
+    passManager.addPass(IREE::HAL::createOutlineMemoizeRegionsPass());
+  }
+
+  // Prune unused executables and their contents.
+  passManager.addPass(IREE::HAL::createPruneExecutablesPass());
 
   addCleanupPatterns(passManager);
 
@@ -353,22 +478,31 @@ void buildHALTransformPassPipeline(OpPassManager &passManager,
   // TODO(benvanik): move translation down to here.
 
   // After all executables are translated and before resolving export
-  // ordinals, we allow the backends to link executables together. For
+  // ordinals we allow the backends to link executables together. For
   // example, the LLVM AOT backend may combine all executable targets for the
   // same architecture into a single executable and link it as a shared
   // library.
-  if (transformOptions.linkExecutables) {
-    passManager.addPass(createLinkExecutablesPass(targetRegistry));
+  if (transformOptions.linkExecutables && clLinkExecutables) {
+    passManager.addPass(
+        IREE::HAL::createLinkAllExecutablesPass({targetRegistry}));
   }
+
+  // If any executable variants have external objects referenced within them
+  // we hoist them up to the top-level variant. This is done after linking so
+  // that we have the greatest chance of combining executables without different
+  // object attrs preventing the merging.
+  passManager.nest<IREE::HAL::ExecutableOp>()
+      .addNestedPass<IREE::HAL::ExecutableVariantOp>(
+          IREE::HAL::createHoistExecutableObjectsPass());
 
   // Resolve export ordinals from nested symbol references prior to
   // serialization. As this pass creates lookup ops it should run before
   // MaterializeResourceCachesPass.
-  passManager.addPass(createResolveExportOrdinalsPass());
+  passManager.addPass(IREE::HAL::createResolveExportOrdinalsPass());
 
   // Gather cacheable resources such as executables and descriptor sets and
   // cache them at initialization-time.
-  passManager.addPass(createMaterializeResourceCachesPass(targetOptions));
+  passManager.addPass(IREE::HAL::createMaterializeResourceCachesPass());
 
   //----------------------------------------------------------------------------
   // Device management and specialization
@@ -376,20 +510,33 @@ void buildHALTransformPassPipeline(OpPassManager &passManager,
 
   // Memoize device queries such that we don't need to repeatedly ask the same
   // information at runtime.
-  passManager.addPass(createMemoizeDeviceQueriesPass());
+  passManager.addPass(IREE::HAL::createMemoizeDeviceQueriesPass());
 
   // Big cleanup after all our conversion and materialization.
   addCleanupPatterns(passManager);
 
-  // HACK: repeat dispatch ops for benchmarks.
+  // Benchmarking only: repeat dispatch ops a certain number of times.
+  // This is guaranteed to invalidate program output and may introduce crashes
+  // if there are in-place dispatches that expect specific input data.
   if (clBenchmarkDispatchRepeatCount != 1) {
-    passManager.addNestedPass<mlir::func::FuncOp>(
-        createBenchmarkBatchDispatchesPass(clBenchmarkDispatchRepeatCount));
+    FunctionLikeNest(passManager).addPass([&]() {
+      return IREE::HAL::createRepeatDispatchesPass(
+          {clBenchmarkDispatchRepeatCount});
+    });
   }
 
   // Elide redundant command buffer state ops created during conversion.
-  FunctionLikeNest(passManager).addPass(createElideRedundantCommandsPass);
+  FunctionLikeNest(passManager)
+      .addPass(IREE::HAL::createElideRedundantCommandsPass);
 
+  // Initialize device globals now that we've done the analysis that is easier
+  // with them in their original target specification.
+  passManager.addPass(IREE::HAL::createInitializeDevicesPass({targetRegistry}));
+
+  // TODO: Maybe this should be a part of Affine lowering pass.
+  // Remove if it is added there.
+  // https://github.com/llvm/llvm-project/issues/78458
+  passManager.addPass(affine::createAffineExpandIndexOpsPass());
   // Fixup workgroup count calculations that may have used the affine dialect.
   // Kind of random here but can happen if the benchmarking code does things.
   passManager.addPass(mlir::createLowerAffinePass());
@@ -397,10 +544,6 @@ void buildHALTransformPassPipeline(OpPassManager &passManager,
   // TODO(benvanik): remove the need for this; some cleanup passes such as
   // SimplifyGlobalAccesses are currently broken with scf present.
   FunctionLikeNest(passManager).addPass(mlir::createConvertSCFToCFPass);
-
-  // Combine the initializers we emitted during resource cache
-  // materialization.
-  passManager.addPass(IREE::Util::createCombineInitializersPass());
 
   //----------------------------------------------------------------------------
   // Executable serialization
@@ -410,13 +553,14 @@ void buildHALTransformPassPipeline(OpPassManager &passManager,
   // contents not turned into a big base64 string.
   if (transformOptions.serializeExecutables) {
     passManager.addNestedPass<IREE::HAL::ExecutableOp>(
-        createSerializeExecutablesPass(
-            targetRegistry, targetOptions.debugLevel,
-            targetOptions.executableIntermediatesPath,
-            targetOptions.executableBinariesPath));
+        IREE::HAL::createSerializeAllExecutablesPass(
+            {&targetRegistry, targetOptions.debugLevel,
+             targetOptions.executableIntermediatesPath,
+             targetOptions.executableBinariesPath}));
 
     // NOTE: symbol DCE will destroy executable target contents, so only run
     // it if we serialized things.
+    passManager.addPass(IREE::HAL::createPruneExecutablesPass());
     passManager.addPass(mlir::createSymbolDCEPass());
   }
 
@@ -448,35 +592,68 @@ void buildHALTransformPassPipeline(OpPassManager &passManager,
 }
 
 void buildHALTransformPassPipeline(OpPassManager &passManager,
-                                   const TargetBackendRegistry &targetRegistry,
+                                   const TargetRegistry &targetRegistry,
                                    const TargetOptions &targetOptions,
+                                   PipelineHooks hooks,
                                    PipelinePhase compileFrom,
                                    PipelinePhase compileTo) {
   TransformOptions transformOptions;
   buildHALTransformPassPipeline(passManager, targetRegistry, targetOptions,
-                                transformOptions, compileFrom, compileTo);
+                                transformOptions, hooks, compileFrom,
+                                compileTo);
 }
 
-void registerHALConfigurationPassPipeline() {
+//===----------------------------------------------------------------------===//
+// Registration
+//===----------------------------------------------------------------------===//
+
+namespace {
+#define GEN_PASS_REGISTRATION
+#include "iree/compiler/Dialect/HAL/Transforms/Passes.h.inc" // IWYU pragma: export
+} // namespace
+
+void registerHALPasses() {
+  // Force the flags to be bound.
+  // TODO(benvanik): remove the global flags and only rely on pipeline flags.
+  (void)IREE::HAL::TargetOptions::FromFlags::get();
+  // TODO(multi-device): move the local device registration somewhere more
+  // centralized. For now we piggy-back on the pass registration as that's where
+  // the local device is used.
+  (void)IREE::HAL::LocalDevice::Options::FromFlags::get();
+  IREE::HAL::TargetDeviceList deviceList;
+  deviceList.add("local", [=]() {
+    return std::make_shared<LocalDevice>(
+        IREE::HAL::LocalDevice::Options::FromFlags::get());
+  });
+  IREE::HAL::TargetRegistry::getMutableTargetRegistry().mergeFrom(deviceList);
+
+  // Generated.
+  registerPasses();
+
+  // Pipelines.
+  PassPipelineRegistration<AssignmentOptions>(
+      "iree-hal-device-assignment-pipeline",
+      "Runs HAL target device assignment pipeline.",
+      [](OpPassManager &passManager,
+         const AssignmentOptions &assignmentOptions) {
+        buildHALDeviceAssignmentPassPipeline(
+            passManager, TargetRegistry::getGlobal(), assignmentOptions);
+      });
   PassPipelineRegistration<>("iree-hal-configuration-pipeline",
-                             "Runs the IREE HAL dialect configuration pipeline",
+                             "Runs HAL target configuration pipeline.",
                              [](OpPassManager &passManager) {
                                buildHALConfigurationPassPipeline(
-                                   passManager,
-                                   TargetBackendRegistry::getGlobal(),
+                                   passManager, TargetRegistry::getGlobal(),
                                    TargetOptions::FromFlags::get());
                              });
-}
-
-void registerHALTransformPassPipeline() {
   PassPipelineRegistration<TransformOptions>(
       "iree-hal-transformation-pipeline",
-      "Runs the full IREE HAL dialect transformation pipeline",
+      "Runs the full IREE HAL conversion/lowering pipeline.",
       [](OpPassManager &passManager, const TransformOptions &transformOptions) {
-        buildHALTransformPassPipeline(
-            passManager, TargetBackendRegistry::getGlobal(),
-            TargetOptions::FromFlags::get(), transformOptions,
-            PipelinePhase::Start, PipelinePhase::End);
+        buildHALTransformPassPipeline(passManager, TargetRegistry::getGlobal(),
+                                      TargetOptions::FromFlags::get(),
+                                      transformOptions, PipelineHooks{},
+                                      PipelinePhase::Start, PipelinePhase::End);
       });
 }
 

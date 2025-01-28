@@ -11,7 +11,6 @@
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "llvm/Support/SourceMgr.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/DialectImplementation.h"
@@ -75,8 +74,12 @@ FlowDialect::FlowDialect(MLIRContext *context)
 
 Operation *FlowDialect::materializeConstant(OpBuilder &builder, Attribute value,
                                             Type type, Location loc) {
-  if (arith::ConstantOp::isBuildableWith(value, type))
+  if (arith::ConstantOp::isBuildableWith(value, type)) {
     return builder.create<arith::ConstantOp>(loc, type, cast<TypedAttr>(value));
+  } else if (IREE::Flow::TensorConstantOp::isBuildableWith(value, type)) {
+    return builder.create<IREE::Flow::TensorConstantOp>(loc, type,
+                                                        cast<TypedAttr>(value));
+  }
   return nullptr;
 }
 

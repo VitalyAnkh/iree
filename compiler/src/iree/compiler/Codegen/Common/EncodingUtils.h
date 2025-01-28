@@ -7,22 +7,18 @@
 #ifndef IREE_COMPILER_SRC_IREE_COMPILER_CODEGEN_COMMON_ENCODINGUTILS_H_
 #define IREE_COMPILER_SRC_IREE_COMPILER_CODEGEN_COMMON_ENCODINGUTILS_H_
 
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenInterfaces.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenTypes.h"
+#include "iree/compiler/Dialect/Encoding/IR/EncodingOps.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 namespace mlir::iree_compiler {
 
-/// Container of information needed to materialize the pack operation.
-struct MaterializeEncodingInfo {
-  SmallVector<int64_t> innerDimsPos;
-  SmallVector<int64_t> innerTileSizes;
-  SmallVector<int64_t> outerDimsPerm;
-  unsigned srcRank = 0;
-};
-
 using MaterializeEncodingFn =
-    std::function<FailureOr<MaterializeEncodingInfo>(RankedTensorType)>;
+    std::function<FailureOr<IREE::Codegen::MaterializeEncodingInfo>(
+        RankedTensorType, IREE::HAL::ExecutableTargetAttr targetAttr)>;
 
 struct MaterializeEncodingValueInfo {
   SmallVector<Value> innerTileSizes;
@@ -37,14 +33,20 @@ using MaterializeEncodingValueFn =
 //===---------------------------------------------------------------------===//
 
 /// TypeConverter to use for materializing the encoding.
-struct MaterializeEncodingTypeConverter : public TypeConverter {
-  MaterializeEncodingTypeConverter(MaterializeEncodingFn fn);
-  const MaterializeEncodingFn &getMaterializeEncodingFn() const {
-    return materializeEncodingFn;
+class MaterializeEncodingTypeConverter : public TypeConverter {
+public:
+  MaterializeEncodingTypeConverter(
+      IREE::Codegen::LayoutAttrInterface layoutAttr);
+
+  const IREE::Codegen::LayoutAttrInterface &getLayoutAttr() const {
+    return layoutAttr;
   }
 
+  IREE::Codegen::MaterializeEncodingInfo
+  getEncodingInfo(RankedTensorType type) const;
+
 private:
-  const MaterializeEncodingFn materializeEncodingFn;
+  const IREE::Codegen::LayoutAttrInterface layoutAttr;
 };
 
 /// Conversion target to use for for materializing the encoding.
@@ -72,60 +74,35 @@ protected:
 // Utility methods about Encoding.
 //===---------------------------------------------------------------------===//
 
-/// Returns the encoding attribute from the type if there is an encoding.
-/// Otherwise, returns null.
-IREE::LinalgExt::EncodingAttr getEncodingAttr(RankedTensorType type);
-
-/// Returns the original type that carried by encoding.
-RankedTensorType getOriginalTypeWithEncoding(RankedTensorType type);
-
 /// Returns the RankedTensorType without encodings.
 RankedTensorType dropEncoding(RankedTensorType type);
 
-/// Returns the integer contained in an IntegerAttr, or zero if it has none.
-int64_t getIntOrZero(IntegerAttr a);
+/// Returns the deserialized MaterializeEncodingInfo if the `layouts` field is
+/// present in encodings and it only has a single layout. Otherwise, returns
+/// std::nullopt.
+std::optional<IREE::Codegen::MaterializeEncodingInfo>
+getEncodingInfoFromLayouts(RankedTensorType type);
 
-/// Returns true if encoding user is one of matmul encodings.
-bool isMatmulEncodingUser(IREE::LinalgExt::EncodingUser user);
+/// Utility method to convert from `set_encoding` op to `pack` operation.
+/// NOTE: `source` could be returned when packing is not needed.
+FailureOr<Value> lowerSetEncodingOpToPackOp(
+    RewriterBase &rewriter, IREE::Encoding::SetEncodingOp encodingOp,
+    Value source, const MaterializeEncodingTypeConverter &typeConverter,
+    MaterializeEncodingValueFn materializeEncodingValueFn);
 
-/// Returns true if encoding user is one of batch matmul encodings.
-bool isBatchMatmulEncodingUser(IREE::LinalgExt::EncodingUser user);
+/// Utility method to convert from `unset_encoding` op to `unpack` operation.
+/// NOTE: `packedValue` could be returned when unpacking is not needed.
+FailureOr<Value> lowerUnsetEncodingToUnpackOp(
+    RewriterBase &rewriter, IREE::Encoding::UnsetEncodingOp encodingOp,
+    Value packedValue, const MaterializeEncodingTypeConverter &typeConverter,
+    MaterializeEncodingValueFn materializeEncodingValueFn);
 
-/// Returns true if the encoding is a vecmat.
-bool isVecmatEncoding(IREE::LinalgExt::EncodingAttr encoding);
-
-/// Returns true if the encoding is a matvec.
-bool isMatvecEncoding(IREE::LinalgExt::EncodingAttr encoding);
-
-/// Returns true if the encoding is a batch_vecmat.
-bool isBatchVecmatEncoding(IREE::LinalgExt::EncodingAttr encoding);
-
-/// Returns true if the encoding is a batch_matvec.
-bool isBatchMatvecEncoding(IREE::LinalgExt::EncodingAttr encoding);
-
-/// Returns true if the encoded type is a vector.
-bool isVectorEncoding(int64_t rank, IREE::LinalgExt::EncodingUser user);
-
-struct TileMxNxK {
-  int64_t M = 1;
-  int64_t N = 1;
-  int64_t K = 1;
-};
-
-MaterializeEncodingInfo
-getEncodingInfoForMatmul(IREE::LinalgExt::EncodingAttr encoding, int64_t rank,
-                         TileMxNxK tileMxNxK);
-
-MaterializeEncodingValueFn
-getMaterializeEncodingValueFn(IREE::HAL::ExecutableTargetAttr targetAttr);
-
-void populateMaterializeEncodingIntoPackUnPackPatterns(
+/// Pouplates the set of patterns that lowers operations with encoding types to
+/// operations without encodings.
+void populateMaterializeEncodingPatterns(
     RewritePatternSet &patterns, MaterializeEncodingConversionTarget &target,
     MaterializeEncodingTypeConverter &typeConverter,
     MaterializeEncodingValueFn materializeEncodingValueFn);
-
-void populateMaterializeUpperBoundTileSizePatterns(
-    RewritePatternSet &patterns, MaterializeEncodingFn materializeEncodingFn);
 
 } // namespace mlir::iree_compiler
 

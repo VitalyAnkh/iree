@@ -11,6 +11,7 @@
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
+#include "iree/compiler/Dialect/HAL/Transforms/Passes.h"
 #include "iree/compiler/Utils/TracingUtils.h"
 #include "llvm/ADT/StringSet.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -22,33 +23,27 @@
 
 namespace mlir::iree_compiler::IREE::HAL {
 
-class TranslateTargetExecutableVariantsPass
-    : public PassWrapper<TranslateTargetExecutableVariantsPass,
-                         OperationPass<IREE::HAL::ExecutableVariantOp>> {
-public:
-  TranslateTargetExecutableVariantsPass()
-      : targetRegistry(TargetBackendRegistry::getGlobal()) {}
-  TranslateTargetExecutableVariantsPass(
-      const TranslateTargetExecutableVariantsPass &pass)
-      : targetRegistry(pass.targetRegistry) {}
-  TranslateTargetExecutableVariantsPass(
-      const TargetBackendRegistry &targetRegistry, StringRef target)
-      : targetRegistry(targetRegistry) {
-    this->target = target.str();
-  }
+#define GEN_PASS_DEF_TRANSLATEALLEXECUTABLESPASS
+#define GEN_PASS_DEF_TRANSLATETARGETEXECUTABLEVARIANTSPASS
+#include "iree/compiler/Dialect/HAL/Transforms/Passes.h.inc"
 
-  StringRef getArgument() const override {
-    return "iree-hal-translate-target-executable-variants";
-  }
+namespace {
 
-  StringRef getDescription() const override {
-    return "Serializes hal.executable.variant ops to hal.executable.binary ops";
-  }
+//===----------------------------------------------------------------------===//
+// --iree-hal-translate-target-executable-variants
+//===----------------------------------------------------------------------===//
+
+struct TranslateTargetExecutableVariantsPass
+    : public IREE::HAL::impl::TranslateTargetExecutableVariantsPassBase<
+          TranslateTargetExecutableVariantsPass> {
+  using IREE::HAL::impl::TranslateTargetExecutableVariantsPassBase<
+      TranslateTargetExecutableVariantsPass>::
+      TranslateTargetExecutableVariantsPassBase;
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<IREE::HAL::HALDialect>();
     registry.insert<bufferization::BufferizationDialect>();
-    auto targetBackend = targetRegistry.getTargetBackend(target);
+    auto targetBackend = targetRegistry->getTargetBackend(target);
     if (targetBackend) {
       targetBackend->getDependentDialects(registry);
     }
@@ -58,15 +53,18 @@ public:
     auto variantOp = getOperation();
     if (variantOp.getTarget().getBackend().getValue() != target)
       return;
+    if (variantOp.isExternal())
+      return;
 
-    auto targetBackend = targetRegistry.getTargetBackend(target);
+    auto targetBackend = targetRegistry->getTargetBackend(target);
     if (!targetBackend) {
       variantOp.emitError() << "unregistered target backend '" << target << "'";
       return signalPassFailure();
     }
 
     OpPassManager passManager(variantOp.getOperationName());
-    targetBackend->buildTranslationPassPipeline(variantOp, passManager);
+    targetBackend->buildTranslationPassPipeline(variantOp.getTargetAttr(),
+                                                passManager);
     if (failed(runPipeline(passManager, variantOp))) {
       variantOp.emitError() << "failed to run translation of source "
                                "executable to target executable for backend "
@@ -74,51 +72,23 @@ public:
       return signalPassFailure();
     }
   }
-
-private:
-  Option<std::string> target{
-      *this, "target",
-      llvm::cl::desc(
-          "Target backend name whose executables will be translated by "
-          "this pass.")};
-
-  const TargetBackendRegistry &targetRegistry;
 };
 
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableVariantOp>>
-createTranslateTargetExecutableVariantsPass(
-    const TargetBackendRegistry &targetRegistry, StringRef target) {
-  return std::make_unique<TranslateTargetExecutableVariantsPass>(targetRegistry,
-                                                                 target);
-}
+//===----------------------------------------------------------------------===//
+// --iree-hal-translate-all-executables
+//===----------------------------------------------------------------------===//
 
-static PassRegistration<TranslateTargetExecutableVariantsPass> linkTargetPass(
-    [] { return std::make_unique<TranslateTargetExecutableVariantsPass>(); });
-
-class TranslateExecutablesPass
-    : public PassWrapper<TranslateExecutablesPass,
-                         OperationPass<IREE::HAL::ExecutableOp>> {
-public:
-  TranslateExecutablesPass()
-      : targetRegistry(TargetBackendRegistry::getGlobal()) {}
-  TranslateExecutablesPass(const TranslateExecutablesPass &pass)
-      : targetRegistry(pass.targetRegistry) {}
-  TranslateExecutablesPass(const TargetBackendRegistry &targetRegistry)
-      : targetRegistry(targetRegistry) {}
-
-  StringRef getArgument() const override {
-    return "iree-hal-translate-executables";
-  }
-
-  StringRef getDescription() const override {
-    return "Serializes hal.executable.variant ops to hal.executable.binary ops";
-  }
+struct TranslateAllExecutablesPass
+    : public IREE::HAL::impl::TranslateAllExecutablesPassBase<
+          TranslateAllExecutablesPass> {
+  using IREE::HAL::impl::TranslateAllExecutablesPassBase<
+      TranslateAllExecutablesPass>::TranslateAllExecutablesPassBase;
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<IREE::HAL::HALDialect>();
     registry.insert<bufferization::BufferizationDialect>();
-    auto targetBackends = targetRegistry.getTargetBackends(
-        targetRegistry.getRegisteredTargetBackends());
+    auto targetBackends = targetRegistry->getTargetBackends(
+        targetRegistry->getRegisteredTargetBackends());
     for (auto &targetBackend : targetBackends) {
       targetBackend->getDependentDialects(registry);
     }
@@ -129,28 +99,19 @@ public:
     OpPassManager passManager(executableOp.getOperationName());
     for (const auto &targetName : gatherExecutableTargetNames(executableOp)) {
       passManager.addNestedPass<IREE::HAL::ExecutableVariantOp>(
-          createTranslateTargetExecutableVariantsPass(targetRegistry,
-                                                      targetName));
+          IREE::HAL::createTranslateTargetExecutableVariantsPass(
+              {targetRegistry, targetName}));
     }
 
     IREE_COMPILER_TRACE_MESSAGE_DYNAMIC(INFO, executableOp.getSymName().str());
 
     if (failed(runPipeline(passManager, executableOp))) {
-      executableOp.emitError() << "failed to serialize executables";
+      llvm::errs() << "failed to translate executables\n";
       return signalPassFailure();
     }
   }
-
-  const TargetBackendRegistry &targetRegistry;
 };
 
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableOp>>
-createTranslateExecutablesPass(const TargetBackendRegistry &targetRegistry) {
-  return std::make_unique<TranslateExecutablesPass>(targetRegistry);
-}
-
-static PassRegistration<TranslateExecutablesPass> translatePass([] {
-  return std::make_unique<TranslateExecutablesPass>();
-});
+} // namespace
 
 } // namespace mlir::iree_compiler::IREE::HAL

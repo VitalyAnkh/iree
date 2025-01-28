@@ -11,15 +11,12 @@
 #include "iree/compiler/Dialect/Stream/IR/StreamDialect.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
 #include "iree/compiler/Dialect/Util/Analysis/DFX/Element.h"
-#include "iree/compiler/Dialect/Util/Analysis/DFX/Solver.h"
 #include "iree/compiler/Dialect/Util/Analysis/DFX/State.h"
-#include "iree/compiler/Dialect/Util/Analysis/Explorer.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
@@ -397,6 +394,12 @@ private:
               DFX::Resolution::REQUIRED);
           getState() ^= targetUsage.getState();
         })
+        .Case([&](IREE::Stream::AsyncBarrierOp op) {
+          auto &tiedUsage = solver.getElementFor<ValueResourceUsage>(
+              *this, Position::forValue(op.getOperand(0)),
+              DFX::Resolution::REQUIRED);
+          getState() ^= tiedUsage.getState();
+        })
         .Case([&](IREE::Stream::AsyncTransferOp op) {
           removeAssumedBits(NOT_TRANSFER_WRITE);
           auto &sourceUsage = solver.getElementFor<ValueResourceUsage>(
@@ -418,10 +421,14 @@ private:
           // TODO(benvanik): remove kFavorTransients.
           bool isSourceExternal = !sourceUsage.isAssumed(NOT_EXTERNAL);
           bool isTargetInternal = isAssumed(NOT_EXTERNAL);
-          if (kFavorTransients && isSourceExternal && isTargetInternal) {
+          bool deviceChange =
+              op.getSourceAffinityAttr() != op.getResultAffinityAttr();
+          if ((kFavorTransients || deviceChange) && isSourceExternal &&
+              isTargetInternal) {
             LLVM_DEBUG({
-              llvm::dbgs() << "[ValueResourceUsage] skipping forward prop of "
-                              "external into internal: ";
+              llvm::dbgs()
+                  << "[ValueResourceUsage] skipping forward prop of external "
+                     "into internal due to kFavorTransients/device-change: ";
               op.print(llvm::dbgs(), solver.getAsmState());
               llvm::dbgs() << "\n";
             });
@@ -477,6 +484,30 @@ private:
             getState() ^= resultUsage.getState();
           }
         })
+        .Case<IREE::Stream::AsyncExecuteOp, IREE::Stream::AsyncConcurrentOp>(
+            [&](auto op) {
+              IREE::Stream::AsyncConcurrentOp c;
+              // Take on the state from the internal usage.
+              for (auto yieldOp :
+                   op.getClosureBodyRegion()
+                       .template getOps<IREE::Stream::YieldOp>()) {
+                auto &yieldUsage = solver.getElementFor<ValueResourceUsage>(
+                    *this,
+                    Position::forValue(
+                        yieldOp.getOperand(result.getResultNumber())),
+                    DFX::Resolution::REQUIRED);
+                getState() ^= yieldUsage.getState();
+              }
+              // If the result is passed through as a tied operand then also
+              // inherit the original state.
+              auto tiedOperand = op.getTiedResultOperand(result);
+              if (tiedOperand) {
+                auto &tiedUsage = solver.getElementFor<ValueResourceUsage>(
+                    *this, Position::forValue(tiedOperand),
+                    DFX::Resolution::REQUIRED);
+                getState() ^= tiedUsage.getState();
+              }
+            })
         .Default([&](Operation *op) {});
   }
 
@@ -531,7 +562,6 @@ private:
               *this,
               Position::forValue(op.getBeforeBody()->getArgument(operandIdx)),
               DFX::Resolution::REQUIRED);
-
           getState() ^= beforeUsage.getState();
         })
         .Case([&](mlir::scf::ConditionOp op) {
@@ -564,29 +594,30 @@ private:
                 Position::forValue(op->getParentOp()->getResult(operandIdx)),
                 DFX::Resolution::REQUIRED);
             getState() ^= parentUsage.getState();
-          } else if (auto whileOp =
-                         dyn_cast_or_null<scf::WhileOp>(op->getParentOp())) {
+          } else if (auto whileOp = dyn_cast<scf::WhileOp>(op->getParentOp())) {
             auto value =
                 Position::forValue(whileOp.getBefore().getArgument(operandIdx));
             auto &valueUsage = solver.getElementFor<ValueResourceUsage>(
                 *this, value, DFX::Resolution::REQUIRED);
             getState() ^= valueUsage.getState();
-          } else if (auto forOp =
-                         dyn_cast_or_null<scf::ForOp>(op->getParentOp())) {
+            auto &parentUsage = solver.getElementFor<ValueResourceUsage>(
+                *this, Position::forValue(whileOp->getResult(operandIdx)),
+                DFX::Resolution::REQUIRED);
+            getState() ^= parentUsage.getState();
+          } else if (auto forOp = dyn_cast<scf::ForOp>(op->getParentOp())) {
             auto value = Position::forValue(forOp.getRegionIterArg(operandIdx));
             auto &valueUsage = solver.getElementFor<ValueResourceUsage>(
                 *this, value, DFX::Resolution::REQUIRED);
             getState() ^= valueUsage.getState();
-
             auto &parentUsage = solver.getElementFor<ValueResourceUsage>(
                 *this, Position::forValue(forOp->getResult(operandIdx)),
                 DFX::Resolution::REQUIRED);
             getState() ^= parentUsage.getState();
           } else {
-            assert(false && "Unsupported test case");
+            assert(false && "unhandled scf yield parent");
           }
         })
-        .Case([&](mlir::func::ReturnOp op) {
+        .Case([&](IREE::Util::ReturnOp op) {
           auto &operandUsage = solver.getElementFor<ValueResourceUsage>(
               *this, Position::forValue(op.getOperand(operandIdx)),
               DFX::Resolution::REQUIRED);
@@ -715,6 +746,12 @@ private:
             getState() ^= resultUsage.getState();
           }
         })
+        .Case([&](IREE::Stream::AsyncBarrierOp op) {
+          auto &resultUsage = solver.getElementFor<ValueResourceUsage>(
+              *this, Position::forValue(op.getResult()),
+              DFX::Resolution::OPTIONAL);
+          getState() ^= resultUsage.getState();
+        })
         .Case([&](IREE::Stream::AsyncTransferOp op) {
           removeAssumedBits(NOT_TRANSFER_READ);
           auto &resultUsage = solver.getElementFor<ValueResourceUsage>(
@@ -736,11 +773,14 @@ private:
           // TODO(benvanik): remove kFavorTransients.
           bool isSourceInternal = isAssumed(NOT_EXTERNAL);
           bool isTargetExternal = !resultUsage.isAssumed(NOT_EXTERNAL);
-          if (kFavorTransients && isSourceInternal && isTargetExternal) {
+          bool deviceChange =
+              op.getSourceAffinityAttr() != op.getResultAffinityAttr();
+          if ((kFavorTransients || deviceChange) && isSourceInternal &&
+              isTargetExternal) {
             LLVM_DEBUG({
               llvm::dbgs()
                   << "[ValueResourceUsage] skipping back prop of external into "
-                     "internal due to kFavorTransients: ";
+                     "internal due to kFavorTransients/device-change: ";
               op.print(llvm::dbgs(), solver.getAsmState());
               llvm::dbgs() << "\n";
             });
@@ -789,6 +829,30 @@ private:
             getState() ^= resultUsage.getState();
           }
         })
+        .Case<IREE::Stream::AsyncExecuteOp, IREE::Stream::AsyncConcurrentOp>(
+            [&](auto op) {
+              // Take on the traits of all ops within the execution region that
+              // use the value and handle ties if needed.
+              auto &operandUsage = solver.getElementFor<ValueResourceUsage>(
+                  *this,
+                  Position::forValue(
+                      op.getClosureBodyRegion().getArgument(operandIdx)),
+                  DFX::Resolution::REQUIRED);
+              getState() ^= operandUsage.getState();
+              for (auto result : op.getOperandTiedResults(operandIdx)) {
+                auto &resultUsage = solver.getElementFor<ValueResourceUsage>(
+                    *this, Position::forValue(result),
+                    DFX::Resolution::REQUIRED);
+                getState() ^= resultUsage.getState();
+              }
+            })
+        .Case([&](IREE::Stream::YieldOp op) {
+          // Take on the traits of the result of the parent operation.
+          Value result = op->getParentOp()->getResult(operandIdx);
+          auto &resultUsage = solver.getElementFor<ValueResourceUsage>(
+              *this, Position::forValue(result), DFX::Resolution::REQUIRED);
+          getState() ^= resultUsage.getState();
+        })
         .Default([&](Operation *op) {});
   }
 
@@ -829,8 +893,8 @@ const char ValueResourceUsage::ID = 0;
 
 ResourceUsageAnalysis::ResourceUsageAnalysis(Operation *rootOp)
     : explorer(rootOp, TraversalAction::SHALLOW), solver(explorer, allocator) {
-  explorer.setOpAction<IREE::Util::InitializerOp>(TraversalAction::RECURSE);
-  explorer.setOpAction<mlir::func::FuncOp>(TraversalAction::RECURSE);
+  explorer.setOpInterfaceAction<mlir::FunctionOpInterface>(
+      TraversalAction::RECURSE);
   explorer.setOpAction<mlir::scf::ForOp>(TraversalAction::RECURSE);
   explorer.setOpAction<mlir::scf::IfOp>(TraversalAction::RECURSE);
   explorer.setOpAction<mlir::scf::WhileOp>(TraversalAction::RECURSE);
@@ -867,11 +931,8 @@ LogicalResult ResourceUsageAnalysis::run() {
   // });
 
   // Initialize all SSA values we can do just with trivial search.
-  explorer.walkValues([&](Value value) {
-    if (llvm::isa<IREE::Stream::ResourceType>(value.getType())) {
-      solver.getOrCreateElementFor<ValueResourceUsage>(
-          Position::forValue(value));
-    }
+  explorer.walkValuesOfType<IREE::Stream::ResourceType>([&](Value value) {
+    solver.getOrCreateElementFor<ValueResourceUsage>(Position::forValue(value));
     return WalkResult::advance();
   });
 

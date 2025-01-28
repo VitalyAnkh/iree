@@ -175,25 +175,23 @@ static LogicalResult serializeAPFloatRawData(Location loc, APFloat value,
   }
 }
 
-// Serializes |count| copies of |splatAttr| to |os|.
-// Significantly faster than the generic ElementsAttr path that needs to perform
-// conversion of the same splat value |count| times.
-static LogicalResult serializeSplatValue(Location loc, Attribute splatAttr,
-                                         int64_t count, llvm::endianness endian,
-                                         llvm::raw_ostream &os) {
+// static
+LogicalResult SerializableAttrInterface::serializeSplatValue(
+    Location loc, Attribute elementAttr, int64_t count, llvm::endianness endian,
+    llvm::raw_ostream &os) {
   // Get the encoded byte contents of the splat element.
   SmallVector<char> elementBuffer;
-  if (auto attr = llvm::dyn_cast<SerializableAttrInterface>(splatAttr)) {
+  if (auto attr = llvm::dyn_cast<SerializableAttrInterface>(elementAttr)) {
     if (failed(attr.serializeToVector(loc, endian, elementBuffer))) {
       return failure();
     }
-  } else if (auto attr = llvm::dyn_cast<IntegerAttr>(splatAttr)) {
+  } else if (auto attr = llvm::dyn_cast<IntegerAttr>(elementAttr)) {
     if (failed(serializeAPIntRawData(loc, attr.getValue(),
                                      attr.getType().getIntOrFloatBitWidth(),
                                      endian, elementBuffer))) {
       return failure();
     }
-  } else if (auto attr = llvm::dyn_cast<FloatAttr>(splatAttr)) {
+  } else if (auto attr = llvm::dyn_cast<FloatAttr>(elementAttr)) {
     if (failed(serializeAPFloatRawData(loc, attr.getValue(),
                                        attr.getType().getIntOrFloatBitWidth(),
                                        endian, elementBuffer))) {
@@ -229,7 +227,14 @@ static LogicalResult
 serializeResourceRawData(Location loc,
                          DenseResourceElementsAttr resourceElementsAttr,
                          llvm::raw_ostream &os) {
-  auto rawData = resourceElementsAttr.getRawHandle().getBlob()->getData();
+  auto *blob = resourceElementsAttr.getRawHandle().getBlob();
+  if (!blob) {
+    return mlir::emitError(loc)
+           << "resource data missing in input IR (removed by user?); "
+              "cannot serialize resource: "
+           << resourceElementsAttr << "\n";
+  }
+  auto rawData = blob->getData();
   os.write(rawData.data(), rawData.size());
   return success();
 }
@@ -442,14 +447,18 @@ static LogicalResult serializeGenericResourceElementData(
     return emitError(loc) << "the endian of the "
                              "DenseResourceElementsAttr is not supported";
   }
-  if (llvm::isa<IntegerType>(resourceElementsAttr.getType().getElementType())) {
-    // Don't hoist bitWidth given `getElementTypeBitWidth()` asserts if the
-    // element type is not integer or floating-point.
+  // For complex resource types, we can just serialize based on the bit width of
+  // the underlying integer or floating point type.
+  Type elementType = resourceElementsAttr.getType().getElementType();
+  if (auto complexType = llvm::dyn_cast<ComplexType>(elementType)) {
+    elementType = complexType.getElementType();
+  }
+  if (auto integerType = llvm::dyn_cast<IntegerType>(elementType)) {
     // At the time of writing, DenseResourceElementsAttr byte aligned physical
     // element types only with the exception of i1, which is stored as a full
     // byte. This is in contrast to DenseElementsAttr which has an exception for
     // i1 where it is bit-packed.
-    unsigned bitWidth = resourceElementsAttr.getType().getElementTypeBitWidth();
+    unsigned bitWidth = integerType.getIntOrFloatBitWidth();
     switch (bitWidth) {
     case 1:
       return serializeResourceRawData(loc, resourceElementsAttr, os);
@@ -466,16 +475,14 @@ static LogicalResult serializeGenericResourceElementData(
              << "unhandled integer element bit width " << bitWidth
              << " for type " << resourceElementsAttr.getType();
     }
-  } else if (llvm::isa<FloatType>(
-                 resourceElementsAttr.getType().getElementType())) {
-    // Don't hoist bitWidth given `getElementTypeBitWidth()` asserts if the
-    // element type is not integer or floating-point.
-    // TODO(saienduri): implement float64 support (not neccesary now)
-    unsigned bitWidth = resourceElementsAttr.getType().getElementTypeBitWidth();
+  } else if (auto floatType = llvm::dyn_cast<FloatType>(elementType)) {
+    unsigned bitWidth = floatType.getIntOrFloatBitWidth();
     switch (bitWidth) {
     case 16:
       return serializeResourceRawData(loc, resourceElementsAttr, os);
     case 32:
+      return serializeResourceRawData(loc, resourceElementsAttr, os);
+    case 64:
       return serializeResourceRawData(loc, resourceElementsAttr, os);
     default:
       return emitError(loc) << "unhandled float element bit width " << bitWidth
@@ -491,7 +498,7 @@ static LogicalResult serializeGenericResourceElementData(
 //===----------------------------------------------------------------------===//
 
 int64_t BytePatternAttr::getStorageSize() const {
-  if (auto shapedType = getType().dyn_cast<ShapedType>()) {
+  if (auto shapedType = llvm::dyn_cast<ShapedType>(getType())) {
     return IREE::Util::getRoundedPhysicalStorageSize(shapedType);
   } else {
     return IREE::Util::getTypePhysicalStorageBitWidth(getType());
@@ -715,7 +722,7 @@ LogicalResult CompositeAttr::serializeToStream(Location loc,
 //===----------------------------------------------------------------------===//
 
 int64_t UninitializedAttr::getStorageSize() const {
-  if (auto shapedType = getType().dyn_cast<ShapedType>()) {
+  if (auto shapedType = llvm::dyn_cast<ShapedType>(getType())) {
     return IREE::Util::getRoundedPhysicalStorageSize(shapedType);
   } else {
     return IREE::Util::getTypePhysicalStorageBitWidth(getType());
@@ -791,8 +798,9 @@ struct SerializableDenseElementsAttrModel
     auto elementsAttr = llvm::cast<DenseElementsAttr>(baseAttr);
     if (elementsAttr.isSplat()) {
       // Fast-path for splat (no need to convert the value a bunch).
-      return serializeSplatValue(loc, elementsAttr.getSplatValue<Attribute>(),
-                                 elementsAttr.getNumElements(), endian, os);
+      return IREE::Util::SerializableAttrInterface::serializeSplatValue(
+          loc, elementsAttr.getSplatValue<Attribute>(),
+          elementsAttr.getNumElements(), endian, os);
     }
 
     if (canUseRawData(elementsAttr, endian)) {
@@ -885,6 +893,46 @@ struct SerializableStringAttrModel
     return success();
   }
 };
+
+//===----------------------------------------------------------------------===//
+// IREE::Util::Hoistable*Interface
+//===----------------------------------------------------------------------===//
+
+// Walks |fromOp| and up to gather all dialect attributes that want to be
+// hoisted along with it. If the same named attribute is present on multiple
+// ancestors only the most narrowly scoped value will be used.
+// static
+void HoistableAttrInterface::gatherHoistableAttrs(Operation *fromOp,
+                                                  NamedAttrList &dialectAttrs) {
+  for (auto attr : fromOp->getDialectAttrs()) {
+    if (auto hoistableAttr = llvm::dyn_cast<IREE::Util::HoistableAttrInterface>(
+            attr.getValue())) {
+      if (hoistableAttr.shouldAttachToHoistedOps() &&
+          !dialectAttrs.get(attr.getName())) {
+        dialectAttrs.push_back(attr);
+      }
+    }
+  }
+  if (auto *parentOp = fromOp->getParentOp())
+    gatherHoistableAttrs(parentOp, dialectAttrs);
+}
+
+// static
+void HoistableAttrInterface::gatherHoistableAttrs(Operation *fromOp,
+                                                  Operation *toOp) {
+  // Get the attributes specified on the target op first as those take
+  // precedence over any from ancestors. We also want to preserve any
+  // non-hoistable attrs when we reassign the dialect attrs.
+  NamedAttrList dialectAttrs;
+  for (auto attr : toOp->getDialectAttrs())
+    dialectAttrs.push_back(attr);
+
+  // Gather attributes from the op and its parents, only adding ones not already
+  // set on the op.
+  HoistableAttrInterface::gatherHoistableAttrs(fromOp, dialectAttrs);
+
+  toOp->setDialectAttrs(dialectAttrs);
+}
 
 //===----------------------------------------------------------------------===//
 // IREE::Util::UtilDialect

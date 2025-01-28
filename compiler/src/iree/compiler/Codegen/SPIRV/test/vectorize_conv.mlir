@@ -1,5 +1,5 @@
 // RUN: iree-opt --split-input-file \
-// RUN:   --pass-pipeline='builtin.module(func.func(iree-codegen-generic-vectorization,iree-spirv-initial-vector-lowering,iree-codegen-hoist-redundant-vector-transfers,iree-spirv-final-vector-lowering))' \
+// RUN:   --pass-pipeline='builtin.module(func.func(iree-codegen-generic-vectorization,iree-spirv-initial-vector-lowering,iree-codegen-optimize-tensor-insert-extract-slices,iree-spirv-final-vector-lowering))' \
 // RUN:   %s | FileCheck %s
 
 func.func @ncw_conv_1d(%input: tensor<2x4x4xf32>, %filter: tensor<4x4x1xf32>, %init: tensor<2x4x4xf32>) -> tensor<2x4x4xf32> {
@@ -27,10 +27,12 @@ func.func @ncw_conv_1d(%input: tensor<2x4x4xf32>, %filter: tensor<4x4x1xf32>, %i
 // the target env. We expect the conv to follow the inner product lowering.
 
 func.func @nwc_conv_1d_dot_prod(%input: tensor<1x7x3xi8>, %filter: tensor<1x3x4xi8>) -> tensor<1x4x4xi32> attributes {
-  spirv.target_env = #spirv.target_env<#spirv.vce<v1.5,
-                                         [DotProduct, DotProductInputAll, DotProductInput4x8Bit],
-                                         [SPV_KHR_integer_dot_product]>,
-                                       #spirv.resource_limits<>> } {
+  iree.gpu.target = #iree_gpu.target<arch = "", features = "spirv:v1.6,cap:Shader", wgp = <
+    compute = fp32|int32|int16|int8, storage = b32|b16|b8, subgroup = none, dot = dp4xi8toi32, mma = [],
+    subgroup_size_choices = [64], max_workgroup_sizes = [1024, 1024, 1024],
+    max_thread_count_per_workgroup = 1024, max_workgroup_memory_bytes = 65536,
+    max_workgroup_counts = [65535, 65535, 65535]>>
+} {
   %c0 = arith.constant 0 : i32
   %i0 = arith.constant 0 : index
   %init = tensor.empty() : tensor<1x4x4xi32>

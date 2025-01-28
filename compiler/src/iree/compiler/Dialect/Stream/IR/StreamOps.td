@@ -11,6 +11,7 @@ include "iree/compiler/Dialect/Stream/IR/StreamBase.td"
 include "iree/compiler/Dialect/Stream/IR/StreamInterfaces.td"
 include "iree/compiler/Dialect/Util/IR/UtilInterfaces.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
+include "mlir/IR/BuiltinAttributeInterfaces.td"
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/CallInterfaces.td"
@@ -85,10 +86,7 @@ def OpGroupResourceOps : OpDocGroup {
 let opDocGroup = OpGroupResourceOps in {
 
 def Stream_ResourceAllocOp : Stream_Op<"resource.alloc", [
-  DeclareOpInterfaceMethods<Stream_AffinityOp, [
-    "getAffinity",
-    "setAffinity",
-  ]>,
+  Stream_AffinityOp,
   Util_SizeAwareOp,
   AlwaysSpeculatable,
   MemoryEffects<[MemAlloc]>,
@@ -122,8 +120,8 @@ def Stream_ResourceAllocOp : Stream_Op<"resource.alloc", [
   );
 
   let assemblyFormat = [{
-    (`on` `(` $affinity^ `)`)?
     (`uninitialized` $uninitialized^)?
+    (`on` `(` $affinity^ `)`)?
     attr-dict `:`
     type($result) `{` $storage_size `}`
   }];
@@ -147,10 +145,7 @@ def Stream_ResourceAllocOp : Stream_Op<"resource.alloc", [
 }
 
 def Stream_ResourceAllocaOp : Stream_Op<"resource.alloca", [
-  DeclareOpInterfaceMethods<Stream_AffinityOp, [
-    "getAffinity",
-    "setAffinity",
-  ]>,
+  Stream_AffinityOp,
   Stream_TimelineOp,
   Util_SizeAwareOp,
   AlwaysSpeculatable,
@@ -208,10 +203,7 @@ def Stream_ResourceAllocaOp : Stream_Op<"resource.alloca", [
 }
 
 def Stream_ResourceDeallocaOp : Stream_Op<"resource.dealloca", [
-  DeclareOpInterfaceMethods<Stream_AffinityOp, [
-    "getAffinity",
-    "setAffinity",
-  ]>,
+  Stream_AffinityOp,
   Stream_TimelineOp,
   Util_SizeAwareOp,
   MemoryEffects<[MemFree]>,
@@ -256,7 +248,6 @@ def Stream_ResourceDeallocaOp : Stream_Op<"resource.dealloca", [
 }
 
 def Stream_ResourceSizeOp : Stream_PureOp<"resource.size", [
-  Stream_AffinityOp,
   Util_SizeAwareOp,
 ]> {
   let summary = [{returns the size of the resource storage in bytes}];
@@ -276,7 +267,6 @@ def Stream_ResourceSizeOp : Stream_PureOp<"resource.size", [
   );
 
   let assemblyFormat = [{
-    (`on` `(` $affinity^ `)`)?
     $operand
     attr-dict `:` type($operand)
   }];
@@ -350,7 +340,7 @@ def Stream_ResourceLoadOp : Stream_Op<"resource.load", [
     Stream_Offset:$source_offset
   );
   let results = (outs
-    AnyTypeOf<[Stream_PrimitiveType, AnyVector]>:$result
+    AnyTypeOf<[Stream_PrimitiveType, AnyVectorOfNonZeroRank]>:$result
   );
 
   let assemblyFormat = [{
@@ -385,7 +375,7 @@ def Stream_ResourceStoreOp : Stream_Op<"resource.store", [
     Stream_StagingResource:$target,
     Stream_Size:$target_size,
     Stream_Offset:$target_offset,
-    AnyTypeOf<[Stream_PrimitiveType, AnyVector]>:$value
+    AnyTypeOf<[Stream_PrimitiveType, AnyVectorOfNonZeroRank]>:$value
   );
 
   let assemblyFormat = [{
@@ -646,10 +636,7 @@ let opDocGroup = OpGroupParameterOps in {
 def Stream_ParameterLoadOp : Stream_PureOp<"parameter.load", [
   AttrSizedOperandSegments,
   AllTypesMatch<["results"]>,
-  DeclareOpInterfaceMethods<Stream_AffinityOp, [
-    "getAffinity",
-    "setAffinity",
-  ]>,
+  Stream_AffinityOp,
   Stream_CmdPhaseOp,
   Stream_TimelineOp,
   Util_SizeAwareOp,
@@ -703,10 +690,7 @@ def Stream_ParameterLoadOp : Stream_PureOp<"parameter.load", [
 }
 
 def Stream_ParameterReadOp : Stream_Op<"parameter.read", [
-  DeclareOpInterfaceMethods<Stream_AffinityOp, [
-    "getAffinity",
-    "setAffinity",
-  ]>,
+  Stream_AffinityOp,
   Stream_CmdPhaseOp,
   Stream_TimelineOp,
   Util_SizeAwareOp,
@@ -758,10 +742,7 @@ def Stream_ParameterReadOp : Stream_Op<"parameter.read", [
 }
 
 def Stream_ParameterWriteOp : Stream_Op<"parameter.write", [
-  DeclareOpInterfaceMethods<Stream_AffinityOp, [
-    "getAffinity",
-    "setAffinity",
-  ]>,
+  Stream_AffinityOp,
   Stream_CmdPhaseOp,
   Stream_TimelineOp,
   Util_SizeAwareOp,
@@ -814,10 +795,7 @@ def Stream_ParameterWriteOp : Stream_Op<"parameter.write", [
 
 def Stream_ParameterGatherOp : Stream_Op<"parameter.gather", [
   AttrSizedOperandSegments,
-  DeclareOpInterfaceMethods<Stream_AffinityOp, [
-    "getAffinity",
-    "setAffinity",
-  ]>,
+  Stream_AffinityOp,
   Stream_CmdPhaseOp,
   Stream_TimelineOp,
   Util_SizeAwareOp,
@@ -873,10 +851,7 @@ def Stream_ParameterGatherOp : Stream_Op<"parameter.gather", [
 
 def Stream_ParameterScatterOp : Stream_Op<"parameter.scatter", [
   AttrSizedOperandSegments,
-  DeclareOpInterfaceMethods<Stream_AffinityOp, [
-    "getAffinity",
-    "setAffinity",
-  ]>,
+  Stream_AffinityOp,
   Stream_CmdPhaseOp,
   Stream_TimelineOp,
   Util_SizeAwareOp,
@@ -983,10 +958,7 @@ def Stream_FileConstantOp : Stream_PureOp<"file.constant", [
 }
 
 def Stream_FileReadOp : Stream_Op<"file.read", [
-  DeclareOpInterfaceMethods<Stream_AffinityOp, [
-    "getAffinity",
-    "setAffinity",
-  ]>,
+  Stream_AffinityOp,
   Stream_CmdPhaseOp,
   Stream_TimelineOp,
   Util_SizeAwareOp,
@@ -1041,10 +1013,7 @@ def Stream_FileReadOp : Stream_Op<"file.read", [
 }
 
 def Stream_FileWriteOp : Stream_Op<"file.write", [
-  DeclareOpInterfaceMethods<Stream_AffinityOp, [
-    "getAffinity",
-    "setAffinity",
-  ]>,
+  Stream_AffinityOp,
   Stream_CmdPhaseOp,
   Stream_TimelineOp,
   Util_SizeAwareOp,
@@ -1325,7 +1294,7 @@ def Stream_TensorConstantOp : Stream_PureOp<"tensor.constant", [
   }];
 
   let arguments = (ins
-    AnyAttr:$value,
+    TypedAttrInterface:$value,
     TypeAttr:$result_encoding,
     Stream_ShapeDynamicDims:$result_encoding_dims,
     OptionalAttr<Stream_AffinityAttr>:$affinity
@@ -1551,7 +1520,7 @@ def Stream_TensorFillOp : Stream_Op<"tensor.fill", [
 
   let assemblyFormat = [{
     (`on` `(` $affinity^ `)`)?
-    $value `,` $target `[` $start_indices `for` $lengths `]` `:`
+    $value `,` $target (`[` $start_indices `for` $lengths^ `]`)? `:`
     type($value)
     `->`
     $target_encoding (`` `{` $target_encoding_dims^ `}`)?
@@ -1657,7 +1626,7 @@ def Stream_TensorLoadOp : Stream_PureOp<"tensor.load", [
     Variadic<Stream_Dim>:$indices
   );
   let results = (outs
-    AnyTypeOf<[Stream_PrimitiveType, AnyVector]>:$result
+    AnyTypeOf<[Stream_PrimitiveType, AnyVectorOfNonZeroRank]>:$result
   );
 
   let assemblyFormat = [{
@@ -1705,7 +1674,7 @@ def Stream_TensorStoreOp : Stream_PureOp<"tensor.store", [
     Stream_ShapeDynamicDims:$target_encoding_dims,
     Stream_Size:$target_size,
     Variadic<Stream_Dim>:$indices,
-    AnyTypeOf<[Stream_PrimitiveType, AnyVector]>:$value
+    AnyTypeOf<[Stream_PrimitiveType, AnyVectorOfNonZeroRank]>:$value
   );
   let results = (outs
     Stream_StagingResource:$result
@@ -1770,24 +1739,95 @@ def Stream_TensorTraceOp : Stream_Op<"tensor.trace", [
   let hasVerifier = 1;
 }
 
+def Stream_TensorDispatchOp : Stream_Op<"tensor.dispatch", [
+  AttrSizedOperandSegments,
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+  Stream_AffinityOp,
+  Stream_TensorPhaseOp,
+  Stream_StreamableOp,
+  Util_SizeAwareOp,
+  DeclareOpInterfaceMethods<Util_TiedOpInterface, [
+    "getTiedOperandsIndexAndLength",
+  ]>,
+]> {
+  let summary = [{dispatches a parallelized grid of work}];
+  let description = [{
+    Calls the specified entry point function once for each element in the
+    specified workgroup count. Each workgroup has access to the same operands
+    and results and is able to load/store at will.
+  }];
+
+  let arguments = (ins
+    Variadic<Index>:$workload,
+    SymbolRefArrayAttr:$entry_points,
+    Variadic<AnyTypeOf<[
+      Stream_AnyStreamResource,
+      Stream_PrimitiveType,
+    ]>>:$mixed_operands,
+    Variadic<Stream_Size>:$operand_sizes,
+    TypeArrayAttr:$operand_encodings,
+    Stream_ShapeDynamicDims:$operand_encoding_dims,
+    Variadic<Stream_Size>:$result_sizes,
+    TypeArrayAttr:$result_encodings,
+    Stream_ShapeDynamicDims:$result_encoding_dims,
+    OptionalAttr<Util_TiedOpStorageAttr>:$tied_operands,
+    OptionalAttr<Stream_AffinityAttr>:$affinity
+  );
+  let results = (outs
+    Variadic<Stream_AnyStreamResource>:$results
+  );
+
+  let assemblyFormat = [{
+    (`on` `(` $affinity^ `)`)?
+    custom<DispatchEntryPoints>($entry_points)
+    (`[` $workload^ `]`)? ``
+    `(` $mixed_operands `)`
+    attr-dict `:`
+    custom<EncodedShapedFunctionType>(
+        ref($mixed_operands),
+        type($mixed_operands), $operand_sizes,
+        $operand_encodings, $operand_encoding_dims,
+        type($results), $result_sizes,
+        $result_encodings, $result_encoding_dims,
+        $tied_operands)
+  }];
+
+  let extraClassDeclaration = [{
+    auto getEntryPointRefs() {
+      return getEntryPoints().getAsRange<SymbolRefAttr>();
+    }
+    void forEachEntryPointAttr(std::function<void(SymbolRefAttr)> fn) {
+      for (auto entryPointAttr : getEntryPointRefs()) fn(entryPointAttr);
+    }
+
+    Value getOperandSize(unsigned idx) {
+      return IREE::Util::findValueSizeInList(idx, getOperands(), getOperandSizes());
+    }
+    Value getResultSize(unsigned idx) {
+      return IREE::Util::findValueSizeInList(idx, getResults(), getResultSizes());
+    }
+  }];
+
+  let hasVerifier = 1;
+
+  let hasCanonicalizer = 1;
+}
+
 } // OpGroupTensorOps
 
 //===----------------------------------------------------------------------===//
-// Resource transfer ops
+// Async (stream.async*) ops
 //===----------------------------------------------------------------------===//
 
-def OpGroupResourceTransferOps : OpDocGroup {
-  let summary = "Resource transfer ops";
+def OpGroupAsyncOps : OpDocGroup {
+  let summary = "Async ops";
   let description = "";
 }
 
-let opDocGroup = OpGroupResourceTransferOps in {
+let opDocGroup = OpGroupAsyncOps in {
 
 def Stream_AsyncAllocaOp : Stream_Op<"async.alloca", [
-  DeclareOpInterfaceMethods<Stream_AffinityOp, [
-    "getAffinity",
-    "setAffinity",
-  ]>,
+  Stream_AffinityOp,
   Stream_AsyncPhaseOp,
   DeclareOpInterfaceMethods<Stream_StreamableOp, [
     "isMetadata",
@@ -2250,8 +2290,56 @@ def Stream_AsyncCollectiveOp : Stream_Op<"async.collective", [
   let hasCanonicalizer = 1;
 }
 
-def Stream_AsyncTransferOp : Stream_Op<"async.transfer", [
+def Stream_AsyncBarrierOp : Stream_Op<"async.barrier", [
   Stream_AffinityOp,
+  Stream_AsyncPhaseOp,
+  DeclareOpInterfaceMethods<Stream_StreamableOp, [
+    "isMetadata",
+  ]>,
+  Util_SizeAwareOp,
+]> {
+  let summary = [{ }];
+  let description = [{
+  }];
+
+  let arguments = (ins
+    AnyTypeOf<[
+      Stream_AnyStreamResource,
+      Stream_StagingResource,
+    ]>:$source,
+    Stream_Size:$size,
+    OptionalAttr<Stream_AffinityAttr>:$affinity
+  );
+  let results = (outs
+    AnyTypeOf<[
+      Stream_AnyStreamResource,
+      Stream_StagingResource,
+    ]>:$result
+  );
+
+  let assemblyFormat = [{
+    $source `:` type($source)
+    `` `{` $size `}`
+    (`from` `(` $affinity^ `)`)?
+    `->`
+    type($result)
+    attr-dict-with-keyword
+  }];
+
+  let extraClassDeclaration = [{
+    Value getOperandSize(unsigned idx) { return getSize(); }
+    Value getResultSize(unsigned idx) { return getSize(); }
+  }];
+
+  let hasVerifier = 1;
+  let hasCanonicalizer = 1;
+}
+
+def Stream_AsyncTransferOp : Stream_Op<"async.transfer", [
+  DeclareOpInterfaceMethods<Stream_AffinityOp, [
+    "getAffinityAttr",
+    "setAffinityAttr",
+  ]>,
   Stream_AsyncPhaseOp,
   Stream_StreamableOp,
   DeclareOpInterfaceMethods<Stream_AsyncAccessOp, [
@@ -2285,9 +2373,10 @@ def Stream_AsyncTransferOp : Stream_Op<"async.transfer", [
   );
 
   let assemblyFormat = [{
+    $source `:` type($source)
+    `` `{` $source_size `}`
     (`from` `(` $source_affinity^ `)`)?
-    $source `:`
-    type($source) `` `{` $source_size `}` `->`
+    `->`
     (`to` `(` $result_affinity^ `)`)?
     type($result) `` `{` $result_size `}`
     attr-dict-with-keyword
@@ -2319,7 +2408,7 @@ def Stream_AsyncLoadOp : Stream_PureOp<"async.load", [
     Stream_Offset:$source_offset
   );
   let results = (outs
-    AnyTypeOf<[Stream_PrimitiveType, AnyVector]>:$result
+    AnyTypeOf<[Stream_PrimitiveType, AnyVectorOfNonZeroRank]>:$result
   );
 
   let assemblyFormat = [{
@@ -2360,7 +2449,7 @@ def Stream_AsyncStoreOp : Stream_PureOp<"async.store", [
     Stream_StagingResource:$target,
     Stream_Size:$target_size,
     Stream_Offset:$target_offset,
-    AnyTypeOf<[Stream_PrimitiveType, AnyVector]>:$value
+    AnyTypeOf<[Stream_PrimitiveType, AnyVectorOfNonZeroRank]>:$value
   );
   let results = (outs
     Stream_StagingResource:$result
@@ -2448,10 +2537,10 @@ def Stream_AsyncDispatchOp : Stream_Op<"async.dispatch", [
     }
 
     Value getOperandSize(unsigned idx) {
-      return findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
+      return IREE::Util::findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
     }
     Value getResultSize(unsigned idx) {
-      return findValueSizeInList(idx, getResults(), getResultSizes());
+      return IREE::Util::findValueSizeInList(idx, getResults(), getResultSizes());
     }
   }];
 
@@ -2460,7 +2549,7 @@ def Stream_AsyncDispatchOp : Stream_Op<"async.dispatch", [
   let hasCanonicalizer = 1;
 }
 
-} // OpGroupResourceTransferOps
+} // OpGroupAsyncOps
 
 //===----------------------------------------------------------------------===//
 // Async control flow ops
@@ -2627,14 +2716,14 @@ def Stream_AsyncCallOp : Stream_Op<"async.call", [
 
     /// Set the callee for this operation.
     void setCalleeFromCallable(CallInterfaceCallable callee) {
-      (*this)->setAttr("callee", callee.get<SymbolRefAttr>());
+      (*this)->setAttr("callee", cast<SymbolRefAttr>(callee));
     }
 
     Value getOperandSize(unsigned idx) {
-      return findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
+      return IREE::Util::findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
     }
     Value getResultSize(unsigned idx) {
-      return findValueSizeInList(idx, getResults(), getResultSizes());
+      return IREE::Util::findValueSizeInList(idx, getResults(), getResultSizes());
     }
 
     /// Get the argument operands to the called function as a mutable range, this is
@@ -2725,10 +2814,10 @@ def Stream_AsyncExecuteOp : Stream_Op<"async.execute", [
 
   let extraClassDeclaration = [{
     Value getOperandSize(unsigned idx) {
-      return findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
+      return IREE::Util::findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
     }
     Value getResultSize(unsigned idx) {
-      return findValueSizeInList(idx, getResults(), getResultSizes());
+      return IREE::Util::findValueSizeInList(idx, getResults(), getResultSizes());
     }
     SmallVector<Value> getAwaitTimepoints() {
       if (getAwaitTimepoint()) return {getAwaitTimepoint()}; else return {};
@@ -2840,10 +2929,10 @@ def Stream_AsyncConcurrentOp : Stream_Op<"async.concurrent", [
 
   let extraClassDeclaration = [{
     Value getOperandSize(unsigned idx) {
-      return findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
+      return IREE::Util::findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
     }
     Value getResultSize(unsigned idx) {
-      return findValueSizeInList(idx, getResults(), getResultSizes());
+      return IREE::Util::findValueSizeInList(idx, getResults(), getResultSizes());
     }
   }];
 
@@ -2855,15 +2944,15 @@ def Stream_AsyncConcurrentOp : Stream_Op<"async.concurrent", [
 } // OpGroupAsyncControlFlowOps
 
 //===----------------------------------------------------------------------===//
-// Explicit command ops
+// Explicit command (stream.cmd.*) ops
 //===----------------------------------------------------------------------===//
 
-def OpGroupExplicitCommandOps : OpDocGroup {
+def OpGroupCmdOps : OpDocGroup {
   let summary = "Explicit command ops";
   let description = "";
 }
 
-let opDocGroup = OpGroupExplicitCommandOps in {
+let opDocGroup = OpGroupCmdOps in {
 
 def Stream_CmdFlushOp : Stream_Op<"cmd.flush", [
   Stream_CmdPhaseOp,
@@ -3104,7 +3193,7 @@ def Stream_CmdCollectiveOp : Stream_Op<"cmd.collective", [
 
   let extraClassDeclaration = [{
     Value getOperandSize(unsigned idx) {
-      return findValueSizeInList(
+      return IREE::Util::findValueSizeInList(
           idx - getODSOperandIndexAndLength(4).first,
           getResources(), getResourceSizes());
     }
@@ -3163,16 +3252,16 @@ def Stream_CmdDispatchOp : Stream_Op<"cmd.dispatch", [
     }
 
     Value getOperandSize(unsigned idx) {
-      return findValueSizeInList(
+      return IREE::Util::findValueSizeInList(
           idx - getODSOperandIndexAndLength(2).first,
           getResources(), getResourceSizes());
     }
     Value getResultSize(unsigned idx) { return {}; }
 
     // Builds a map of operand index to argument index.
-    static SmallVector<unsigned> makeOperandToArgMap(mlir::func::FuncOp funcOp);
+    static SmallVector<unsigned> makeOperandToArgMap(mlir::FunctionOpInterface funcOp);
     // Builds a map of resource to argument index of the corresponding binding.
-    static SmallVector<unsigned> makeResourceToArgMap(mlir::func::FuncOp funcOp);
+    static SmallVector<unsigned> makeResourceToArgMap(mlir::FunctionOpInterface funcOp);
   }];
 
   let hasVerifier = 1;
@@ -3307,11 +3396,11 @@ def Stream_CmdCallOp : Stream_Op<"cmd.call", [
 
     /// Set the callee for this operation.
     void setCalleeFromCallable(CallInterfaceCallable callee) {
-      (*this)->setAttr("callee", callee.get<SymbolRefAttr>());
+      (*this)->setAttr("callee", cast<SymbolRefAttr>(callee));
     }
 
     Value getOperandSize(unsigned idx) {
-      return findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
+      return IREE::Util::findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
     }
     Value getResultSize(unsigned idx) { return {}; }
 
@@ -3358,6 +3447,7 @@ def Stream_CmdExecuteOp : Stream_Op<"cmd.execute", [
       Stream_StagingResource,
     ]>>:$resource_operands,
     Variadic<Stream_Size>:$resource_operand_sizes,
+    UnitAttr:$once,
     Optional<Stream_Timepoint>:$await_timepoint,
     OptionalAttr<Stream_AffinityAttr>:$affinity
   );
@@ -3368,6 +3458,7 @@ def Stream_CmdExecuteOp : Stream_Op<"cmd.execute", [
   let regions = (region AnyRegion:$body);
 
   let assemblyFormat = [{
+    (`once` $once^)?
     (`on` `(` $affinity^ `)`)?
     (`await` `(` $await_timepoint^ `)` `=` `` `>`)?
     `with` ``
@@ -3388,7 +3479,7 @@ def Stream_CmdExecuteOp : Stream_Op<"cmd.execute", [
 
   let extraClassDeclaration = [{
     Value getOperandSize(unsigned idx) {
-      return findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
+      return IREE::Util::findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
     }
     Value getResultSize(unsigned idx) {
       return {};
@@ -3531,7 +3622,7 @@ def Stream_CmdConcurrentOp : Stream_Op<"cmd.concurrent", [
   let hasCanonicalizer = 1;
 }
 
-} // OpGroupExplicitCommandOps
+} // OpGroupCmdOps
 
 //===----------------------------------------------------------------------===//
 // Synchronization ops
@@ -3753,7 +3844,6 @@ def Stream_TimepointBarrierOp : Stream_PureOp<"timepoint.barrier", [
 
 def Stream_TimepointAwaitOp : Stream_PureOp<"timepoint.await", [
   AttrSizedOperandSegments,
-  Stream_AffinityOp,
   Stream_TimelineOp,
   Util_SizeAwareOp,
   DeclareOpInterfaceMethods<Util_TiedOpInterface, [
@@ -3778,7 +3868,7 @@ def Stream_TimepointAwaitOp : Stream_PureOp<"timepoint.await", [
     ]>>:$resource_operands,
     Variadic<Stream_Size>:$resource_operand_sizes,
     Stream_Timepoint:$await_timepoint,
-    OptionalAttr<Stream_AffinityAttr>:$affinity
+    UnitAttr:$sync
   );
   let results = (outs
     Variadic<AnyTypeOf<[
@@ -3788,10 +3878,10 @@ def Stream_TimepointAwaitOp : Stream_PureOp<"timepoint.await", [
   );
 
   let assemblyFormat = [{
-    (`on` `(` $affinity^ `)`)?
+    (`sync` $sync^)?
     $await_timepoint `=` `` `>`
     $resource_operands `:`
-    custom<SizeAwareTypeList>(type($resource_operands),
+    custom<ShapedTypeList>(type($resource_operands),
                               type($results), $resource_operand_sizes)
     attr-dict-with-keyword
   }];
@@ -4059,15 +4149,15 @@ def Stream_ExecutableExportOp : Stream_Op<"executable.export", [
   ];
 
   let extraClassDeclaration = [{
-    ::mlir::func::FuncOp lookupFunctionRef();
+    ::mlir::FunctionOpInterface lookupFunctionRef();
   }];
 
   let hasVerifier = 1;
 }
 
 def Stream_BindingSubspanOp : Stream_PureOp<"binding.subspan", [
-    Util_ShapeAwareOp,
-  ]> {
+  Util_ShapeAwareOp,
+]> {
   let summary = [{returns an alias to a subspan of interface binding data}];
   let description = [{
     Returns a subview to a tensor or memref-like type from a binding. The same
@@ -4094,6 +4184,113 @@ def Stream_BindingSubspanOp : Stream_PureOp<"binding.subspan", [
     ValueRange getOperandDynamicDims(unsigned idx) { return ValueRange{}; }
     ValueRange getResultDynamicDims(unsigned idx) { return getDynamicDims(); }
   }];
+}
+
+def Stream_DispatchWorkgroupIDOp : Stream_PureOp<"dispatch.workgroup.id", [
+  DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>,
+]> {
+  let summary = [{returns the index of the current workgroup in the grid}];
+  let description = [{
+    The global workgroup ID of the current workgroup in the range of
+    `[0, stream.dispatch.workgroup.count)` along each dimension.
+
+    Represented as a 3D grid classically written as XYZ.
+    Corresponds to the `WorkgroupId` SPIR-V built-in and the `blockIdx` CUDA
+    built-in variable.
+
+    ```mlir
+    %x = stream.dispatch.workgroup.id[0] : index
+    %y = stream.dispatch.workgroup.id[1] : index
+    %z = stream.dispatch.workgroup.id[2] : index
+    ```
+  }];
+
+  let arguments = (ins IndexAttr:$dimension);
+  let results = (outs Stream_Dim:$result);
+
+  let assemblyFormat = "`[` $dimension `]` attr-dict `:` type($result)";
+
+  let builders = [
+    OpBuilder<(ins "unsigned":$dim),
+    [{
+      build($_builder, $_state, $_builder.getIndexType(), $_builder.getIndexAttr(dim));
+    }]>,
+  ];
+
+  let hasVerifier = 1;
+}
+
+def Stream_DispatchWorkgroupCountOp : Stream_PureOp<"dispatch.workgroup.count", [
+  DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>,
+]> {
+  let summary = [{returns the total workgroup count of the grid}];
+  let description = [{
+    The total number of workgroups along each dimension in the dispatch grid.
+
+    Represented as a 3D grid classically written as XYZ.
+    Corresponds to the `NumWorkgroups` SPIR-V built-in and the `gridDim` CUDA
+    built-in variable.
+
+    ```mlir
+    %x = stream.dispatch.workgroup.count[0] : index
+    %y = stream.dispatch.workgroup.count[1] : index
+    %z = stream.dispatch.workgroup.count[2] : index
+    ```
+  }];
+
+  let arguments = (ins IndexAttr:$dimension);
+  let results = (outs Stream_Dim:$result);
+
+  let assemblyFormat = "`[` $dimension `]` attr-dict `:` type($result)";
+
+  let builders = [
+    OpBuilder<(ins "unsigned":$dim),
+    [{
+      build($_builder, $_state, $_builder.getIndexType(), $_builder.getIndexAttr(dim));
+    }]>,
+  ];
+
+  let hasVerifier = 1;
+}
+
+def Stream_DispatchWorkgroupSizeOp : Stream_PureOp<"dispatch.workgroup.size", [
+  DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>,
+]> {
+  let summary = [{returns the size of each workgroup in invocations}];
+  let description = [{
+    The number of local invocations within the current workgroup along each
+    dimension. Depending on backend this may map to the SIMT thread count or
+    inner loop nest parameters.
+
+    Workgroup sizes are not determined at the stream dialect level as they are
+    dependent on the target backend determined when lowering into the HAL. It's
+    still possible to use the symbolic workgroup size inside of dispatch
+    executables as a placeholder for the resolved value once in the HAL.
+
+    Represented as a 3D grid classically written as XYZ.
+    Corresponds to the `WorkgroupSize` SPIR-V built-in and the `blockDim` CUDA
+    built-in variable.
+
+    ```mlir
+    %x = stream.dispatch.workgroup.size[0] : index
+    %y = stream.dispatch.workgroup.size[1] : index
+    %z = stream.dispatch.workgroup.size[2] : index
+    ```
+  }];
+
+  let arguments = (ins IndexAttr:$dimension);
+  let results = (outs Stream_Dim:$result);
+
+  let assemblyFormat = "`[` $dimension `]` attr-dict `:` type($result)";
+
+  let builders = [
+    OpBuilder<(ins "unsigned":$dim),
+    [{
+      build($_builder, $_state, $_builder.getIndexType(), $_builder.getIndexAttr(dim));
+    }]>,
+  ];
+
+  let hasVerifier = 1;
 }
 
 } // OpGroupExecutableOps
@@ -4163,7 +4360,7 @@ def Stream_YieldOp : Stream_Op<"yield", [
   let assemblyFormat = [{
     attr-dict
     ($resource_operands^ `:`
-        custom<SizeAwareTypeList>(type($resource_operands),
+        custom<ShapedTypeList>(type($resource_operands),
                                   $resource_operand_sizes))?
   }];
 
@@ -4176,7 +4373,7 @@ def Stream_YieldOp : Stream_Op<"yield", [
 
   let extraClassDeclaration = [{
     Value getOperandSize(unsigned idx) {
-      return findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
+      return IREE::Util::findValueSizeInList(idx, getOperands(), getResourceOperandSizes());
     }
     Value getResultSize(unsigned idx) { return {}; }
   }];

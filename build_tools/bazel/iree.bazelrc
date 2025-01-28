@@ -34,7 +34,7 @@ build --enable_runfiles
 # build --incompatible_default_to_explicit_init_py
 
 # Disable split PIC/non-PIC build graphs and disable heuristic to link binaries
-# dynamically by default. See: https://github.com/openxla/iree/issues/13470
+# dynamically by default. See: https://github.com/iree-org/iree/issues/13470
 build --dynamic_mode=off
 build --force_pic
 
@@ -90,6 +90,9 @@ build:generic_clang --per_file_copt=external/.*@-w
 # Would need to then make all the --copt below duplicated with --host_copt.
 build:generic_clang --host_copt=-w
 
+# This is currently flagging the status macros (https://github.com/iree-org/iree/issues/16946)
+build:generic_clang --copt=-Wno-c++20-extensions --host_copt=-Wno-c++20-extensions
+
 # Set clang diagnostics. These largely match the set of warnings used within
 # Google. They have not been audited super carefully by the IREE team but are
 # generally thought to be a good set and consistency with those used internally
@@ -131,7 +134,7 @@ build:generic_clang --copt=-Wno-user-defined-warnings
 # Explicitly enable some additional warnings.
 # Some of these aren't on by default, or under -Wall, or are subsets of warnings
 # turned off above.
-build:generic_clang --copt=-Wc++20-extensions
+# build:generic_clang --copt=-Wc++20-extensions  # See above.
 build:generic_clang --copt=-Wctad-maybe-unsupported
 build:generic_clang --copt=-Wfloat-overflow-conversion
 build:generic_clang --copt=-Wfloat-zero-conversion
@@ -277,7 +280,7 @@ build:remote_cache_bazel_ci --config=_remote_cache_base
 # specific docker container the CI Bazel builds are run in. The image URL is
 # included for clarity and so that this reference is automatically updated by
 # manage_images.py
-build:remote_cache_bazel_ci --host_platform_remote_properties_override='properties:{name:"cache-silo-key" value:"gcr.io/iree-oss/swiftshader-bleeding-edge@sha256:d2483ac643184a16942489d8f709ef3714543ae795fa9ae8fd2e4d8bf68a24a0"}'
+build:remote_cache_bazel_ci --host_platform_remote_properties_override='properties:{name:"cache-silo-key" value:"gcr.io/iree-oss/base-bleeding-edge@sha256:cf2e78194e64fd0166f4141317366261d7a62432b72e9a324cb8c2ff4e1a515a"}'
 
 
 ###############################################################################

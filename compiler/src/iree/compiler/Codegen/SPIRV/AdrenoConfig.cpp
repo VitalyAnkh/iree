@@ -13,42 +13,40 @@
 #include <array>
 
 #include "iree/compiler/Codegen/SPIRV/KernelConfig.h"
-#include "llvm/ADT/TypeSwitch.h"
+#include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/IR/BuiltinOps.h"
 
 namespace mlir::iree_compiler::detail {
 
 static LogicalResult setAdrenoMatmulConfig(linalg::LinalgOp op,
-                                           spirv::ResourceLimitsAttr limits) {
-  const int subgroupSize = limits.getSubgroupSize();
+                                           IREE::GPU::TargetAttr target) {
+  const int subgroupSize = target.getPreferredSubgroupSize();
   const std::array<int64_t, 2> workgroupXY = {subgroupSize / 2, 2};
   std::array<int64_t, 3> threadMNK;
   auto inputType =
       llvm::cast<ShapedType>(op.getDpsInputOperand(0)->get().getType());
-  if (inputType.getElementType().getIntOrFloatBitWidth() == 16) {
+  if (IREE::Util::getTypeBitWidth(inputType.getElementType()) == 16) {
     threadMNK = {16, 8, 8};
   } else {
     threadMNK = {16, 4, 4};
   }
-  return setMatmulOpConfig(limits, op, workgroupXY, threadMNK);
+  return setMatmulOpConfig(target, op, workgroupXY, threadMNK);
 }
 
 //===----------------------------------------------------------------------===//
 // Entry Point
 //===----------------------------------------------------------------------===//
 
-LogicalResult setAdrenoCodeGenConfig(const spirv::TargetEnv &targetEnv,
+LogicalResult setAdrenoCodeGenConfig(IREE::GPU::TargetAttr target,
                                      Operation *rootOp) {
-  spirv::ResourceLimitsAttr limits = targetEnv.getResourceLimits();
-  int subgroupSize = limits.getSubgroupSize();
+  int subgroupSize = target.getPreferredSubgroupSize();
 
   if (!isa<linalg::LinalgOp>(rootOp))
     return failure();
 
   auto linalgOp = cast<linalg::LinalgOp>(rootOp);
   if (isMatmulOrBatchMatmul(linalgOp))
-    return setAdrenoMatmulConfig(linalgOp, limits);
+    return setAdrenoMatmulConfig(linalgOp, target);
 
   if (auto convOp = dyn_cast<linalg::ConvolutionOpInterface>(rootOp)) {
     // Use the result type in case of larger bitwidth for accumulators.

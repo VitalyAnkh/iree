@@ -7,7 +7,6 @@
 #include "iree/compiler/Dialect/Stream/IR/StreamDialect.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamTypes.h"
-#include "iree/compiler/Dialect/Stream/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Stream/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
@@ -17,7 +16,6 @@
 #include "llvm/Support/Debug.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
@@ -28,6 +26,10 @@
 #define DEBUG_TYPE "iree-stream-schedule-allocation"
 
 namespace mlir::iree_compiler::IREE::Stream {
+
+#define GEN_PASS_DEF_SCHEDULEALLOCATIONPASS
+#include "iree/compiler/Dialect/Stream/Transforms/Passes.h.inc"
+
 namespace {
 
 //===----------------------------------------------------------------------===//
@@ -100,10 +102,10 @@ static void computeRegionValueAliases(Operation *regionOp,
 
   // Filter out to only resource results - some regions may return additional
   // things like stream.async.execute returning a timepoint.
-  auto resourceResults = llvm::to_vector_of<OpResult>(
-      llvm::make_filter_range(regionOp->getResults(), [](OpResult result) {
+  auto resourceResults =
+      llvm::filter_to_vector(regionOp->getResults(), [](OpResult result) {
         return llvm::isa<IREE::Stream::ResourceType>(result.getType());
-      }));
+      });
 
   // Start with outputs so that we handle tied values that may lead all the way
   // back up the chain to the stream inputs.
@@ -242,6 +244,12 @@ computeExecutionRegionLivenessIntervals(IREE::Stream::AsyncExecuteOp executeOp,
         for (auto value : op->getResults()) {
           if (!llvm::isa<IREE::Stream::ResourceType>(value.getType()))
             continue;
+          if (auto tiedOp = dyn_cast<Util::TiedOpInterface>(op)) {
+            // Skip tied results as their liveness is determined by the tied
+            // operand.
+            if (tiedOp.getTiedResultOperand(value))
+              continue;
+          }
           if (!value.use_empty())
             continue;
           LivenessInterval interval;
@@ -657,6 +665,24 @@ applyAsyncCollectiveOp(IREE::Stream::AsyncCollectiveOp asyncOp,
   return success();
 }
 
+static LogicalResult applyAsyncBarrierOp(IREE::Stream::AsyncBarrierOp barrierOp,
+                                         AllocationScope &scope,
+                                         OpBuilder builder) {
+  // TODO: barriers are being treated as copies, they should just be metadata
+  // operations but currently it's causing failures to be removed.
+  auto sourceRange = scope.lookupResourceRange(barrierOp.getSource());
+  auto targetRange = scope.lookupResourceRange(barrierOp.getResult());
+
+  // Perform the copy.
+  builder.create<IREE::Stream::CmdCopyOp>(
+      barrierOp.getLoc(), sourceRange.resource, sourceRange.resourceSize,
+      sourceRange.offset, targetRange.resource, targetRange.resourceSize,
+      targetRange.offset, sourceRange.length);
+
+  barrierOp.erase();
+  return success();
+}
+
 static LogicalResult applyAsyncTransferOp(IREE::Stream::AsyncTransferOp asyncOp,
                                           AllocationScope &scope,
                                           OpBuilder builder) {
@@ -666,7 +692,8 @@ static LogicalResult applyAsyncTransferOp(IREE::Stream::AsyncTransferOp asyncOp,
     return llvm::cast<IREE::Stream::ResourceType>(value.getType())
                .getLifetime() == IREE::Stream::Lifetime::Staging;
   };
-  auto currentAffinityAttr = IREE::Stream::AffinityAttr::lookup(asyncOp);
+  auto currentAffinityAttr =
+      IREE::Stream::AffinityAttr::lookupOrDefault(asyncOp);
   bool transferIn = asyncOp.getSourceAffinityAttr() != currentAffinityAttr ||
                     isStaging(asyncOp.getSource());
   bool transferOut = asyncOp.getResultAffinityAttr() != currentAffinityAttr ||
@@ -978,6 +1005,9 @@ static LogicalResult applyAsyncAllocations(Region &region,
                    .Case([&](IREE::Stream::AsyncCollectiveOp op) {
                      return applyAsyncCollectiveOp(op, scope, OpBuilder(op));
                    })
+                   .Case([&](IREE::Stream::AsyncBarrierOp op) {
+                     return applyAsyncBarrierOp(op, scope, OpBuilder(op));
+                   })
                    .Case([&](IREE::Stream::AsyncTransferOp op) {
                      return applyAsyncTransferOp(op, scope, OpBuilder(op));
                    })
@@ -1142,14 +1172,12 @@ static std::optional<ConstantAllocation>
 extractConstantsWithLifetime(IREE::Stream::AsyncExecuteOp executeOp,
                              IREE::Stream::Lifetime lifetime,
                              OpBuilder &externalBuilder) {
-  auto constantOps = llvm::to_vector(
-      llvm::make_filter_range(executeOp.getOps<IREE::Stream::AsyncConstantOp>(),
-                              [&](IREE::Stream::AsyncConstantOp op) {
-                                return op.getResult()
-                                           .getType()
-                                           .cast<IREE::Stream::ResourceType>()
-                                           .getLifetime() == lifetime;
-                              }));
+  auto constantOps = llvm::filter_to_vector(
+      executeOp.getOps<IREE::Stream::AsyncConstantOp>(),
+      [&](IREE::Stream::AsyncConstantOp op) {
+        return cast<IREE::Stream::ResourceType>(op.getResult().getType())
+                   .getLifetime() == lifetime;
+      });
   if (constantOps.empty())
     return {};
 
@@ -1360,6 +1388,17 @@ static ResourceRange deriveResourceRangeFromResult(Value resultValue,
 
   return ResourceRange(subranges.back().resource, subranges.back().resourceSize,
                        offset, resultSize);
+}
+
+// Returns true if |op| is guaranteed to only be executed once in the program.
+// This naively checks that the op is in the entry block of an initializer. If
+// we really wanted to do this analysis we should do it in a dedicated pass that
+// checks the whole call graph in order to detect if the op is in a function
+// called from an initializer or in a conditional.
+static bool isExecutedOnce(Operation *op) {
+  auto parentOp =
+      dyn_cast<IREE::Util::InitializerOpInterface>(op->getParentOp());
+  return parentOp && op->getBlock() == &parentOp.getInitializerRegion().front();
 }
 
 // TODO(benvanik): find a way to split this up. We could probably do this in
@@ -1688,6 +1727,7 @@ allocateExecutionRegion(IREE::Stream::AsyncExecuteOp executeOp) {
   // the results (besides the timepoint) as they are all aliased.
   auto newExecuteOp = executeBuilder.create<IREE::Stream::CmdExecuteOp>(
       executeOp.getLoc(), newAwaitTimepoint, newOperands, newOperandSizes);
+  newExecuteOp.setOnce(isExecutedOnce(executeOp));
   if (executeOp.getAffinity().has_value()) {
     newExecuteOp.setAffinityAttr(executeOp.getAffinityAttr());
   }
@@ -1816,19 +1856,12 @@ static LogicalResult convertAsyncStoreOp(IREE::Stream::AsyncStoreOp asyncOp) {
 }
 
 //===----------------------------------------------------------------------===//
-// -iree-stream-schedule-allocation
+// --iree-stream-schedule-allocation
 //===----------------------------------------------------------------------===//
 
-class ScheduleAllocationPass
-    : public ScheduleAllocationBase<ScheduleAllocationPass> {
-public:
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<mlir::func::FuncDialect>();
-    registry.insert<mlir::arith::ArithDialect>();
-    registry.insert<IREE::Stream::StreamDialect>();
-    registry.insert<IREE::Util::UtilDialect>();
-  }
-
+struct ScheduleAllocationPass
+    : public IREE::Stream::impl::ScheduleAllocationPassBase<
+          ScheduleAllocationPass> {
   void runOnOperation() override {
     auto moduleOp = getOperation();
     for (auto &parentOp : llvm::make_early_inc_range(moduleOp.getOps())) {
@@ -1865,9 +1898,5 @@ public:
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createScheduleAllocationPass() {
-  return std::make_unique<ScheduleAllocationPass>();
-}
 
 } // namespace mlir::iree_compiler::IREE::Stream

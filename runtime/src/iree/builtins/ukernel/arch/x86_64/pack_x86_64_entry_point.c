@@ -4,13 +4,13 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/builtins/ukernel/arch/x86_64/common_x86_64_entry_point.h"
+#include "iree/builtins/ukernel/arch/x86_64/common_x86_64.h"
 #include "iree/builtins/ukernel/arch/x86_64/pack_x86_64_internal.h"
 
 static iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_x86_64_8x8_x32(
     const iree_uk_pack_params_t* params) {
 #if defined(IREE_UK_BUILD_X86_64_AVX2_FMA)
-  if (iree_uk_cpu_supports_avx2_fma(params->cpu_data)) {
+  if (iree_uk_cpu_x86_64_avx2_fma(params->cpu_data)) {
     bool transpose = params->flags & IREE_UK_FLAG_PACK_TRANSPOSE_INNER;
     return transpose ? 0 : iree_uk_pack_tile_8x8_x32_x86_64_avx2_fma_direct;
   }
@@ -21,7 +21,7 @@ static iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_x86_64_8x8_x32(
 static iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_x86_64_16x16_x32(
     const iree_uk_pack_params_t* params) {
 #if defined(IREE_UK_BUILD_X86_64_AVX512_BASE)
-  if (iree_uk_cpu_supports_avx512_base(params->cpu_data)) {
+  if (iree_uk_cpu_x86_64_avx512_base(params->cpu_data)) {
     bool transpose = params->flags & IREE_UK_FLAG_PACK_TRANSPOSE_INNER;
     return transpose ? 0
                      : iree_uk_pack_tile_16x16_x32_x86_64_avx512_base_direct;
@@ -33,7 +33,7 @@ static iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_x86_64_16x16_x32(
 static iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_x86_64_8x1_x32(
     const iree_uk_pack_params_t* params) {
 #if defined(IREE_UK_BUILD_X86_64_AVX2_FMA)
-  if (iree_uk_cpu_supports_avx2_fma(params->cpu_data)) {
+  if (iree_uk_cpu_x86_64_avx2_fma(params->cpu_data)) {
     bool transpose = params->flags & IREE_UK_FLAG_PACK_TRANSPOSE_INNER;
     return transpose ? iree_uk_pack_tile_8x1_x32_x86_64_avx2_fma_transpose
                      : iree_uk_pack_tile_8x1_x32_x86_64_avx2_fma_direct;
@@ -45,7 +45,7 @@ static iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_x86_64_8x1_x32(
 static iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_x86_64_16x1_x32(
     const iree_uk_pack_params_t* params) {
 #if defined(IREE_UK_BUILD_X86_64_AVX512_BASE)
-  if (iree_uk_cpu_supports_avx512_base(params->cpu_data)) {
+  if (iree_uk_cpu_x86_64_avx512_base(params->cpu_data)) {
     bool transpose = params->flags & IREE_UK_FLAG_PACK_TRANSPOSE_INNER;
     return transpose ? iree_uk_pack_tile_16x1_x32_x86_64_avx512_base_transpose
                      : iree_uk_pack_tile_16x1_x32_x86_64_avx512_base_direct;
@@ -54,10 +54,22 @@ static iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_x86_64_16x1_x32(
   return 0;
 }
 
+static iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_x86_64_16x2_x16(
+    const iree_uk_pack_params_t* params) {
+#if defined(IREE_UK_BUILD_X86_64_AVX512_BASE)
+  if (iree_uk_cpu_x86_64_avx512_base(params->cpu_data)) {
+    bool transpose = params->flags & IREE_UK_FLAG_PACK_TRANSPOSE_INNER;
+    return transpose ? iree_uk_pack_tile_16x2_x16_x86_64_avx512_base_transpose
+                     : iree_uk_pack_tile_16x2_x16_x86_64_avx512_base_direct;
+  }
+#endif
+  return 0;
+}
+
 static iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_x86_64_8x2_x8(
     const iree_uk_pack_params_t* params) {
 #if defined(IREE_UK_BUILD_X86_64_AVX2_FMA)
-  if (iree_uk_cpu_supports_avx2_fma(params->cpu_data)) {
+  if (iree_uk_cpu_x86_64_avx2_fma(params->cpu_data)) {
     bool transpose = params->flags & IREE_UK_FLAG_PACK_TRANSPOSE_INNER;
     return transpose ? iree_uk_pack_tile_8x2_x8_x86_64_avx2_fma_transpose
                      : iree_uk_pack_tile_8x2_x8_x86_64_avx2_fma_direct;
@@ -69,7 +81,7 @@ static iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_x86_64_8x2_x8(
 static iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_x86_64_16x2_x8(
     const iree_uk_pack_params_t* params) {
 #if defined(IREE_UK_BUILD_X86_64_AVX512_BASE)
-  if (iree_uk_cpu_supports_avx512_base(params->cpu_data)) {
+  if (iree_uk_cpu_x86_64_avx512_base(params->cpu_data)) {
     bool transpose = params->flags & IREE_UK_FLAG_PACK_TRANSPOSE_INNER;
     return transpose ? iree_uk_pack_tile_16x2_x8_x86_64_avx512_base_transpose
                      : iree_uk_pack_tile_16x2_x8_x86_64_avx512_base_direct;
@@ -93,6 +105,8 @@ iree_uk_pack_tile_func_t iree_uk_pack_select_tile_func_arch(
     return iree_uk_pack_select_tile_func_x86_64_8x1_x32(params);
   } else if (esize == 4 && params->out_size2 == 16 && params->out_size3 == 1) {
     return iree_uk_pack_select_tile_func_x86_64_16x1_x32(params);
+  } else if (esize == 2 && params->out_size2 == 16 && params->out_size3 == 2) {
+    return iree_uk_pack_select_tile_func_x86_64_16x2_x16(params);
   } else if (esize == 1 && params->out_size2 == 8 && params->out_size3 == 2) {
     return iree_uk_pack_select_tile_func_x86_64_8x2_x8(params);
   } else if (esize == 1 && params->out_size2 == 16 && params->out_size3 == 2) {

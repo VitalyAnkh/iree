@@ -10,13 +10,13 @@
 //
 // Originally contributed due to the work of edubart who figured out how to
 // be the first user of the combined MLIR+IREE CAPI:
-// https://github.com/openxla/iree/pull/8582
+// https://github.com/iree-org/iree/pull/8582
 
 #include <stdio.h>
 #include <string.h>
 
-#include "iree/compiler/API/MLIRInterop.h"
 #include "iree/compiler/embedding_api.h"
+#include "iree/compiler/mlir_interop.h"
 
 struct compiler_state_t {
   iree_compiler_session_t *session;

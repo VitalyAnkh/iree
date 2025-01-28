@@ -52,7 +52,7 @@ graph LR
     [official documentation](https://www.tensorflow.org/install):
 
     ```shell
-    python -m pip install tf-nightly
+    python -m pip install tensorflow
     ```
 
 2. Install IREE packages, either by
@@ -61,27 +61,27 @@ graph LR
 
     === "Stable releases"
 
-        Stable release packages are
-        [published to PyPI](https://pypi.org/user/google-iree-pypi-deploy/).
+        Stable release packages are [published to PyPI](https://pypi.org/).
 
         ``` shell
         python -m pip install \
-          iree-compiler \
-          iree-runtime \
+          iree-base-compiler \
+          iree-base-runtime \
           iree-tools-tf
         ```
 
     === ":material-alert: Nightly releases"
 
         Nightly releases are published on
-        [GitHub releases](https://github.com/openxla/iree/releases).
+        [GitHub releases](https://github.com/iree-org/iree/releases).
 
         ``` shell
         python -m pip install \
           --find-links https://iree.dev/pip-release-links.html \
           --upgrade \
-          iree-compiler \
-          iree-runtime \
+          --pre \
+          iree-base-compiler \
+          iree-base-runtime \
           iree-tools-tf
         ```
 
@@ -148,13 +148,13 @@ supported targets by following one of the
 
 | Colab notebooks |  |
 | -- | -- |
-Training an MNIST digits classifier | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openxla/iree/blob/main/samples/colab/tensorflow_mnist_training.ipynb)
-Edge detection | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openxla/iree/blob/main/samples/colab/tensorflow_edge_detection.ipynb)
-Pretrained ResNet50 inference | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openxla/iree/blob/main/samples/colab/tensorflow_resnet.ipynb)
-TensorFlow Hub import | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openxla/iree/blob/main/samples/colab/tensorflow_hub_import.ipynb)
+Training an MNIST digits classifier | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree/blob/main/samples/colab/tensorflow_mnist_training.ipynb)
+Edge detection | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree/blob/main/samples/colab/tensorflow_edge_detection.ipynb)
+Pretrained ResNet50 inference | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree/blob/main/samples/colab/tensorflow_resnet.ipynb)
+TensorFlow Hub import | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree/blob/main/samples/colab/tensorflow_hub_import.ipynb)
 
 End-to-end execution tests can be found in IREE's
-[integrations/tensorflow/e2e/](https://github.com/openxla/iree/tree/main/integrations/tensorflow/e2e)
+[integrations/tensorflow/e2e/](https://github.com/iree-org/iree/tree/main/integrations/tensorflow/e2e)
 directory.
 
 ## :octicons-question-16: Troubleshooting
