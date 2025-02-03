@@ -7,15 +7,15 @@
 #ifndef IREE_COMPILER_INPUTCONVERSION_COMMON_PASSES_H_
 #define IREE_COMPILER_INPUTCONVERSION_COMMON_PASSES_H_
 
-#include "iree/compiler/InputConversion/Common/PassDetail.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "iree/compiler/Pipelines/Options.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 // Forward declare from iree/compiler/PluginAPI/Client.h.
 class PipelineExtensions;
 
-namespace mlir::iree_compiler {
+namespace mlir::iree_compiler::InputConversion {
 
 #define GEN_PASS_DECL
 #include "iree/compiler/InputConversion/Common/Passes.h.inc"
@@ -24,25 +24,21 @@ namespace mlir::iree_compiler {
 // Pipelines
 //===----------------------------------------------------------------------===//
 
+struct TransformOptions : public PassPipelineOptions<TransformOptions> {
+  InputDialectOptions options;
+};
+
 // Performs common input legalization after specific input dialect conversions
 // have taken place.
-void buildCommonInputConversionPassPipeline(OpPassManager &passManager);
+void buildCommonInputConversionPassPipeline(
+    OpPassManager &passManager, const TransformOptions &transformOptions);
 
 //===----------------------------------------------------------------------===//
 // Passes
 //===----------------------------------------------------------------------===//
 
 std::unique_ptr<OperationPass<ModuleOp>>
-createAutoInputConversionPipelinePass();
-std::unique_ptr<OperationPass<ModuleOp>>
 createAutoInputConversionPipelinePass(PipelineExtensions *pipelineExtensions);
-std::unique_ptr<OperationPass<ModuleOp>> createIREEImportPublicPass();
-std::unique_ptr<OperationPass<ModuleOp>> createImportMLProgramPass();
-std::unique_ptr<OperationPass<func::FuncOp>>
-createLinalgQuantizedConvToConvPass();
-std::unique_ptr<OperationPass<func::FuncOp>>
-createLinalgQuantizedMatmulToMatmulPass();
-std::unique_ptr<OperationPass<ModuleOp>> createSanitizeModuleNamesPass();
 
 //===----------------------------------------------------------------------===//
 // Register all Passes
@@ -50,6 +46,6 @@ std::unique_ptr<OperationPass<ModuleOp>> createSanitizeModuleNamesPass();
 
 void registerCommonInputConversionPasses();
 
-} // namespace mlir::iree_compiler
+} // namespace mlir::iree_compiler::InputConversion
 
 #endif // IREE_COMPILER_INPUTCONVERSION_COMMON_PASSES_H_

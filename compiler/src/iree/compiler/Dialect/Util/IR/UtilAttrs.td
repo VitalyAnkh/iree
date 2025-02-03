@@ -14,6 +14,37 @@ include "mlir/IR/BuiltinAttributeInterfaces.td"
 include "mlir/IR/OpBase.td"
 
 //===----------------------------------------------------------------------===//
+// #util.int.assumptions
+//===----------------------------------------------------------------------===//
+
+def Util_IntAssumptionAttr : AttrDef<Util_Dialect, "IntAssumption", []
+> {
+  let mnemonic = "int.assumption";
+  let summary = [{specifies assumptions that can be made about an integer's value}];
+  let description = [{
+    This is typically used to memorialize the result of some integer analysis
+    or outside knowledge. All components of the attribute are optional.
+
+    See the op `util.assume.int` for binding assumptions to values.
+  }];
+  let parameters = (ins
+    DefaultValuedParameter<"std::optional<uint64_t>", "std::nullopt">:$umin,
+    DefaultValuedParameter<"std::optional<uint64_t>", "std::nullopt">:$umax,
+    DefaultValuedParameter<"std::optional<uint64_t>", "std::nullopt">:$udiv
+  );
+  let assemblyFormat = [{
+    `<` struct($umin, $umax, $udiv) `>`
+  }];
+}
+
+def Util_IntAssumptionAttrList : TypedArrayAttrBase<
+    Util_IntAssumptionAttr, "list of int assumption attributes">;
+
+def Util_MultiValueIntAssumptionAttrList : TypedArrayAttrBase<
+    Util_IntAssumptionAttrList,
+    "list of int attribute assumptions for multiple values">;
+
+//===----------------------------------------------------------------------===//
 // #util.byte_pattern
 //===----------------------------------------------------------------------===//
 
@@ -108,6 +139,68 @@ def Util_CompositeAttr : AttrDef<Util_Dialect, "Composite", [
   let genVerifyDecl = 1;
 
   let hasCustomAssemblyFormat = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// #util.inline.*
+//===----------------------------------------------------------------------===//
+
+def Util_InlineNeverAttr : AttrDef<Util_Dialect, "InlineNever", [
+  Util_InliningPolicyAttrInterface,
+]> {
+  let mnemonic = "inline.never";
+  let summary = [{disables inlining on the associated function}];
+  let description = [{
+    Disables inlining of the function the attribute is associated with into
+    any call-site.
+  }];
+  let parameters = (ins);
+  let assemblyFormat = [{}];
+  let extraClassDeclaration = [{
+    bool isLegalToInline(Operation *inlineSite, Operation *inlinable) {
+      return false;
+    }
+  }];
+}
+
+def Util_InlineAlwaysAttr : AttrDef<Util_Dialect, "InlineAlways", [
+  Util_InliningPolicyAttrInterface,
+]> {
+  let mnemonic = "inline.always";
+  let summary = [{forces inlining on the associated function when possible}];
+  let description = [{
+    Skips any cost-model decisions as to whether a function should be inlined
+    into call-sites and allows the inlining to happen. Any policies that prevent
+    inlining will still be observed and inlining may fail if any are not
+    satisfied.
+  }];
+  let parameters = (ins);
+  let assemblyFormat = [{}];
+  let extraClassDeclaration = [{
+    bool isLegalToInline(Operation *inlineSite, Operation *inlinable) {
+      return true;
+    }
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// #util.null
+//===----------------------------------------------------------------------===//
+
+def Util_NullAttr : AttrDef<Util_Dialect, "Null", [
+  TypedAttrInterface,
+]> {
+  let mnemonic = "null";
+  let summary = [{an attribute specifying a null reference}];
+  let description = [{
+    A null reference value.
+  }];
+
+  let parameters = (ins
+    AttributeSelfTypeParameter<"">:$type
+  );
+
+  let assemblyFormat = [{}];
 }
 
 //===----------------------------------------------------------------------===//

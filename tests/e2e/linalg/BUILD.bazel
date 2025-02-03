@@ -22,8 +22,9 @@ LLVM_SRCS = enforce_glob(
     # keep sorted
     [
         "conv2d.mlir",
-        "f32_to_i4.mlir",
-        "i4_to_f32.mlir",
+        "fp_to_subbyte.mlir",
+        "narrow_n_matmuls.mlir",
+        "subbyte_to_fp.mlir",
     ],
     include = ["*.mlir"],
     exclude = [
@@ -34,19 +35,25 @@ LLVM_SRCS = enforce_glob(
 iree_check_single_backend_test_suite(
     name = "check_llvm-cpu_local-task",
     srcs = LLVM_SRCS,
+    compiler_flags = ["--iree-llvmcpu-target-cpu=generic"],
     driver = "local-task",
+    tags = [
+        # subbyte support for wasm is not on priorities.
+        "nowasm",
+    ],
     target_backend = "llvm-cpu",
 )
 
 VMVX_SRCS = enforce_glob(
     [
         "conv2d.mlir",
+        "narrow_n_matmuls.mlir",
     ],
     include = ["*.mlir"],
     exclude = [
+        "fp_to_subbyte.mlir",
         "large_linalg_matmul.mlir",
-        "i4_to_f32.mlir",
-        "f32_to_i4.mlir",
+        "subbyte_to_fp.mlir",
     ],
 )
 
@@ -60,12 +67,13 @@ iree_check_single_backend_test_suite(
 VULKAN_SRCS = enforce_glob(
     [
         "conv2d.mlir",
-        "i4_to_f32.mlir",
+        "subbyte_to_fp.mlir",
+        "narrow_n_matmuls.mlir",
     ],
     include = ["*.mlir"],
     exclude = [
         "large_linalg_matmul.mlir",
-        "f32_to_i4.mlir",
+        "fp_to_subbyte.mlir",
     ],
 )
 
@@ -85,6 +93,7 @@ iree_check_single_backend_test_suite(
     srcs = WINOGRAD_CONV_SRCS,
     compiler_flags = [
         "--iree-preprocessing-pass-pipeline=builtin.module\\(func.func\\(iree-linalg-ext-convert-conv2d-to-winograd\\)\\)",
+        "--iree-llvmcpu-target-cpu=generic",
     ],
     driver = "local-task",
     target_backend = "llvm-cpu",
@@ -104,10 +113,11 @@ CUDA_SRCS = enforce_glob(
     # keep sorted
     [
         "conv2d.mlir",
-        "f32_to_i4.mlir",
-        "i4_to_f32.mlir",
+        "fp_to_subbyte.mlir",
+        "subbyte_to_fp.mlir",
         # currently only enabled on cuda as it can be slow on other backends.
         "large_linalg_matmul.mlir",
+        "narrow_n_matmuls.mlir",
     ],
     include = ["*.mlir"],
     exclude = [

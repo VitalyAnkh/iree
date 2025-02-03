@@ -20,6 +20,7 @@
 #include "iree/modules/hal/module.h"
 #include "iree/tooling/modules/resolver.h"
 #include "iree/vm/api.h"
+#include "nanobind/nanobind.h"
 
 using namespace nanobind::literals;
 
@@ -129,6 +130,24 @@ py::dict GetFunctionReflectionDict(iree_vm_function_t& f) {
 }
 
 }  // namespace
+
+//------------------------------------------------------------------------------
+// VmBuffer
+//------------------------------------------------------------------------------
+
+int VmBuffer::HandleBufferProtocol(Py_buffer* view, int flags) {
+  view->buf = raw_ptr()->data.data;
+  view->len = raw_ptr()->data.data_length;
+  view->readonly = !(raw_ptr()->access & IREE_VM_BUFFER_ACCESS_MUTABLE);
+  view->itemsize = 1;
+  view->format = (char*)"B";  // Byte
+  view->ndim = 1;
+  view->shape = nullptr;
+  view->strides = nullptr;
+  view->suboffsets = nullptr;
+  view->internal = nullptr;
+  return 0;
+}
 
 //------------------------------------------------------------------------------
 // VmInstance
@@ -271,7 +290,28 @@ VmModule VmModule::MMap(VmInstance* instance, std::string filepath,
 VmModule VmModule::WrapBuffer(VmInstance* instance, py::object buffer_obj,
                               py::object destroy_callback, bool close_buffer) {
   IREE_TRACE_SCOPE_NAMED("VmModule::FromAlignedMemory");
-  PyBufferRequest buffer_info(buffer_obj, PyBUF_SIMPLE);
+  // State object that is retained for the life of the module.
+  // It is responsible for keeping the backing resources alive and
+  // holding the user-level destroy callback.
+  // Note that the original buffer_obj is not captured explicitly but
+  // is available as part of the Py_buffer underlying the PyBufferRequest.
+  // Aside from being more efficient, avoiding redundant capture removes
+  // destruction race potential.
+  struct BufferState {
+    BufferState(py::object buffer_obj, py::object destroy_callback,
+                bool close_buffer)
+        : buffer_info(buffer_obj, PyBUF_SIMPLE),
+          destroy_callback(std::move(destroy_callback)),
+          close_buffer(close_buffer) {}
+    PyBufferRequest buffer_info;
+    py::object destroy_callback;
+    bool close_buffer;
+
+    py::handle get_buffer() { return py::handle(buffer_info.view().obj); }
+  };
+  BufferState* state =
+      new BufferState(buffer_obj, destroy_callback, close_buffer);
+  PyBufferRequest& buffer_info = state->buffer_info;
   if (!iree_host_size_has_alignment((uintptr_t)buffer_info.view().buf,
                                     IREE_HAL_HEAP_BUFFER_ALIGNMENT)) {
     std::stringstream err;
@@ -282,33 +322,33 @@ VmModule VmModule::WrapBuffer(VmInstance* instance, py::object buffer_obj,
   }
 
   iree_vm_module_t* module = nullptr;
-
-  // Bridge to the C-based deallocator API.
-  struct DeallocateState {
-    DeallocateState(py::object buffer_obj, py::object destroy_callback,
-                    bool close_buffer)
-        : buffer_obj(std::move(buffer_obj)),
-          destroy_callback(std::move(destroy_callback)),
-          close_buffer(close_buffer) {}
-    py::object buffer_obj;
-    py::object destroy_callback;
-    bool close_buffer;
-  };
-  DeallocateState* state =
-      new DeallocateState(buffer_obj, destroy_callback, close_buffer);
   auto ctl_fn = +([](void* self, iree_allocator_command_t command,
                      const void* params, void** inout_ptr) {
     py::gil_scoped_acquire gil;
     assert(command == IREE_ALLOCATOR_COMMAND_FREE);
     try {
-      DeallocateState* state = static_cast<DeallocateState*>(self);
+      // Destruction sequencing is tricky. We must have released the
+      // PyBufferRequest before calling close, so we first get what we
+      // need out of the state into local variables, then delete the state
+      // (releasing the PyBufferRequest), then closing and issuing the
+      // destroy callback. Getting the order wrong will result in an
+      // unrecoverable exception indicating the the buffer cannot be closed
+      // with outstanding mappings.
+      BufferState* state = static_cast<BufferState*>(self);
+      py::object destroy_callback = std::move(state->destroy_callback);
+      py::object buffer_to_close;
       if (state->close_buffer) {
-        state->buffer_obj.attr("close")();
-      }
-      if (!state->destroy_callback.is_none()) {
-        state->destroy_callback();
+        buffer_to_close = py::borrow(state->get_buffer());
       }
       delete state;
+
+      if (buffer_to_close) {
+        buffer_to_close.attr("close")();
+      }
+
+      if (!destroy_callback.is_none()) {
+        destroy_callback();
+      }
     } catch (std::exception& e) {
       // There are many situations where deallocation exceptions can be
       // swallowed, so carp loudly. This is almost always a critical issue
@@ -780,49 +820,14 @@ void SetupVmBindings(nanobind::module_ m) {
       .value("IMPORT", IREE_VM_FUNCTION_LINKAGE_IMPORT)
       .value("IMPORT_OPTIONAL", IREE_VM_FUNCTION_LINKAGE_IMPORT_OPTIONAL)
       .value("EXPORT", IREE_VM_FUNCTION_LINKAGE_EXPORT)
+      .value("EXPORT_OPTIONAL", IREE_VM_FUNCTION_LINKAGE_EXPORT_OPTIONAL)
       .export_values();
 
   auto vm_buffer = py::class_<VmBuffer>(m, "VmBuffer");
   VmRef::BindRefProtocol(vm_buffer, iree_vm_buffer_type,
                          iree_vm_buffer_retain_ref, iree_vm_buffer_deref,
                          iree_vm_buffer_isa);
-  // Implement the buffer protocol with low-level API.
-  {
-    static PyBufferProcs buffer_procs = {
-        // It is not legal to raise exceptions from these callbacks.
-        +[](PyObject* raw_self, Py_buffer* view, int flags) -> int {
-          // Cast must succeed due to invariants.
-          auto self = py::cast<VmBuffer*>(py::handle(raw_self));
-          if (view == NULL) {
-            PyErr_SetString(PyExc_ValueError, "NULL view in getbuffer");
-            return -1;
-          }
-
-          Py_INCREF(raw_self);
-          view->obj = raw_self;
-          view->buf = self->raw_ptr()->data.data;
-          view->len = self->raw_ptr()->data.data_length;
-          view->readonly =
-              !(self->raw_ptr()->access & IREE_VM_BUFFER_ACCESS_MUTABLE);
-          view->itemsize = 1;
-          view->format = (char*)"B";  // Byte
-          view->ndim = 1;
-          view->shape = nullptr;
-          view->strides = nullptr;
-          view->suboffsets = nullptr;
-          view->internal = nullptr;
-          return 0;
-        },
-        +[](PyObject* self_obj, Py_buffer* view) -> void {
-
-        },
-    };
-    auto heap_type = reinterpret_cast<PyHeapTypeObject*>(vm_buffer.ptr());
-    assert(heap_type->ht_type.tp_flags & Py_TPFLAGS_HEAPTYPE &&
-           "must be heap type");
-    heap_type->as_buffer = buffer_procs;
-  }
-
+  BindBufferProtocol<VmBuffer>(vm_buffer);
   vm_buffer
       .def(
           "__init__",

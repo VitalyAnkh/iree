@@ -16,6 +16,7 @@ include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "iree/compiler/Dialect/Util/IR/UtilInterfaces.td"
 include "iree/compiler/Dialect/Util/IR/UtilTypes.td"
+include "iree/compiler/Dialect/Util/IR/UtilAttrs.td"
 include "iree/compiler/Dialect/VM/IR/VMBase.td"
 
 // Trial ops do not have any memory effects but may invoke Undefine Behavior on
@@ -26,7 +27,7 @@ class VM_TrivialOp<string mnemonic, list<Trait> traits = []> :
 // Pure ops do not have any memory effects, do not invoke Undefined Behavior,
 // and are always safe to speculate/hoist.
 //
-// TODO(https://github.com/openxla/iree/issues/11179): More VM ops should be
+// TODO(https://github.com/iree-org/iree/issues/11179): More VM ops should be
 // made pure.
 class VM_PureOp<string mnemonic, list<Trait> traits = []> :
       VM_TrivialOp<mnemonic, !listconcat(traits, [AlwaysSpeculatable])>;
@@ -120,7 +121,7 @@ def VM_FuncOp : VM_Op<"func", [
   let arguments = (ins
     TypeAttrOf<FunctionType>:$function_type,
     OptionalAttr<VM_Ordinal>:$ordinal,
-    OptionalAttr<UnitAttr>:$noinline,
+    OptionalAttr<Util_InliningPolicyAttrInterface>:$inlining_policy,
     OptionalAttr<DictArrayAttr>:$arg_attrs,
     OptionalAttr<DictArrayAttr>:$res_attrs
   );
@@ -378,7 +379,10 @@ class VM_PrimitiveGlobalOp<string mnemonic, Attr attr_type, list<Trait> traits =
       IsolatedFromAbove,
       HasParent<"IREE::VM::ModuleOp">,
       Symbol,
-      Util_GlobalOpInterface,
+      DeclareOpInterfaceMethods<Util_GlobalOpInterface, [
+        "createLoadOp",
+        "createStoreOp",
+      ]>
     ])> {
   let arguments = (ins
     OptionalAttr<StrAttr>:$sym_visibility,
@@ -386,6 +390,7 @@ class VM_PrimitiveGlobalOp<string mnemonic, Attr attr_type, list<Trait> traits =
     TypeAttr:$type,
     UnitAttr:$is_mutable,
     OptionalAttr<attr_type>:$initial_value,
+    OptionalAttr<Util_InliningPolicyAttrInterface>:$inlining_policy,
     OptionalAttr<VM_Ordinal>:$ordinal
   );
 
@@ -411,8 +416,8 @@ class VM_PrimitiveGlobalOp<string mnemonic, Attr attr_type, list<Trait> traits =
         $_state.addAttribute("is_mutable", $_builder.getUnitAttr());
       }
       if (initialValue.has_value() &&
-                 (initialValue.value().isa<IntegerAttr>() ||
-                  initialValue.value().isa<FloatAttr>())) {
+                 (isa<IntegerAttr>(initialValue.value()) ||
+                  isa<FloatAttr>(initialValue.value()))) {
         $_state.addAttribute("initial_value", initialValue.value());
       }
       $_state.addAttribute("type", TypeAttr::get(type));
@@ -494,6 +499,7 @@ def VM_GlobalRefOp :
     SymbolNameAttr:$sym_name,
     TypeAttr:$type,
     UnitAttr:$is_mutable,
+    OptionalAttr<Util_InliningPolicyAttrInterface>:$inlining_policy,
     OptionalAttr<VM_Ordinal>:$ordinal
   );
 
@@ -542,13 +548,15 @@ def VM_GlobalAddressOp : VM_PureOp<"global.address", [
   }];
 
   let arguments = (ins
-    VM_GlobalRefAttr:$global
+    VM_GlobalRefAttr:$global,
+    UnitAttr:$is_immutable
   );
   let results = (outs
     AnyTypeOf<[VM_Ptr, Util_AnyPtrType]>:$result
   );
 
   let assemblyFormat = [{
+    (`immutable` $is_immutable^)?
     $global attr-dict `:` type($result)
   }];
 
@@ -568,13 +576,15 @@ class VM_GlobalLoadOp<Type type, string mnemonic, list<Trait> traits = []> :
       DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
     ])> {
   let arguments = (ins
-    VM_GlobalRefAttr:$global
+    VM_GlobalRefAttr:$global,
+    UnitAttr:$is_immutable
   );
   let results = (outs
     type:$value
   );
 
   let assemblyFormat = [{
+    (`immutable` $is_immutable^)?
     $global attr-dict `:` type($value)
   }];
 
@@ -642,13 +652,15 @@ class VM_GlobalLoadIndirectOp<Type type, string mnemonic,
       Util_GlobalLoadIndirectOpInterface,
     ])> {
   let arguments = (ins
-    AnyTypeOf<[VM_Ptr, Util_PtrOf<type>]>:$global
+    AnyTypeOf<[VM_Ptr, Util_PtrOf<type>]>:$global,
+    UnitAttr:$is_immutable
   );
   let results = (outs
     type:$value
   );
 
   let assemblyFormat = [{
+    (`immutable` $is_immutable^)?
     $global attr-dict `:` type($global) `->` type($value)
   }];
 }
@@ -1125,6 +1137,7 @@ def VM_RodataOp : VM_Op<"rodata", [
 }
 
 def VM_ConstRefRodataOp : VM_PureOp<"const.ref.rodata", [
+    DeclareOpInterfaceMethods<SymbolUserOpInterface>,
     DeclareOpInterfaceMethods<VM_SerializableOpInterface>,
     DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>
   ]> {
@@ -1158,8 +1171,6 @@ def VM_ConstRefRodataOp : VM_PureOp<"const.ref.rodata", [
     OpBuilder<(ins "RodataOp":$rodataOp,
       CArg<"ArrayRef<NamedAttribute>", "{}">:$attrs)>,
   ];
-
-  let hasVerifier = 1;
 }
 
 def VM_RodataInlineOp : VM_PureOp<"rodata.inline", [
@@ -1193,6 +1204,48 @@ def VM_RodataInlineOp : VM_PureOp<"rodata.inline", [
       $_state.addAttribute("value", value);
     }]>,
     OpBuilder<(ins "StringAttr":$value)>
+  ];
+}
+
+def VM_RodataTableInlineOp : VM_PureOp<"rodata.table.inline", [
+    VM_PseudoOp,
+  ]> {
+  let summary = [{inlined constant rodata table}];
+  let description = [{
+    vm.rodata with another associated vm.rodata table specifying byte offsets
+    and sizes as a subview into the flattened data. The table is a flat array
+    of 32 or 64-bit integers storing (offset, size) in element order.
+
+    The optional alignment attribute applies to both the table and data rodata.
+    The data_alignment attribute can be used to specify an alignment for the
+    elements of the table, padding to the data alignment with zeros. The element
+    sizes reflect the unpadded attribute storage sizes.
+
+    See vm.rodata for more information.
+  }];
+
+  let arguments = (ins
+    OptionalAttr<StrAttr>:$table_name,
+    OptionalAttr<StrAttr>:$data_name,
+    TypeAttrOf<VM_AnyIntegerType>:$table_type,
+    Util_AnySerializableArrayAttr:$data_array,
+    OptionalAttr<I64Attr>:$alignment,
+    OptionalAttr<I64Attr>:$data_alignment,
+    OptionalAttr<StrAttr>:$mime_type
+  );
+
+  let results = (outs
+    VM_RefOf<VM_BufferType>:$table_result,
+    VM_RefOf<VM_BufferType>:$data_result
+  );
+
+  let assemblyFormat = [{
+    $table_type attr-dict `:` type($table_result) `,` type($data_result) `=` $data_array
+  }];
+
+  let builders = [
+    OpBuilder<(ins "IntegerType":$table_type, "ArrayAttr":$value)>,
+    OpBuilder<(ins "StringAttr":$name, "IntegerType":$table_type, "ArrayAttr":$value)>
   ];
 }
 
@@ -1555,6 +1608,38 @@ def VM_BufferStoreF64Op :
   let summary = [{64-bit floating-point store}];
 }
 
+def VM_BufferHashOp : VM_Op<"buffer.hash", [
+      DeclareOpInterfaceMethods<VM_SerializableOpInterface>,
+      MemoryEffects<[MemRead]>,
+    ]> {
+  let description = [{
+    Computes the SipHash-2-4 of the source buffer at the given offset for
+    |length| bytes using seed `0x0001020304...0e0f`.
+  }];
+
+  let arguments = (ins
+    VM_RefOf<VM_BufferType>:$source_buffer,
+    VM_BufferIndex:$source_offset,
+    VM_BufferIndex:$length
+  );
+  let results = (outs
+    I64:$result
+  );
+
+  let assemblyFormat = [{
+    $source_buffer `,` $source_offset `,` $length
+    attr-dict `:` type($source_buffer) `->` type($result)
+  }];
+
+  let encoding = [
+    VM_EncOpcode<VM_OPC_BufferHash>,
+    VM_EncOperand<"source_buffer", 0>,
+    VM_EncOperand<"source_offset", 1>,
+    VM_EncOperand<"length", 2>,
+    VM_EncResult<"result">,
+  ];
+}
+
 } // OpGroupBufferOps
 
 //===----------------------------------------------------------------------===//
@@ -1596,7 +1681,7 @@ def VM_ListAllocOp :
 
   let encoding = [
     VM_EncOpcode<VM_OPC_ListAlloc>,
-    VM_EncType<"getResult().getType().cast<IREE::VM::RefType>().getObjectType().cast<IREE::VM::ListType>().getElementType()">,
+    VM_EncType<"cast<IREE::VM::ListType>(cast<IREE::VM::RefType>(getResult().getType()).getObjectType()).getElementType()">,
     VM_EncOperand<"initial_capacity", 0>,
     VM_EncResult<"result">,
   ];
@@ -2573,7 +2658,7 @@ def VM_MaxF32Op :
 
 def VM_MaxF64Op :
     VM_TotalBinaryArithmeticOp<F64, "max.f64", VM_OPC_MaxF64,
-                               [VM_ExtF32, Commutative]> {
+                               [VM_ExtF64, Commutative]> {
   let summary = [{floating point maximum operation}];
   let hasFolder = 1;
 }
@@ -3075,16 +3160,65 @@ def VM_CastUI32F32Op :
   let hasFolder = 1;
 }
 
+def VM_CastSI64F64Op :
+    VM_ConversionOp<I64, F64, "cast.si64.f64", VM_OPC_CastSI64F64,
+                    [VM_ExtF64]> {
+  let summary = [{cast from a signed integer to a float-point value}];
+  let hasFolder = 1;
+}
+
+def VM_CastSI64F32Op :
+    VM_ConversionOp<I64, F32, "cast.si64.f32", VM_OPC_CastSI64F32,
+                    [VM_ExtF32]> {
+  let summary = [{cast from a signed integer to a float-point value}];
+  let hasFolder = 1;
+}
+
+def VM_CastUI64F64Op :
+    VM_ConversionOp<I64, F64, "cast.ui64.f64", VM_OPC_CastUI64F64,
+                    [VM_ExtF64]> {
+  let summary = [{cast from an unsigned integer to a float-point value}];
+  let hasFolder = 1;
+}
+
 def VM_CastF32SI32Op :
     VM_ConversionOp<F32, I32, "cast.f32.si32", VM_OPC_CastF32SI32,
                     [VM_ExtF32]> {
-  let summary = [{cast from a float-point value to a signed integer}];
+  let summary = [{cast from a float-point value to a signed 32-bit integer}];
+  let hasFolder = 1;
+}
+
+def VM_CastF32SI64Op :
+    VM_ConversionOp<F32, I64, "cast.f32.si64", VM_OPC_CastF32SI64,
+                    [VM_ExtF32]> {
+  let summary = [{cast from a float-point value to a signed 64-bit integer}];
   let hasFolder = 1;
 }
 
 def VM_CastF32UI32Op :
     VM_ConversionOp<F32, I32, "cast.f32.ui32", VM_OPC_CastF32UI32,
                     [VM_ExtF32]> {
+  let summary = [{cast from an float-point value to an unsigned 32-bit integer}];
+  let hasFolder = 1;
+}
+
+def VM_CastF32UI64Op :
+    VM_ConversionOp<F32, I64, "cast.f32.ui64", VM_OPC_CastF32UI64,
+                    [VM_ExtF32]> {
+  let summary = [{cast from an float-point value to an unsigned 64-bit integer}];
+  let hasFolder = 1;
+}
+
+def VM_CastF64SI64Op :
+    VM_ConversionOp<F64, I64, "cast.f64.si64", VM_OPC_CastF64SI64,
+                    [VM_ExtF64]> {
+  let summary = [{cast from a float-point value to a signed integer}];
+  let hasFolder = 1;
+}
+
+def VM_CastF64UI64Op :
+    VM_ConversionOp<F64, I64, "cast.f64.ui64", VM_OPC_CastF64UI64,
+                    [VM_ExtF64]> {
   let summary = [{cast from an float-point value to an unsigned integer}];
   let hasFolder = 1;
 }
@@ -4089,7 +4223,7 @@ class VM_CallBaseOp<string mnemonic, list<Trait> traits = []> :
 
     /// Set the callee for this operation.
     void setCalleeFromCallable(CallInterfaceCallable callee) {
-      (*this)->setAttr("callee", callee.get<SymbolRefAttr>());
+      (*this)->setAttr("callee", cast<SymbolRefAttr>(callee));
     }
 
     /// Get the argument operands to the called function as a mutable range, this is
@@ -4197,7 +4331,7 @@ def VM_CallVariadicOp : VM_CallBaseOp<"call.variadic"> {
               segmentSizes));
       $_state.addAttribute("segment_types", $_builder.getArrayAttr(
           llvm::map_to_vector(segmentTypes, [&](Type type) {
-              return TypeAttr::get(type).cast<Attribute>();
+              return cast<Attribute>(TypeAttr::get(type));
           })));
       $_state.addOperands(operands);
       $_state.addTypes(resultTypes);

@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/LLVMCPU/PassDetail.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/LLVMCPU/Passes.h"
 #include "iree/compiler/Codegen/LLVMCPU/Utils.h"
 #include "llvm/Support/CommandLine.h"
@@ -25,14 +25,18 @@
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_LLVMCPUTILEPASS
+#include "iree/compiler/Codegen/LLVMCPU/Passes.h.inc"
+
 namespace {
 
 /// This pass tiles all the TilingInterface operations. The `tilingLevel` must
 /// be specified. It picks the `tilingLevel`-th list as tiling sizes from
 /// lowering_config.
-struct LLVMCPUTilePass : LLVMCPUTileBase<LLVMCPUTilePass> {
-  LLVMCPUTilePass(int64_t tilingLevel = -1) {
-    this->tilingLevel.setValue(tilingLevel);
+struct LLVMCPUTilePass : impl::LLVMCPUTilePassBase<LLVMCPUTilePass> {
+  using impl::LLVMCPUTilePassBase<LLVMCPUTilePass>::LLVMCPUTilePassBase;
+  explicit LLVMCPUTilePass(int64_t tilingLevel) {
+    this->tilingLevel = tilingLevel;
   }
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, affine::AffineDialect,
@@ -53,15 +57,15 @@ void LLVMCPUTilePass::runOnOperation() {
 
   SmallVector<Operation *> computeOps = getComputeOps(funcOp);
   FailureOr<IREE::Codegen::LoweringConfigAttr> rootLoweringConfig =
-      getLoweringConfig(computeOps);
+      getFirstLoweringConfig<IREE::Codegen::LoweringConfigAttr>(computeOps);
   if (failed(rootLoweringConfig)) {
     LLVM_DEBUG(llvm::dbgs() << "can't find lowering_config, skip tiling\n");
     return;
   }
 
   for (auto computeOp : computeOps) {
-    auto op = cast<TilingInterface>(computeOp);
-    if (op.getLoopIteratorTypes().empty())
+    auto op = dyn_cast<TilingInterface>(computeOp);
+    if (!op || op.getLoopIteratorTypes().empty())
       continue;
 
     // For now do not tile `tensor.pad` operations. The `tensor.pad`
@@ -74,7 +78,8 @@ void LLVMCPUTilePass::runOnOperation() {
     LLVM_DEBUG(llvm::dbgs() << "candidate: " << op << "\n");
     SmallVector<int64_t> tileSizes;
     SmallVector<bool> tileScalableFlags;
-    if (auto loweringConfig = getLoweringConfig(op)) {
+    if (auto loweringConfig =
+            getLoweringConfig<IREE::Codegen::LoweringConfigAttr>(op)) {
       tileSizes = loweringConfig.getTileSizeVals(tilingLevel);
       tileScalableFlags = loweringConfig.getScalableTileFlagVals(tilingLevel);
     } else {
@@ -93,10 +98,10 @@ void LLVMCPUTilePass::runOnOperation() {
     setSCFTileSizes(options, op, std::move(tileSizes),
                     std::move(tileScalableFlags));
     FailureOr<scf::SCFTilingResult> tiledResults =
-        scf::tileUsingSCFForOp(rewriter, op, options);
+        scf::tileUsingSCF(rewriter, op, options);
     if (failed(tiledResults))
       continue;
-    rewriter.replaceOp(op, tiledResults->replacements);
+    rewriter.replaceOp(op, tiledResults->mergeResult.replacements);
   }
 
   RewritePatternSet patterns =
@@ -106,14 +111,14 @@ void LLVMCPUTilePass::runOnOperation() {
   memref::populateResolveRankedShapedTypeResultDimsPatterns(patterns);
   context->getLoadedDialect<tensor::TensorDialect>()
       ->getCanonicalizationPatterns(patterns);
-  if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+  if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
     LLVM_DEBUG(llvm::dbgs() << "----- cleanup failed -----\n");
     return signalPassFailure();
   }
 }
 } // namespace
 
-std::unique_ptr<OperationPass<func::FuncOp>>
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 createLLVMCPUTilePass(int64_t tilingLevel) {
   return std::make_unique<LLVMCPUTilePass>(tilingLevel);
 }

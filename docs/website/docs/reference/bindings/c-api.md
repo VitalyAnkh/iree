@@ -4,7 +4,7 @@ icon: octicons/code-16
 
 # C API bindings
 
-## Overview
+## :octicons-book-16: Overview
 
 The IREE compiler and IREE runtime both have their own C/C++ APIs. This page
 introduces the available APIs and describes how to use them from your
@@ -34,7 +34,7 @@ graph TD
     C API's exported symbols.
   }
 
-  subgraph compiler[libIREECompiler.so / IREECompiler.dll]
+  subgraph compiler[libIREECompiler.so]
     pipelines("Pipelines
 
     • Flow
@@ -70,8 +70,8 @@ API definitions can be found in the following locations:
 
 | Source location | Overview |
 | --------------- | -------- |
-[`iree/compiler/embedding_api.h`](https://github.com/openxla/iree/blob/main/compiler/bindings/c/iree/compiler/embedding_api.h) | Top-level IREE compiler embedding API
-[`iree/compiler/PluginAPI/` directory](https://github.com/openxla/iree/tree/main/compiler/src/iree/compiler/PluginAPI) | IREE compiler plugin API
+[`iree/compiler/embedding_api.h`](https://github.com/iree-org/iree/blob/main/compiler/bindings/c/iree/compiler/embedding_api.h) | Top-level IREE compiler embedding API
+[`iree/compiler/PluginAPI/` directory](https://github.com/iree-org/iree/tree/main/compiler/src/iree/compiler/PluginAPI) | IREE compiler plugin API
 [`mlir/include/mlir-c/` directory](https://github.com/llvm/llvm-project/tree/main/mlir/include/mlir-c) | MLIR C API headers
 
 ### Concepts
@@ -95,10 +95,13 @@ stateDiagram-v2
   InputBuffer --> Source2 : wrap buffer
 
   state Session {
+    Invocation1: Invocation1<br>(run pipelines on this)
     Source1 --> Invocation1
+
+    --
+
+    Invocation2: Invocation2<br>(run pipelines on this)
     Source2 --> Invocation2
-    Invocation1 --> Invocation1 : run pipeline
-    Invocation2 --> Invocation2 : run pipeline
   }
 
   Invocation1 --> Output1File   : write file
@@ -140,7 +143,7 @@ An _output_ (`iree_compiler_output_t`) represents a compilation artifact.
 
 A _plugin_ extends the compiler with some combination of target backends,
 options, passes, or pipelines. For documentation on compiler plugins, see
-[`compiler/PluginAPI/README.md`](https://github.com/openxla/iree/blob/main/compiler/src/iree/compiler/PluginAPI/README.md).
+[`compiler/PluginAPI/README.md`](https://github.com/iree-org/iree/blob/main/compiler/src/iree/compiler/PluginAPI/README.md).
 
 ### Usage
 
@@ -199,9 +202,9 @@ int main(int argc, char** argv) {
 | Project | Source | Description |
 | ------- | ------ | ----------- |
 [iree-org/iree-template-compiler-cmake](https://github.com/iree-org/iree-template-compiler-cmake/) |[`hello_compiler.c`](https://github.com/iree-org/iree-template-compiler-cmake/blob/main/hello_compiler/hello_compiler.c) | Compiler application template
-[openxla/iree](https://github.com/openxla/iree/) | [`integrations/pjrt/.../iree_compiler.cc`](https://github.com/openxla/iree/blob/main/integrations/pjrt/src/iree_pjrt/common/iree_compiler.cc) | JIT for TensorFlow + JAX to IREE
-[openxla/iree](https://github.com/openxla/iree/) | [`compiler/plugins`](https://github.com/openxla/iree/tree/main/compiler/plugins) | In-tree supported compiler plugins
-[openxla/iree](https://github.com/openxla/iree/) | [`samples/compiler_plugins/`](https://github.com/openxla/iree/tree/main/samples/compiler_plugins) | In-tree sample compiler plugins
+[iree-org/iree](https://github.com/iree-org/iree/) | [`integrations/pjrt/.../iree_compiler.cc`](https://github.com/iree-org/iree/blob/main/integrations/pjrt/src/iree_pjrt/common/iree_compiler.cc) | JIT for TensorFlow + JAX to IREE
+[iree-org/iree](https://github.com/iree-org/iree/) | [`compiler/plugins`](https://github.com/iree-org/iree/tree/main/compiler/plugins) | In-tree supported compiler plugins
+[iree-org/iree](https://github.com/iree-org/iree/) | [`samples/compiler_plugins/`](https://github.com/iree-org/iree/tree/main/samples/compiler_plugins) | In-tree sample compiler plugins
 [nod-ai/iree-amd-aie](https://github.com/nod-ai/iree-amd-aie/) | [`plugins/.../iree-amd-aie`](https://github.com/nod-ai/iree-amd-aie/tree/main/compiler/plugins/target/AMD-AIE/iree-amd-aie) | Early-phase plugins for interfacing with AMD AIE accelerators
 
 ## Runtime API
@@ -212,6 +215,61 @@ with LTO style optimizations.
 
 The low level library components can be used directly or through a higher level
 API.
+
+!!! caution
+
+    Prefer using the low level API directly when writing custom bindings or
+    integrating into larger projects. The high level API is mainly useful as
+    a reference and when building samples.
+
+=== "Low level API"
+
+    Each runtime component has its own low level API. The low level APIs are
+    typically verbose as they expose the full flexibility of each underlying
+    system.
+
+    ```mermaid
+    graph TD
+      accTitle: IREE runtime low level API diagram
+      accDescr {
+        The IREE runtime includes 'base', 'HAL', and 'VM' components, each with
+        their own types and API methods.
+        Applications can interface directly with the IREE runtime via the low
+        level component APIs.
+      }
+
+      subgraph iree_runtime[IREE Runtime]
+        subgraph base
+          base_types("Types
+          • allocator
+          • status
+          • etc.")
+        end
+
+        subgraph hal[HAL]
+          hal_types("Types
+          • buffer
+          • device
+          • etc.")
+
+          hal_drivers("Drivers
+          • local-*
+          • vulkan
+          • etc.")
+        end
+
+        subgraph vm[VM]
+          vm_types("Types
+          • context
+          • invocation
+          • etc.")
+        end
+      end
+
+      application(Your application)
+
+      base_types & hal_types & hal_drivers & vm_types --> application
+    ```
 
 === "High level API"
 
@@ -233,7 +291,6 @@ API.
       subgraph iree_runtime[IREE Runtime]
         subgraph base
           base_types("Types
-
           • allocator
           • status
           • etc.")
@@ -241,13 +298,11 @@ API.
 
         subgraph hal[HAL]
           hal_types("Types
-
           • buffer
           • device
           • etc.")
 
           hal_drivers("Drivers
-
           • local-*
           • vulkan
           • etc.")
@@ -255,14 +310,12 @@ API.
 
         subgraph vm[VM]
           vm_types("Types
-
           • context
           • invocation
           • etc.")
         end
 
         runtime_api("Runtime API
-
         • instance
         • session
         • call")
@@ -275,65 +328,101 @@ API.
       runtime_api --> application
     ```
 
-=== "Low level API"
-
-    Each runtime component has its own low level API. The low level APIs are
-    typically verbose as they expose the full flexibility of each underlying
-    system.
-
-    ```mermaid
-    graph TD
-      accTitle: IREE runtime low level API diagram
-      accDescr {
-        The IREE runtime includes 'base', 'HAL', and 'VM' components, each with
-        their own types and API methods.
-        Applications can interface directly with the IREE runtime via the low
-        level component APIs.
-      }
-
-      subgraph iree_runtime[IREE Runtime]
-        subgraph base
-          base_types("Types
-
-          • allocator
-          • status
-          • etc.")
-        end
-        subgraph hal[HAL]
-          hal_types("Types
-
-          • buffer
-          • device
-          • etc.")
-
-          hal_drivers("Drivers
-
-          • local-*
-          • vulkan
-          • etc.")
-        end
-        subgraph vm[VM]
-          vm_types("Types
-
-          • context
-          • invocation
-          • etc.")
-        end
-      end
-
-      application(Your application)
-
-      base_types & hal_types & hal_drivers & vm_types --> application
-    ```
-
 Runtime API header files are organized by component:
 
 | Component header file | Overview |
 | --------------------- | -------- |
-[`iree/runtime/api.h`](https://github.com/openxla/iree/blob/main/runtime/src/iree/runtime/api.h) | High level runtime API
-[`iree/base/api.h`](https://github.com/openxla/iree/blob/main/runtime/src/iree/base/api.h) | Core API, type definitions, ownership policies, utilities
-[`iree/vm/api.h`](https://github.com/openxla/iree/blob/main/runtime/src/iree/vm/api.h) | VM APIs: loading modules, I/O, calling functions
-[`iree/hal/api.h`](https://github.com/openxla/iree/blob/main/runtime/src/iree/hal/api.h) | HAL APIs: device management, synchronization, accessing hardware features
+[`iree/base/api.h`](https://github.com/iree-org/iree/blob/main/runtime/src/iree/base/api.h) | Base API: type definitions, cross-platform primitives, utilities
+[`iree/vm/api.h`](https://github.com/iree-org/iree/blob/main/runtime/src/iree/vm/api.h) | VM APIs: loading modules, I/O, calling functions
+[`iree/hal/api.h`](https://github.com/iree-org/iree/blob/main/runtime/src/iree/hal/api.h) | HAL APIs: device management, synchronization, accessing hardware features
+[`iree/runtime/api.h`](https://github.com/iree-org/iree/blob/main/runtime/src/iree/runtime/api.h) | High level runtime API
+
+### Low level concepts
+
+#### Base
+
+The 'base' component includes general runtime utilities such as:
+
+* Memory allocators
+* Status and error handling
+* String manipulation
+* File input and output
+* Event pools and loops
+* Synchronization and threading primitives
+* Tracing and other debugging
+
+As IREE is designed to support a variety of deployment targets, many of these
+utilities are written to be cross-platform or be optional.
+
+#### VM
+
+IREE uses its own Virtual Machine (VM) at runtime to interpret program
+instructions on the host system.
+
+??? tip "Tip - EmitC alternate lowering path"
+    VM instructions may be further lowered to C source code for static or
+    resource constrained deployment.
+
+    See the `--output-format=vm-c` compiler option and the samples in
+    [`samples/emitc_modules/`](https://github.com/iree-org/iree/tree/main/samples/emitc_modules)
+    for more information.
+
+The VM supports generic operations like loads, stores, arithmetic, function
+calls, and control flow. The VM builds streams of more complex program logic and
+dense math into HAL command buffers that are dispatched to hardware backends.
+
+* VM _instances_ can serve multiple isolated execution _contexts_.
+* VM _contexts_ are effectively sandboxes for loading modules and running
+  programs.
+* VM _modules_ provide all functionality to execution _contexts_, including
+  access to hardware accelerators through the HAL. Compiled user programs are
+  also modules.
+
+    ```mermaid
+    stateDiagram-v2
+      accTitle: Sample VM Modules
+      accDescr {
+        Bytecode modules contain program state, program functions, and debug
+        information.
+        HAL modules contain devices, executables, HAL functions, and HAL types.
+        Custom modules may contain external functions and custom types.
+      }
+
+      state "Bytecode module" as bytecode {
+        bytecode_contents: Module state<br>Program funcs<br>Debug info
+      }
+
+      state "HAL module" as HAL {
+        hal_contents: Devices<br>Executables<br>HAL funcs<br>HAL types
+      }
+
+      state "Parameters module" as Params {
+        parameters_contents: Providers
+      }
+
+      state "Custom module" as custom {
+        custom_contents: External funcs<br>Custom types
+      }
+    ```
+
+For more detailed information about the design of the VM, see
+[this design doc](../../developers/design-docs/vm.md).
+
+#### HAL
+
+<!-- TODO(scotttodd): command buffer construction -> dispatch diagram -->
+<!-- TODO(scotttodd): input buffers -> output buffers diagram -->
+<!-- TODO(scotttodd): HAL interface diagram -->
+
+IREE uses a Hardware Abstraction Layer (HAL) to model and interact with
+hardware devices like CPUs, GPUs and other accelerators.
+
+* HAL _drivers_ are used to enumerate and create HAL _devices_.
+* HAL _devices_ interface with hardware, such as by allocating device memory,
+  preparing executables, recording and dispatching command buffers, and
+  synchronizing with the host.
+* HAL _buffers_ represent data storage and _buffer views_ represent views into
+  that storage with associated shapes and types (similar to "tensors").
 
 ### High level concepts
 
@@ -387,84 +476,26 @@ A _call_ (`iree_runtime_call_t`) is a stateful VM function call builder.
 * _Calls_ can be reused to avoid having to construct input lists for each
   invocation.
 
-### Low level concepts
-
-#### Base
-
-!!! todo - "Under construction, more coming soon"
-
-#### VM
-
-IREE uses its own Virtual Machine (VM) at runtime to interpret program
-instructions on the host system.
-
-??? tip "Tip - EmitC alternate lowering path"
-    VM instructions may be further lowered to C source code for static or
-    resource constrained deployment.
-
-    See the `--output-format=vm-c` compiler option and the samples in
-    [`samples/emitc_modules/`](https://github.com/openxla/iree/tree/main/samples/emitc_modules)
-    for more information.
-
-The VM supports generic operations like loads, stores, arithmetic, function
-calls, and control flow. The VM builds streams of more complex program logic and
-dense math into HAL command buffers that are dispatched to hardware backends.
-
-* VM _instances_ can serve multiple isolated execution _contexts_.
-* VM _contexts_ are effectively sandboxes for loading modules and running
-  programs.
-* VM _modules_ provide all functionality to execution _contexts_, including
-  access to hardware accelerators through the HAL. Compiled user programs are
-  also modules.
-
-    ```mermaid
-    stateDiagram-v2
-      accTitle: Sample VM Modules
-      accDescr {
-        Bytecode modules contain program state, program functions, and debug
-        information.
-        HAL modules contain devices, executables, HAL functions, and HAL types.
-        Custom modules may contain external functions and custom types.
-      }
-
-      state "Bytecode module" as bytecode {
-        bytecode_contents: Module state<br>Program functions<br>Debug information
-      }
-
-      state "HAL module" as HAL {
-        hal_contents: Devices<br>Executables<br>HAL functions<br>HAL types
-      }
-
-      state "Custom module" as custom {
-        custom_contents: External functions<br>Custom types
-      }
-    ```
-
-#### HAL
-
-<!-- TODO(scotttodd): command buffer construction -> dispatch diagram -->
-<!-- TODO(scotttodd): input buffers -> output buffers diagram -->
-<!-- TODO(scotttodd): HAL interface diagram -->
-
-IREE uses a Hardware Abstraction Layer (HAL) to model and interact with
-hardware devices like CPUs, GPUs and other accelerators.
-
-* HAL _drivers_ are used to enumerate and create HAL _devices_.
-* HAL _devices_ interface with hardware, such as by allocating device memory,
-  preparing executables, recording and dispatching command buffers, and
-  synchronizing with the host.
-* HAL _buffers_ represent data storage and _buffer views_ represent views into
-  that storage with associated shapes and types (similar to "tensors").
-
 ### Usage
 
-!!! info ""
+#### Samples
 
-    For other examples, see the [samples below](#samples_1).
+| Project | Source | Description |
+| ------- |------- | ----------- |
+[iree-org/iree-template-runtime-cmake](https://github.com/iree-org/iree-template-runtime-cmake/) | [`hello_world.c`](https://github.com/iree-org/iree-template-runtime-cmake/blob/main/hello_world.c) | Runtime application template
+[iree-org/iree](https://github.com/iree-org/iree/) | [`runtime/demo/`](https://github.com/iree-org/iree/blob/main/runtime/src/iree/runtime/demo/) | In-tree demos of the high level runtime API
+[iree-org/iree](https://github.com/iree-org/iree/) | [`samples/`](https://github.com/iree-org/iree/tree/main/samples) | In-tree sample applications
+[iree-org/iree-experimental](https://github.com/iree-org/iree-experimental/) | [`runtime-library/`](https://github.com/iree-org/iree-experimental/tree/main/runtime-library) | Shared runtime library builder<br>Builds `libireert.so` to aid development
+[iml130/iree-template-cpp](https://github.com/iml130/iree-template-cpp) | [`simple_embedding.c`](https://github.com/iml130/iree-template-cpp/blob/main/iree_simple_embedding/simple_embedding.c) | Demo integration into a project
+
+#### High level "hello world"
+
+Below are two samples showing how to use the high level runtime API - one
+"terse" sample and one "explained" sample with more detailed comments:
 
 === "hello_world_terse.c"
 
-    Source file: [`runtime/src/iree/runtime/demo/hello_world_terse.c`](https://github.com/openxla/iree/tree/main/runtime/src/iree/runtime/demo/hello_world_terse.c)
+    Source file: [`runtime/src/iree/runtime/demo/hello_world_terse.c`](https://github.com/iree-org/iree/tree/main/runtime/src/iree/runtime/demo/hello_world_terse.c)
 
     ```c++ title="runtime/src/iree/runtime/demo/hello_world_terse.c" linenums="1"
     --8<-- "runtime/src/iree/runtime/demo/hello_world_terse.c:7"
@@ -472,21 +503,11 @@ hardware devices like CPUs, GPUs and other accelerators.
 
 === "hello_world_explained.c"
 
-    Source file: [`runtime/src/iree/runtime/demo/hello_world_explained.c`](https://github.com/openxla/iree/tree/main/runtime/src/iree/runtime/demo/hello_world_explained.c)
+    Source file: [`runtime/src/iree/runtime/demo/hello_world_explained.c`](https://github.com/iree-org/iree/tree/main/runtime/src/iree/runtime/demo/hello_world_explained.c)
 
     ```c++ title="runtime/src/iree/runtime/demo/hello_world_explained.c" linenums="1"
     --8<-- "runtime/src/iree/runtime/demo/hello_world_explained.c:7"
     ```
-
-#### Samples
-
-| Project | Source | Description |
-| ------- |------- | ----------- |
-[iree-org/iree-template-runtime-cmake](https://github.com/iree-org/iree-template-runtime-cmake/) | [`hello_world.c`](https://github.com/iree-org/iree-template-runtime-cmake/blob/main/hello_world.c) | Runtime application template
-[openxla/iree](https://github.com/openxla/iree/) | [`runtime/demo/`](https://github.com/openxla/iree/blob/main/runtime/src/iree/runtime/demo/) | In-tree demos of the high level runtime API
-[openxla/iree](https://github.com/openxla/iree/) | [`samples/`](https://github.com/openxla/iree/tree/main/samples) | In-tree sample applications
-[iree-org/iree-samples](https://github.com/iree-org/iree-samples/) | [`runtime-library/`](https://github.com/iree-org/iree-samples/tree/main/runtime-library) | Shared runtime library builder<br>Builds `libireert.so` to aid development
-[iml130/iree-template-cpp](https://github.com/iml130/iree-template-cpp) | [`simple_embedding.c`](https://github.com/iml130/iree-template-cpp/blob/main/iree_simple_embedding/simple_embedding.c) | Demo integration into a project
 
 ## Compiler + Runtime = JIT
 

@@ -4,10 +4,12 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/SPIRV/PassDetail.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/SPIRV/Passes.h"
 #include "iree/compiler/Codegen/SPIRV/Utils.h"
+#include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
+#include "llvm/ADT/StringExtras.h"
 #include "mlir/Conversion/MemRefToSPIRV/MemRefToSPIRV.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
@@ -20,8 +22,12 @@
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_SPIRVMAPMEMREFSTORAGECLASSPASS
+#include "iree/compiler/Codegen/SPIRV/Passes.h.inc"
+
 namespace {
 
+template <bool UseIndirectBindings>
 std::optional<spirv::StorageClass>
 mapHALDescriptorTypeForVulkan(Attribute attr) {
   if (auto dtAttr =
@@ -30,7 +36,8 @@ mapHALDescriptorTypeForVulkan(Attribute attr) {
     case IREE::HAL::DescriptorType::UniformBuffer:
       return spirv::StorageClass::Uniform;
     case IREE::HAL::DescriptorType::StorageBuffer:
-      return spirv::StorageClass::StorageBuffer;
+      return UseIndirectBindings ? spirv::StorageClass::PhysicalStorageBuffer
+                                 : spirv::StorageClass::StorageBuffer;
     default:
       return std::nullopt;
     }
@@ -68,8 +75,24 @@ mapHALDescriptorTypeForOpenCL(Attribute attr) {
   return spirv::mapMemorySpaceToOpenCLStorageClass(attr);
 }
 
+bool allowsShaderCapability(ArrayRef<StringRef> features) {
+  for (StringRef feature : features) {
+    if (feature.consume_front("cap:") && feature == "Shader")
+      return true;
+  }
+  return false;
+}
+
+bool allowsKernelCapability(ArrayRef<StringRef> features) {
+  for (StringRef feature : features) {
+    if (feature.consume_front("cap:") && feature == "Kernel")
+      return true;
+  }
+  return false;
+}
+
 struct SPIRVMapMemRefStorageClassPass final
-    : public SPIRVMapMemRefStorageClassBase<SPIRVMapMemRefStorageClassPass> {
+    : impl::SPIRVMapMemRefStorageClassPassBase<SPIRVMapMemRefStorageClassPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<spirv::SPIRVDialect>();
   }
@@ -78,13 +101,18 @@ struct SPIRVMapMemRefStorageClassPass final
     MLIRContext *context = &getContext();
     Operation *op = getOperation();
 
+    bool useIndirectBindings = usesIndirectBindingsAttr(op);
+
     spirv::MemorySpaceToStorageClassMap memorySpaceMap;
 
-    if (spirv::TargetEnvAttr attr = getSPIRVTargetEnvAttr(op)) {
-      spirv::TargetEnv targetEnv(attr);
-      if (targetEnv.allows(spirv::Capability::Shader)) {
-        memorySpaceMap = mapHALDescriptorTypeForVulkan;
-      } else if (targetEnv.allows(spirv::Capability::Kernel)) {
+    if (IREE::GPU::TargetAttr target = getGPUTargetAttr(op)) {
+      SmallVector<StringRef> features;
+      llvm::SplitString(target.getFeatures(), features, ",");
+      if (allowsShaderCapability(features)) {
+        memorySpaceMap = useIndirectBindings
+                             ? &mapHALDescriptorTypeForVulkan<true>
+                             : &mapHALDescriptorTypeForVulkan<false>;
+      } else if (allowsKernelCapability(features)) {
         memorySpaceMap = mapHALDescriptorTypeForOpenCL;
       }
     }
@@ -93,22 +121,23 @@ struct SPIRVMapMemRefStorageClassPass final
       return signalPassFailure();
     }
 
-    auto target = spirv::getMemorySpaceToStorageClassTarget(*context);
     spirv::MemorySpaceToStorageClassConverter converter(memorySpaceMap);
+    // Perform the replacement.
+    spirv::convertMemRefTypesAndAttrs(op, converter);
 
-    RewritePatternSet patterns(context);
-    spirv::populateMemorySpaceToStorageClassPatterns(converter, patterns);
-
-    if (failed(applyFullConversion(op, *target, std::move(patterns))))
-      return signalPassFailure();
+    // Check if there are any illegal ops remaining.
+    std::unique_ptr<ConversionTarget> target =
+        spirv::getMemorySpaceToStorageClassTarget(*context);
+    op->walk([&target, this](Operation *childOp) {
+      if (target->isIllegal(childOp)) {
+        childOp->emitOpError("failed to legalize memory space");
+        signalPassFailure();
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
   }
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createSPIRVMapMemRefStorageClassPass() {
-  return std::make_unique<SPIRVMapMemRefStorageClassPass>();
-}
-
 } // namespace mlir::iree_compiler

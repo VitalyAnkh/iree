@@ -1,4 +1,4 @@
-if(NOT IREE_INPUT_STABLEHLO)
+if(NOT IREE_INPUT_STABLEHLO AND NOT IREE_HOST_BIN_DIR)
   return()
 endif()
 
@@ -31,10 +31,7 @@ iree_lit_test_suite(
     iree-run-mlir
   LABELS
     "driver=local-task"
-    "driver=metal"
-    "driver=vulkan"
     "hostonly"
-    "optonly"
 )
 
 ### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###
@@ -45,7 +42,7 @@ iree_static_linker_test(
   SRC
     "mnist_fake_weights.mlir"
   STATIC_LIB_PREFIX
-    mnist_fake_weights_linked_llvm_cpu
+    mnist_fake_weights_linked
   ENTRY_FUNCTION
     "predict"
   FUNCTION_INPUTS
@@ -60,7 +57,7 @@ iree_static_linker_test(
   SRC
     "mnist_fake_weights.mlir"
   STATIC_LIB_PREFIX
-    mnist_fake_weights_linked_llvm_cpu
+    mnist_fake_weights_linked
   ENTRY_FUNCTION
     "predict"
   FUNCTION_INPUTS
@@ -99,5 +96,3 @@ iree_static_linker_test(
     "--iree-vm-target-index-bits=32"
   EMITC
 )
-
-include(generated_e2e_model_tests.cmake)

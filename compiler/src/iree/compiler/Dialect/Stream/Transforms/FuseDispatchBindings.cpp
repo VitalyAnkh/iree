@@ -8,24 +8,27 @@
 #include <utility>
 
 #include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
-#include "iree/compiler/Dialect/Stream/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Stream/Transforms/Passes.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
 #define DEBUG_TYPE "iree-stream-fuse-dispatch-bindings"
 
 namespace mlir::iree_compiler::IREE::Stream {
+
+#define GEN_PASS_DEF_FUSEDISPATCHBINDINGSPASS
+#include "iree/compiler/Dialect/Stream/Transforms/Passes.h.inc"
+
 namespace {
 
 //===----------------------------------------------------------------------===//
@@ -170,7 +173,7 @@ findCorrelatedBindings(unsigned bindingCount,
 // Updates an executable function to use the new bindings.
 static void updateExecutableSignature(IREE::Stream::ExecutableOp executableOp,
                                       IREE::Stream::ExecutableExportOp exportOp,
-                                      mlir::func::FuncOp funcOp,
+                                      mlir::FunctionOpInterface funcOp,
                                       ArrayRef<Binding> bindings) {
   auto &entryBlock = funcOp.front();
 
@@ -406,18 +409,12 @@ fuseDispatchBindings(IREE::Stream::ExecutableOp executableOp,
 }
 
 //===----------------------------------------------------------------------===//
-// -iree-stream-fuse-dispatch-bindings
+// --iree-stream-fuse-dispatch-bindings
 //===----------------------------------------------------------------------===//
 
-class FuseDispatchBindingsPass
-    : public FuseDispatchBindingsBase<FuseDispatchBindingsPass> {
-public:
-  FuseDispatchBindingsPass() = default;
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<IREE::Stream::StreamDialect>();
-  }
-
+struct FuseDispatchBindingsPass
+    : public IREE::Stream::impl::FuseDispatchBindingsPassBase<
+          FuseDispatchBindingsPass> {
   // TODO(benvanik): preserve the information we are eliding by inserting
   // appropriate memory ops. On devices that require prefetching and other
   // nasty things we want to pass along as fine-grained of information as
@@ -459,10 +456,5 @@ public:
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createFuseDispatchBindingsPass() {
-  return std::make_unique<FuseDispatchBindingsPass>();
-}
 
 } // namespace mlir::iree_compiler::IREE::Stream

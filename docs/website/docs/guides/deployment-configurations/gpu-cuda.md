@@ -26,42 +26,14 @@ If `nvidia-smi` does not exist, you will need to
 
 ### Get the IREE compiler
 
-#### :octicons-package-16: Download the compiler from a release
+#### :octicons-download-16: Download the compiler from a release
 
-Python packages are regularly published to
-[PyPI](https://pypi.org/user/google-iree-pypi-deploy/). See the
+Python packages are distributed through multiple channels. See the
 [Python Bindings](../../reference/bindings/python.md) page for more details.
-The core `iree-compiler` package includes the CUDA compiler:
+The core [`iree-base-compiler`](https://pypi.org/project/iree-base-compiler/)
+package includes the CUDA compiler:
 
-=== "Stable releases"
-
-    Stable release packages are
-    [published to PyPI](https://pypi.org/user/google-iree-pypi-deploy/).
-
-    ``` shell
-    python -m pip install iree-compiler
-    ```
-
-=== ":material-alert: Nightly releases"
-
-    Nightly releases are published on
-    [GitHub releases](https://github.com/openxla/iree/releases).
-
-    ``` shell
-    python -m pip install \
-      --find-links https://iree.dev/pip-release-links.html \
-      --upgrade iree-compiler
-    ```
-
-!!! tip
-    `iree-compile` is installed to your python module installation path. If you
-    pip install with the user mode, it is under `${HOME}/.local/bin`, or
-    `%APPDATA%Python` on Windows. You may want to include the path in your
-    system's `PATH` environment variable:
-
-    ```shell
-    export PATH=${HOME}/.local/bin:${PATH}
-    ```
+--8<-- "docs/website/docs/guides/deployment-configurations/snippets/_iree-compiler-from-release.md"
 
 #### :material-hammer-wrench: Build the compiler from source
 
@@ -77,6 +49,29 @@ the IREE compiler, then enable the CUDA compiler target with the
 ### Get the IREE runtime
 
 Next you will need to get an IREE runtime that includes the CUDA HAL driver.
+
+You can check for CUDA support by looking for a matching driver and device:
+
+```console hl_lines="3"
+--8<-- "docs/website/docs/guides/deployment-configurations/snippets/_iree-run-module-driver-list.md"
+```
+
+```console hl_lines="3"
+$ iree-run-module --list_devices
+
+  cuda://GPU-00000000-1111-2222-3333-444444444444
+  local-sync://
+  local-task://
+```
+
+#### :octicons-download-16: Download the runtime from a release
+
+Python packages are distributed through multiple channels. See the
+[Python Bindings](../../reference/bindings/python.md) page for more details.
+The core [`iree-base-runtime`](https://pypi.org/project/iree-base-runtime/)
+package includes the CUDA HAL driver:
+
+--8<-- "docs/website/docs/guides/deployment-configurations/snippets/_iree-runtime-from-release.md"
 
 #### :material-hammer-wrench: Build the runtime from source
 
@@ -107,23 +102,35 @@ following commands to compile:
 ```shell hl_lines="2-3"
 iree-compile \
     --iree-hal-target-backends=cuda \
-    --iree-hal-cuda-llvm-target-arch=<...> \
+    --iree-cuda-target=<...> \
     mobilenet_iree_input.mlir -o mobilenet_cuda.vmfb
 ```
 
-Note that a cuda target architecture (`iree-hal-cuda-llvm-target-arch`) of
-the form `sm_<arch_number>` is needed to compile towards each GPU
-architecture. If no architecture is specified then we will default to
-`sm_35`.
+Canonically a CUDA target (`iree-cuda-target`) matching the LLVM NVPTX backend
+of the form `sm_<arch_number>` is needed to compile towards each GPU
+architecture. If no architecture is specified then we will default to `sm_60`.
 
 Here is a table of commonly used architectures:
 
-| CUDA GPU    | Target Architecture |
-| ----------- | ------------------- |
-| Nvidia K80  | `sm_35`             |
-| Nvidia P100 | `sm_60`             |
-| Nvidia V100 | `sm_70`             |
-| Nvidia A100 | `sm_80`             |
+| CUDA GPU            | Target Architecture | Architecture Code Name
+| ------------------- | ------------------- | ----------------------
+| NVIDIA P100         | `sm_60`             | `pascal`
+| NVIDIA V100         | `sm_70`             | `volta`
+| NVIDIA A100         | `sm_80`             | `ampere`
+| NVIDIA H100         | `sm_90`             | `hopper`
+| NVIDIA RTX20 series | `sm_75`             | `turing`
+| NVIDIA RTX30 series | `sm_86`             | `ampere`
+| NVIDIA RTX40 series | `sm_89`             | `ada`
+
+In addition to the canonical `sm_<arch_number>` scheme, `iree-cuda-target` also
+supports two additonal schemes to make a better developer experience:
+
+* Architecture code names like `volta` or `ampere`
+* GPU product names like `a100` or `rtx3090`
+
+These two schemes are translated into the canonical form under the hood.
+We add support for common code/product names without aiming to be exhaustive.
+If the ones you want are missing, please use the canonical form.
 
 ### :octicons-terminal-16: Run a compiled program
 

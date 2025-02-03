@@ -8,7 +8,6 @@
 
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "llvm/ADT/STLExtras.h"
-#include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 
@@ -46,43 +45,71 @@ bool hasZve64xFeature(IREE::HAL::ExecutableTargetAttr targetAttr) {
   return hasFeature(targetAttr, "+zve64x");
 }
 
+bool hasAnyVFeature(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  return hasVFeature(targetAttr) || hasZve32xFeature(targetAttr) ||
+         hasZve32fFeature(targetAttr) || hasZve64xFeature(targetAttr) ||
+         hasFeature(targetAttr, "+zve64f") || hasFeature(targetAttr, "+zve64d");
+}
+
 bool hasAnySVEFeature(IREE::HAL::ExecutableTargetAttr targetAttr) {
-  return hasFeature(targetAttr, "+sve") || hasFeature(targetAttr, "+sve2");
+  return hasFeature(targetAttr, "+sve") || hasFeature(targetAttr, "+sve2") ||
+         hasFeature(targetAttr, "+v9a");
 }
 
 bool hasSMEFeature(IREE::HAL::ExecutableTargetAttr targetAttr) {
   return hasFeature(targetAttr, "+sme");
 }
 
-void setSCFTileSizes(scf::SCFTilingOptions &options, TilingInterface consumerOp,
-                     SmallVector<int64_t> tileSizes,
-                     SmallVector<bool> tileScalableFlags) {
-  // scf::tileUsingSCFForOp expects the num of tile sizes = num of loops.
-  int numLoops = consumerOp.getLoopIteratorTypes().size();
-  tileSizes.resize(numLoops, /*default=*/0);
-  tileScalableFlags.resize(numLoops, /*default=*/false);
-  if (!llvm::is_contained(tileScalableFlags, true)) {
-    // Non-scalable case: All constant tile sizes.
-    options.setTileSizes(
-        getAsIndexOpFoldResult(consumerOp.getContext(), tileSizes));
-  } else {
-    // Scalable case: Multiply scalable tile sizes by a vector.vscale op.
-    options.setTileSizeComputationFunction(
-        [=](OpBuilder &b, Operation *op) -> SmallVector<OpFoldResult> {
-          auto loc = op->getLoc();
-          return llvm::map_to_vector(
-              llvm::zip(tileSizes, tileScalableFlags),
-              [&](auto pair) -> OpFoldResult {
-                auto [t, isScalable] = pair;
-                Value size = b.create<arith::ConstantIndexOp>(loc, t);
-                if (isScalable) {
-                  Value vscale = b.create<vector::VectorScaleOp>(loc);
-                  size = b.create<arith::MulIOp>(loc, size, vscale);
-                }
-                return size;
-              });
-        });
+bool hasI8mmFeature(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  return hasFeature(targetAttr, "+i8mm");
+}
+
+bool isLinalgGeneric2DTranspose(linalg::GenericOp genericOp) {
+  // Check op has 2 dimensions.
+  if (genericOp.getNumLoops() != 2)
+    return false;
+
+  // Check op has single input and output.
+  if (genericOp.getNumDpsInputs() != 1 || genericOp.getNumDpsInits() != 1)
+    return false;
+
+  // Check all iterators are parallel.
+  if (genericOp.getNumParallelLoops() != genericOp.getNumLoops())
+    return false;
+
+  // Check that the two indexing maps are a permutation of each other.
+  SmallVector<AffineMap> indexingMaps = genericOp.getIndexingMapsArray();
+  bool isTranspose =
+      (indexingMaps[0].isPermutation() && indexingMaps[1].isIdentity()) ||
+      (indexingMaps[1].isPermutation() && indexingMaps[0].isIdentity());
+  if (!isTranspose)
+    return false;
+
+  // Make sure the region only contains a yield op.
+  Block &body = genericOp.getRegion().front();
+  if (!llvm::hasSingleElement(body))
+    return false;
+
+  auto yieldOp = cast<linalg::YieldOp>(body.getTerminator());
+
+  // The yield op should return the block argument corresponding to the input.
+  auto yieldArg = dyn_cast<BlockArgument>(yieldOp.getValues()[0]);
+  if (!yieldArg || yieldArg.getArgNumber() != 0 || yieldArg.getOwner() != &body)
+    return false;
+
+  return true;
+}
+
+bool mayHaveUndefinedBehaviorInMasking(Operation *op) {
+  // Those operations will be lowered to division or related instructions,
+  // and they might result in divide-by-zero.
+  if (isa<mlir::arith::RemSIOp, mlir::arith::RemUIOp, mlir::arith::DivSIOp,
+          mlir::arith::DivUIOp, mlir::arith::CeilDivSIOp,
+          mlir::arith::CeilDivUIOp, mlir::arith::FloorDivSIOp,
+          mlir::arith::DivFOp, mlir::arith::RemFOp>(op)) {
+    return true;
   }
+  return false;
 }
 
 } // namespace mlir::iree_compiler

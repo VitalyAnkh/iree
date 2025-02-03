@@ -37,7 +37,7 @@ set(IREE_EXTERNAL_HAL_DRIVERS_USED)
 get_property(IREE_EXTERNAL_HAL_DRIVERS_AVAILABLE GLOBAL PROPERTY IREE_EXTERNAL_HAL_DRIVERS_AVAILABLE)
 foreach(_DRIVER_NAME ${IREE_EXTERNAL_HAL_DRIVERS})
   if(NOT _DRIVER_NAME IN_LIST IREE_EXTERNAL_HAL_DRIVERS_AVAILABLE)
-    message(SEND_ERROR 
+    message(SEND_ERROR
       "Driver passed to -DIREE_EXTERNAL_HAL_DRIVERS=${_DRIVER_NAME} is not found. Available: "
       "${IREE_EXTERNAL_HAL_DRIVERS_AVAILABLE}")
   endif()
@@ -101,7 +101,7 @@ if(IREE_EXTERNAL_HAL_DRIVERS_USED)
     list(APPEND _INIT_EXTERNAL_DEPS ${_DRIVER_TARGET})
 
     if(NOT _DRIVER_TARGET OR NOT _DRIVER_REGISTER)
-      message(SEND_ERROR 
+      message(SEND_ERROR
         "Bad configuration for external HAL driver ${_DRIVER_VAR}: "
         "Missing ${_DRIVER_VAR}_TARGET or ${_DRIVER_VAR}_REGISTER vars. "
         "This usually indicates that the project was not included in the "
@@ -128,6 +128,10 @@ if(IREE_HAL_DRIVER_CUDA)
   add_subdirectory(cuda)
   list(APPEND _INIT_INTERNAL_DEPS iree::hal::drivers::cuda::registration)
 endif()
+if(IREE_HAL_DRIVER_HIP)
+  add_subdirectory(hip)
+  list(APPEND _INIT_INTERNAL_DEPS iree::hal::drivers::hip::registration)
+endif()
 if(IREE_HAL_DRIVER_LOCAL_SYNC)
   add_subdirectory(local_sync)
   list(APPEND _INIT_INTERNAL_DEPS iree::hal::drivers::local_sync::registration)
@@ -136,13 +140,17 @@ if(IREE_HAL_DRIVER_LOCAL_TASK)
   add_subdirectory(local_task)
   list(APPEND _INIT_INTERNAL_DEPS iree::hal::drivers::local_task::registration)
 endif()
-if(IREE_HAL_DRIVER_VULKAN)
-  add_subdirectory(vulkan)
-  list(APPEND _INIT_INTERNAL_DEPS iree::hal::drivers::vulkan::registration)
-endif()
 if(IREE_HAL_DRIVER_METAL)
   add_subdirectory(metal)
   list(APPEND _INIT_INTERNAL_DEPS iree::hal::drivers::metal::registration)
+endif()
+if(IREE_HAL_DRIVER_NULL)
+  add_subdirectory(null)
+  list(APPEND _INIT_INTERNAL_DEPS iree::hal::drivers::null::registration)
+endif()
+if(IREE_HAL_DRIVER_VULKAN)
+  add_subdirectory(vulkan)
+  list(APPEND _INIT_INTERNAL_DEPS iree::hal::drivers::vulkan::registration)
 endif()
 
 iree_cc_library(

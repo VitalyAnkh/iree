@@ -80,6 +80,39 @@ static llvm::cl::opt<IREE::Stream::MemoryModel> clResourceMemoryModel(
     llvm::cl::init(IREE::Stream::MemoryModel::Unified));
 
 //===----------------------------------------------------------------------===//
+// Utilities
+//===----------------------------------------------------------------------===//
+
+void AsyncAccessRange::print(llvm::raw_ostream &os, AsmState &asmState) {
+  os << stringifyResourceAccessBitfield(access) << " ";
+  resource.printAsOperand(os, asmState);
+  os << "[";
+  start.printAsOperand(os, asmState);
+  os << " to ";
+  end.printAsOperand(os, asmState);
+  os << " for ";
+  length.printAsOperand(os, asmState);
+  os << "]";
+}
+
+// static
+bool AsyncAccessRange::mayOverlap(const AsyncAccessRange &lhs,
+                                  const AsyncAccessRange &rhs) {
+  // Different resources do not overlap for this purpose. They may still alias
+  // at various points but that's beyond the analysis we can do here.
+  if (lhs.resource != rhs.resource)
+    return false;
+
+  // Check for adjacent but not overlapping.
+  if (lhs.end == rhs.start || lhs.start == rhs.end) {
+    return false;
+  }
+
+  // _May_ overlap. More analysis required.
+  return true;
+}
+
+//===----------------------------------------------------------------------===//
 // custom<ParameterReference>($scope, $key)
 //===----------------------------------------------------------------------===//
 
@@ -241,7 +274,7 @@ ResourceConfigAttr ResourceConfigAttr::lookup(Operation *op) {
       return attr;
     // See if the affinity specified provides a resource configuration.
     if (auto affinityOp = llvm::dyn_cast<AffinityOpInterface>(op)) {
-      auto affinityAttr = affinityOp.getAffinity();
+      auto affinityAttr = affinityOp.getAffinityAttr();
       if (affinityAttr) {
         auto attr = affinityAttr.getResourceConfigAttr();
         if (attr)
@@ -264,7 +297,7 @@ int64_t NamedParameterAttr::getStorageSize() const {
       return lengthAttr.getInt();
     }
   }
-  if (auto shapedType = getType().dyn_cast<ShapedType>()) {
+  if (auto shapedType = llvm::dyn_cast<ShapedType>(getType())) {
     return IREE::Util::getRoundedPhysicalStorageSize(shapedType);
   } else {
     return IREE::Util::getTypePhysicalStorageBitWidth(getType());
@@ -302,20 +335,40 @@ void TimepointAttr::print(AsmPrinter &p) const {
 // #stream.affinity
 //===----------------------------------------------------------------------===//
 
-AffinityAttr AffinityAttr::lookup(Operation *op) {
-  auto attrId = StringAttr::get(op->getContext(), "stream.affinity");
-  while (op) {
-    if (auto affinityOp = llvm::dyn_cast<AffinityOpInterface>(op)) {
-      auto affinity = affinityOp.getAffinity();
-      if (affinity)
+// static
+AffinityAttr AffinityAttr::lookup(Operation *fromOp) {
+  auto attrId = StringAttr::get(fromOp->getContext(), "stream.affinity");
+  while (fromOp) {
+    if (auto affinityOp = llvm::dyn_cast<AffinityOpInterface>(fromOp)) {
+      if (auto affinity = affinityOp.getAffinityAttr()) {
         return affinity;
+      }
     }
-    auto attr = op->getAttrOfType<AffinityAttr>(attrId);
-    if (attr)
+    if (auto attr = fromOp->getAttrOfType<AffinityAttr>(attrId)) {
       return attr;
-    op = op->getParentOp();
+    }
+    fromOp = fromOp->getParentOp();
   }
-  return {}; // No affinity found; let caller decide what to do.
+  // No affinity found; let caller decide what to do.
+  return {};
+}
+
+// static
+AffinityAttr AffinityAttr::lookupOrDefault(Operation *fromOp) {
+  if (auto affinityAttr = AffinityAttr::lookup(fromOp)) {
+    return affinityAttr; // found a specified affinity
+  }
+  auto attrId =
+      StringAttr::get(fromOp->getContext(), "stream.affinity.default");
+  while (fromOp) {
+    if (auto affinityAttr =
+            fromOp->getAttrOfType<IREE::Stream::AffinityAttr>(attrId)) {
+      return affinityAttr;
+    }
+    fromOp = fromOp->getParentOp();
+  }
+  // No affinity or default found; let caller decide what to do.
+  return {};
 }
 
 // static

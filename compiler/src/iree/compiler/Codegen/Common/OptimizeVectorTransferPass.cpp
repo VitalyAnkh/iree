@@ -4,7 +4,6 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
@@ -24,6 +23,9 @@
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_OPTIMIZEVECTORTRANSFERPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 namespace {
 
@@ -51,7 +53,7 @@ public:
   }
 };
 
-static void loopInvariantCodeMotion(func::FuncOp funcOp) {
+static void loopInvariantCodeMotion(mlir::FunctionOpInterface funcOp) {
   // Walk through all loops in a function in innermost-loop-first order. This
   // way, we first LICM from the inner loop, and place the ops in
   // the outer loop, which in turn can be further LICM'ed.
@@ -59,12 +61,13 @@ static void loopInvariantCodeMotion(func::FuncOp funcOp) {
       [&](LoopLikeOpInterface loopLike) { moveLoopInvariantCode(loopLike); });
 }
 
-struct OptimizeVectorTransferPass
-    : public OptimizeVectorTransferBase<OptimizeVectorTransferPass> {
-  OptimizeVectorTransferPass(bool flatten, bool dropUnitDims)
-      : flatten(flatten), dropUnitDims(dropUnitDims) {}
+struct OptimizeVectorTransferPass final
+    : impl::OptimizeVectorTransferPassBase<OptimizeVectorTransferPass> {
+  using impl::OptimizeVectorTransferPassBase<
+      OptimizeVectorTransferPass>::OptimizeVectorTransferPassBase;
+
   void runOnOperation() override {
-    func::FuncOp funcOp = getOperation();
+    auto funcOp = getOperation();
     LDBG("before optimize vector transfer\n" << funcOp);
     // Generate vector.shape_cast for dropping leading one dimensions in vector
     // ops. This increases the chance that we can forward more transfer writes
@@ -77,18 +80,20 @@ struct OptimizeVectorTransferPass
       mlir::vector::
           populateVectorTransferCollapseInnerMostContiguousDimsPatterns(
               patterns);
-      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
 
     LDBG("after dropping leading unit dims\n" << funcOp);
 
-    // Workaround, run loop invariant code motion before hoist redudant vector
-    // transfer to workaround a bug upstream.
-    // TODO(thomasraoux): Remove it once the fix is merged.
-    loopInvariantCodeMotion(funcOp);
-    linalg::hoistRedundantVectorTransfers(funcOp);
+    if (redundantHoisting) {
+      // Workaround, run loop invariant code motion before hoist redundant
+      // vector transfer to workaround a bug upstream.
+      loopInvariantCodeMotion(funcOp);
+      linalg::hoistRedundantVectorTransfers(cast<func::FuncOp>(funcOp),
+                                            /*verifyNonZeroTrip=*/true);
+    }
     IRRewriter rewriter(funcOp->getContext());
     vector::transferOpflowOpt(rewriter, funcOp);
 
@@ -99,31 +104,18 @@ struct OptimizeVectorTransferPass
     {
       RewritePatternSet patterns(&getContext());
       vector::populateBubbleVectorBitCastOpPatterns(patterns);
-      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
 
     LDBG("after bubbling vector bitcasts\n" << funcOp);
 
-    // TODO(#14191): SPIR-V can't handle the vector.shape_cast created for
-    // dropping unit dims so this option is disabled in SPIR-V pipeline.
-    // This option should go away after all backend issues have been resolved.
-    if (dropUnitDims) {
-      RewritePatternSet patterns(&getContext());
-      mlir::vector::populateVectorTransferDropUnitDimsPatterns(patterns);
-      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
-        return signalPassFailure();
-      }
-
-      LDBG("after dropping vector transfer unit dims\n" << funcOp);
-    }
-
     // Second stage of patterns to flatten transfer ops.
     if (flatten) {
       RewritePatternSet patterns(&getContext());
       mlir::vector::populateFlattenVectorTransferPatterns(patterns);
-      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
@@ -133,28 +125,7 @@ struct OptimizeVectorTransferPass
     memref::eraseDeadAllocAndStores(rewriter, funcOp);
     LDBG("after erasing unused allocs and stores\n" << funcOp);
   }
-
-  LogicalResult initializeOptions(StringRef options) override {
-    if (failed(Pass::initializeOptions(options))) {
-      return failure();
-    }
-    // `flatten` may have been set to `true` in the constructor already.
-    // The |= is so we preserve that rather than overwrite it with the default
-    // value `false` of `optionFlatten`.
-    flatten |= optionFlatten;
-    return success();
-  }
-
-private:
-  bool flatten;
-  bool dropUnitDims;
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createOptimizeVectorTransferPass(bool flatten, bool dropUnitDims) {
-  return std::make_unique<OptimizeVectorTransferPass>(flatten, dropUnitDims);
-}
-
 } // namespace mlir::iree_compiler

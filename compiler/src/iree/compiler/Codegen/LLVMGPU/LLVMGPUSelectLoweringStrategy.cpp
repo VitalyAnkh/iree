@@ -4,22 +4,10 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtDialect.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenAttrs.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenDialect.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
 #include "iree/compiler/Codegen/LLVMGPU/KernelConfig.h"
-#include "iree/compiler/Codegen/LLVMGPU/PassDetail.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
-#include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
-#include "iree/compiler/Dialect/HAL/IR/HALOps.h"
-#include "mlir/Dialect/GPU/IR/GPUDialect.h"
-#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
-#include "mlir/Dialect/PDL/IR/PDL.h"
-#include "mlir/Dialect/PDLInterp/IR/PDLInterp.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/Transform/IR/TransformDialect.h"
-#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -27,36 +15,23 @@
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_LLVMGPUSELECTLOWERINGSTRATEGYPASS
+#include "iree/compiler/Codegen/LLVMGPU/Passes.h.inc"
+
 namespace {
 /// Selects a lowering strategy for taking a hal.executable.variant operation
 /// to scalar/native-vector code.
-class LLVMGPUSelectLoweringStrategyPass
-    : public LLVMGPUSelectLoweringStrategyBase<
+class LLVMGPUSelectLoweringStrategyPass final
+    : public impl::LLVMGPUSelectLoweringStrategyPassBase<
           LLVMGPUSelectLoweringStrategyPass> {
 public:
-  void getDependentDialects(DialectRegistry &registry) const override {
-    // TODO(qedawkins): Once TransformStrategies is deprecated, drop the
-    // unnecessary dialect registrations.
-    // clang-format off
-    registry
-        .insert<IREE::Codegen::IREECodegenDialect,
-                IREE::HAL::HALDialect,
-                IREE::LinalgExt::IREELinalgExtDialect,
-                linalg::LinalgDialect,
-                gpu::GPUDialect,
-                nvgpu::NVGPUDialect,
-                pdl::PDLDialect,
-                pdl_interp::PDLInterpDialect,
-                scf::SCFDialect,
-                tensor::TensorDialect,
-                transform::TransformDialect,
-                vector::VectorDialect>();
-    // clang-format on
-  }
+  using impl::LLVMGPUSelectLoweringStrategyPassBase<
+      LLVMGPUSelectLoweringStrategyPass>::LLVMGPUSelectLoweringStrategyPassBase;
 
-  LLVMGPUSelectLoweringStrategyPass() = default;
-  LLVMGPUSelectLoweringStrategyPass(
-      const LLVMGPUSelectLoweringStrategyPass &pass){};
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry
+        .insert<IREE::Codegen::IREECodegenDialect, IREE::GPU::IREEGPUDialect>();
+  }
 
   void runOnOperation() override;
 };
@@ -66,11 +41,12 @@ public:
 /// module.
 template <typename F>
 static LogicalResult
-verifyLoweringConfiguration(ModuleOp module,
+verifyLoweringConfiguration(FunctionOpInterface funcOp,
                             IREE::Codegen::TranslationInfoAttr translationInfo,
                             ArrayRef<int64_t> workgroupSize, F verificationFn) {
-  auto walkResult = module.walk([&](Operation *op) -> WalkResult {
-    IREE::Codegen::LoweringConfigAttr loweringConfig = getLoweringConfig(op);
+  auto walkResult = funcOp.walk([&](Operation *op) -> WalkResult {
+    auto loweringConfig =
+        getLoweringConfig<IREE::Codegen::LoweringConfigAttr>(op);
     if (!loweringConfig)
       return WalkResult::advance();
     return verificationFn(op, loweringConfig, translationInfo, workgroupSize);
@@ -79,51 +55,38 @@ verifyLoweringConfiguration(ModuleOp module,
 }
 
 static LogicalResult
-verifyEntryPoint(ModuleOp moduleOp,
-                 IREE::Codegen::TranslationInfoAttr translationInfo,
-                 IREE::HAL::ExecutableExportOp exportOp) {
-  std::optional<mlir::ArrayAttr> workgroupSizeAttr =
-      exportOp.getWorkgroupSize();
-
-  if (workgroupSizeAttr.has_value()) {
-    std::array<int64_t, 3> workgroupSizes;
-    for (auto [index, attr] : llvm::enumerate(workgroupSizeAttr.value())) {
-      workgroupSizes[index] = llvm::cast<IntegerAttr>(attr).getInt();
-    }
-    return verifyLoweringConfiguration(moduleOp, translationInfo,
-                                       workgroupSizes, verifyGPUMatmulPipeline);
+verifyEntryPoint(FunctionOpInterface funcOp,
+                 IREE::Codegen::TranslationInfoAttr translationInfo) {
+  std::optional<SmallVector<int64_t>> workgroupSize = getWorkgroupSize(funcOp);
+  if (!workgroupSize) {
+    return funcOp->emitOpError(
+        "failed to get workgroup size needed for verification");
   }
+
+  return verifyLoweringConfiguration(
+      funcOp, translationInfo, workgroupSize.value(), verifyGPUMatmulPipeline);
   return success();
 }
 
 void LLVMGPUSelectLoweringStrategyPass::runOnOperation() {
-  IREE::HAL::ExecutableVariantOp variantOp = getOperation();
-  ModuleOp moduleOp = variantOp.getInnerModule();
+  auto moduleOp = getOperation();
+  for (auto funcOp : moduleOp.getOps<FunctionOpInterface>()) {
+    if (failed(initGPULaunchConfig(funcOp))) {
+      return signalPassFailure();
+    }
 
-  if (failed(initGPULaunchConfig(moduleOp))) {
-    return signalPassFailure();
-  }
+    IREE::Codegen::TranslationInfoAttr translationInfo =
+        getTranslationInfo(funcOp);
+    if (!translationInfo) {
+      // Dont do anything if translation info is not set.
+      return;
+    }
 
-  std::optional<IREE::Codegen::TranslationInfoAttr> translationInfo =
-      getIdenticalTranslationInfo(variantOp);
-  if (!translationInfo) {
-    moduleOp.emitOpError(
-        "unhandled compilation of entry point functions with different "
-        "translation info");
-    return signalPassFailure();
-  }
-
-  // Verify the properties of each entry point based on the target pipeline.
-  for (auto exportOp : variantOp.getExportOps()) {
-    if (failed(verifyEntryPoint(moduleOp, translationInfo.value(), exportOp))) {
+    // Verify the properties of each entry point based on the target pipeline.
+    if (failed(verifyEntryPoint(funcOp, translationInfo))) {
       return signalPassFailure();
     }
   }
-}
-
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableVariantOp>>
-createLLVMGPUSelectLoweringStrategyPass() {
-  return std::make_unique<LLVMGPUSelectLoweringStrategyPass>();
 }
 
 } // namespace mlir::iree_compiler

@@ -6,18 +6,26 @@
 
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
+#include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/KnownTargets.h"
 #include "iree/compiler/Codegen/Utils/MarkerUtils.h"
+#include "iree/compiler/Codegen/Utils/Utils.h"
+#include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
+#include <cassert>
+#include <cstdint>
 #include <optional>
 
 #define DEBUG_TYPE "iree-codegen-gpu-utils"
@@ -26,6 +34,15 @@
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 static constexpr unsigned kShuffleBitWidth = 32;
+
+static llvm::cl::opt<std::string> clTestTarget(
+    "iree-gpu-test-target",
+    llvm::cl::desc(
+        "The target for IR LIT tests. Format is '<arch>:<feature>@<api>', "
+        "where <feature> and <api> are optional; e.g., "
+        "'gfx942:+sramecc,-xnack@hip'. If <api> is missing, it will be deduced "
+        "from <arch>; e.g., 'gfx*' defaults to HIP, 'sm_*' defaults to CUDA"),
+    llvm::cl::init(""));
 
 namespace mlir::iree_compiler {
 
@@ -65,10 +82,11 @@ getSubgroupIdsAndCounts(mlir::OpBuilder &builder, mlir::Location loc,
     mlir::Value subgroupId =
         builder.create<mlir::gpu::ThreadIdOp>(loc, indexType, dimAttr[i]);
     if (i == 0) {
-      mlir::AffineExpr d0 = builder.getAffineDimExpr(0);
-      subgroupId = mlir::affine::makeComposedAffineApply(
-          builder, loc, d0.floorDiv(builder.getAffineConstantExpr(warpSize)),
-          {subgroupId});
+      subgroupId =
+          builder
+              .create<affine::AffineDelinearizeIndexOp>(
+                  loc, subgroupId, ArrayRef<int64_t>{numSubgroups[i], warpSize})
+              .getResult(0);
     }
     procInfo[numDims - 1 - i] = {
         subgroupId,
@@ -79,18 +97,18 @@ getSubgroupIdsAndCounts(mlir::OpBuilder &builder, mlir::Location loc,
   return procInfo;
 }
 
-std::array<int64_t, 3> getWorkgroupSize(mlir::func::FuncOp funcOp) {
-  std::array<int64_t, 3> workgroupSize;
-  FailureOr<IREE::HAL::ExecutableExportOp> exportOp =
-      mlir::iree_compiler::getEntryPoint(funcOp);
-  std::optional<mlir::ArrayAttr> workgroupSizeAttr =
-      exportOp->getWorkgroupSize();
-  assert(workgroupSizeAttr.has_value());
-  for (auto [index, attr] : llvm::enumerate(workgroupSizeAttr.value())) {
-    workgroupSize[index] =
-        llvm::cast<mlir::IntegerAttr>(attr).getValue().getZExtValue();
+bool isDescendingRelativeMappingIndices(ArrayRef<Attribute> array) {
+  int64_t prev =
+      llvm::cast<DeviceMappingAttrInterface>(array[0]).getRelativeIndex();
+  for (Attribute attr : array.drop_front()) {
+    int64_t relativeIndex =
+        llvm::cast<DeviceMappingAttrInterface>(attr).getRelativeIndex();
+    if (relativeIndex != prev - 1) {
+      return false;
+    }
+    prev = relativeIndex;
   }
-  return workgroupSize;
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -160,6 +178,46 @@ gpuMmaUnrollOrder(vector::ContractionOp contract) {
 }
 
 //===----------------------------------------------------------------------===//
+// GPU tiling and distribution
+//===----------------------------------------------------------------------===//
+
+const char *getGPUDistributeAttrName() { return "iree.gpu.distribute_dim"; }
+
+FailureOr<SmallVector<int64_t>> getGPUTileSize(mlir::FunctionOpInterface funcOp,
+                                               int tilingLevel) {
+  SmallVector<Operation *> computeOps = getComputeOps(funcOp);
+  FailureOr<IREE::Codegen::LoweringConfigAttr> config =
+      getFirstLoweringConfig<IREE::Codegen::LoweringConfigAttr>(computeOps);
+  if (failed(config)) {
+    return funcOp.emitOpError("failed to get lowering configuration");
+  }
+
+  return config->getTileSizeVals(tilingLevel);
+}
+
+FailureOr<scf::SCFTileSizeComputationFunction>
+getGPUScfTileSizeComputeFn(mlir::FunctionOpInterface funcOp, int tilingLevel) {
+  FailureOr<SmallVector<int64_t>> tileSizes =
+      getGPUTileSize(funcOp, tilingLevel);
+  if (failed(tileSizes))
+    return failure();
+  scf::SCFTileSizeComputationFunction computeFn =
+      [tileSizes](OpBuilder &builder,
+                  Operation *op) -> SmallVector<OpFoldResult> {
+    auto tileSizesOfr = getAsIndexOpFoldResult(op->getContext(), *tileSizes);
+    auto zeroAttr = builder.getIndexAttr(0);
+    int numLoops = cast<TilingInterface>(op).getLoopIteratorTypes().size();
+    tileSizesOfr.resize(numLoops, zeroAttr);
+    return tileSizesOfr;
+  };
+  return computeFn;
+}
+
+bool isNonZeroRank(TypedValue<VectorType> val) {
+  return val.getType().getRank() != 0;
+}
+
+//===----------------------------------------------------------------------===//
 // GPU workgroup memory
 //===----------------------------------------------------------------------===//
 
@@ -169,7 +227,8 @@ std::optional<Value> allocateWorkgroupMemory(OpBuilder &builder,
                                              DataLayout &) {
   OpBuilder::InsertionGuard guard(builder);
 
-  func::FuncOp funcOp = subview->getParentOfType<func::FuncOp>();
+  mlir::FunctionOpInterface funcOp =
+      subview->getParentOfType<mlir::FunctionOpInterface>();
   if (!funcOp)
     return std::nullopt;
 
@@ -281,7 +340,7 @@ propagateCopySourceIntoConsumerGeneric(memref::CopyOp copyOp,
 /// This is needed because we are doing promotion to shared memory on buffers.
 /// This is a fragile and temporary solution until we move to be able to do this
 /// kind of transformations on tensors.
-void propagateSharedMemoryCopy(func::FuncOp funcOp) {
+void propagateSharedMemoryCopy(mlir::FunctionOpInterface funcOp) {
   SmallVector<Operation *> toDelete;
   funcOp.walk([&toDelete](memref::CopyOp copyOp) {
     if (hasMarker(copyOp, getCopyToWorkgroupMemoryMarker())) {
@@ -294,7 +353,7 @@ void propagateSharedMemoryCopy(func::FuncOp funcOp) {
     op->erase();
 }
 
-void insertBarriersAroundSharedMemoryCopy(func::FuncOp funcOp) {
+void insertBarriersAroundSharedMemoryCopy(mlir::FunctionOpInterface funcOp) {
   OpBuilder builder(funcOp.getContext());
   // Insert barriers before and after copies to workgroup memory and skip
   // insert barriers between back to back copy to workgroup memory.
@@ -318,7 +377,7 @@ void insertBarriersAroundSharedMemoryCopy(func::FuncOp funcOp) {
 // Reduction utils
 //===----------------------------------------------------------------------===//
 
-/// Packs scalar element to it's vector equivalent.
+/// Packs scalar element to its vector equivalent.
 /// (i.e f16 -> vector<1xf16> and f32 -> vector<1xf32>)
 static Value promoteElementToVector(Location loc, OpBuilder &builder,
                                     Value input) {
@@ -331,7 +390,7 @@ static Value promoteElementToVector(Location loc, OpBuilder &builder,
 Value packVectorToSupportedWidth(Location loc, OpBuilder &builder,
                                  Value input) {
   LLVM_DEBUG({
-    auto vecType = input.getType().cast<VectorType>();
+    auto vecType = cast<VectorType>(input.getType());
     Type elementType = vecType.getElementType();
     assert(vecType.getDimSize(0) * elementType.getIntOrFloatBitWidth() ==
                kShuffleBitWidth &&
@@ -362,43 +421,63 @@ Value unpackToVector(Location loc, OpBuilder &builder, Value packedInput,
   return unpackedVector;
 }
 
-/// Emit warp reduction code sequence for a given input.
+/// Emit warp reduction code sequence for a given scalar input value.
 static Value warpReduction(Location loc, OpBuilder &builder, Value input,
                            vector::CombiningKind kind, uint32_t warpSize,
                            uint32_t numLaneToReduce) {
-  VectorType unpackedType = llvm::dyn_cast<VectorType>(input.getType());
-  Value laneVal = input;
   assert(llvm::isPowerOf2_32(numLaneToReduce));
+  assert((llvm::isa<IntegerType, FloatType>(input.getType())) &&
+         "Input must be a scalar");
+  IntegerType shuffleIntType = builder.getIntegerType(kShuffleBitWidth);
+  Type origInputType = input.getType();
+  const unsigned origBitWidth = origInputType.getIntOrFloatBitWidth();
+  assert(origBitWidth <= kShuffleBitWidth && "Unsupported input type bitwidth");
+
+  const bool needsPacking = kShuffleBitWidth != origBitWidth;
+  IntegerType equivIntType = builder.getIntegerType(origBitWidth);
+
+  // Always perform the shuffles over the supported scalar type. For inputs of
+  // smaller bitwidth, perform packing and unpacking via the supported integer
+  // type.
+  auto unpack = [loc, &builder, needsPacking, equivIntType,
+                 origInputType](Value packedVal) -> Value {
+    if (!needsPacking)
+      return packedVal;
+    auto asInt = builder.create<arith::TruncIOp>(loc, equivIntType, packedVal);
+    return builder.create<arith::BitcastOp>(loc, origInputType, asInt);
+  };
+
+  auto pack = [loc, &builder, needsPacking, equivIntType,
+               shuffleIntType](Value unpackedVal) -> Value {
+    if (!needsPacking)
+      return unpackedVal;
+    auto asInt =
+        builder.create<arith::BitcastOp>(loc, equivIntType, unpackedVal);
+    return builder.create<arith::ExtUIOp>(loc, shuffleIntType, asInt);
+  };
+
+  // Lane value always stays in the original type. We use it to perform arith
+  // reductions.
+  Value laneVal = input;
   // Parallel reduction using butterfly shuffles.
   for (uint64_t i = 1; i < numLaneToReduce; i <<= 1) {
-    Value shuffleInput = laneVal;
-    if (unpackedType) {
-      shuffleInput = packVectorToSupportedWidth(loc, builder, laneVal);
-    }
     Value shuffled = builder
-                         .create<gpu::ShuffleOp>(loc, shuffleInput, i,
+                         .create<gpu::ShuffleOp>(loc, pack(laneVal), i,
                                                  /*width=*/warpSize,
                                                  /*mode=*/gpu::ShuffleMode::XOR)
                          .getShuffleResult();
-    if (unpackedType) {
-      shuffled = unpackToVector(loc, builder, shuffled, unpackedType);
-    }
-    laneVal = makeArithReduction(builder, loc, kind, laneVal, shuffled);
+    laneVal = makeArithReduction(builder, loc, kind, laneVal, unpack(shuffled));
   }
   // Broadcast the result to all the lanes.
   if (warpSize != numLaneToReduce) {
-    if (unpackedType) {
-      laneVal = packVectorToSupportedWidth(loc, builder, laneVal);
-    }
-    laneVal = builder
-                  .create<gpu::ShuffleOp>(loc, laneVal, 0,
-                                          /*width=*/warpSize,
-                                          /*mode=*/gpu::ShuffleMode::IDX)
-                  .getShuffleResult();
-    if (unpackedType) {
-      laneVal = unpackToVector(loc, builder, laneVal, unpackedType);
-    }
+    Value shuffled = builder
+                         .create<gpu::ShuffleOp>(loc, pack(laneVal), 0,
+                                                 /*width=*/warpSize,
+                                                 /*mode=*/gpu::ShuffleMode::IDX)
+                         .getShuffleResult();
+    laneVal = unpack(shuffled);
   }
+
   return laneVal;
 }
 
@@ -428,13 +507,13 @@ static TypedAttr getCombiningKindIdentity(OpBuilder &builder,
   case vector::CombiningKind::XOR:
     return builder.getZeroAttr(type);
   case vector::CombiningKind::MINIMUMF:
-  case vector::CombiningKind::MINF: {
+  case vector::CombiningKind::MINNUMF: {
     auto posInfApFloat = APFloat::getInf(
         llvm::cast<FloatType>(type).getFloatSemantics(), /*Negative=*/false);
     return builder.getFloatAttr(type, posInfApFloat);
   }
   case vector::CombiningKind::MAXIMUMF:
-  case vector::CombiningKind::MAXF: {
+  case vector::CombiningKind::MAXNUMF: {
     auto negInfApFloat = APFloat::getInf(
         llvm::cast<FloatType>(type).getFloatSemantics(), /*Negative=*/true);
     return builder.getFloatAttr(type, negInfApFloat);
@@ -443,63 +522,9 @@ static TypedAttr getCombiningKindIdentity(OpBuilder &builder,
   return TypedAttr();
 }
 
-/// Compute the value on a single thread to get per lane reduction value.
-/// If bit-width is not supported on shuffle operations, and a lower precision,
-/// we represent them as a vector S.T we can pack them into a single 32-bit
-/// width for shuffles.
-static Value reduceToSupportedWidth(Location loc, OpBuilder &builder,
-                                    Value input, vector::CombiningKind kind) {
-  auto vecType = llvm::cast<VectorType>(input.getType());
-  Type elementType = vecType.getElementType();
-  int64_t vecSize = vecType.getDimSize(0);
-  unsigned bitWidth = elementType.getIntOrFloatBitWidth();
-  // Simply reduce if it's already 32 bits.
-  if (bitWidth == kShuffleBitWidth) {
-    return builder.create<vector::ReductionOp>(loc, kind, input);
-  }
-  assert(kShuffleBitWidth % bitWidth == 0 &&
-         "Bitwidth needs to be able to be packed into shuffle-bitwidth.");
-  int64_t unrollCount = kShuffleBitWidth / bitWidth;
-  // Original size needs to be divisble by or less than unroll count to
-  // determine slice size.
-  assert(vecSize % unrollCount == 0 || vecSize < unrollCount);
-  unsigned sliceSize = vecSize / unrollCount;
-  VectorType unrolledLaneValType = VectorType::get({unrollCount}, elementType);
-  Value perLaneReduction = builder.create<arith::ConstantOp>(
-      loc, builder.getZeroAttr(unrolledLaneValType));
-  if (vecSize % unrollCount == 0) {
-    // Unroll reductions s.t we can pack into a supported 32-bitWidth format.
-    for (int64_t i = 0; i < unrollCount; i++) {
-      Value laneValSlice = builder.create<vector::ExtractStridedSliceOp>(
-          loc, input,
-          /*offsets=*/ArrayRef<int64_t>{sliceSize * i},
-          /*sizes=*/ArrayRef<int64_t>{sliceSize},
-          /*strides=*/ArrayRef<int64_t>{1});
-      Value reductionSlice =
-          builder.create<vector::ReductionOp>(loc, kind, laneValSlice);
-      SmallVector<int64_t> perLaneUnrollId = {i};
-      perLaneReduction = builder.create<vector::InsertOp>(
-          loc, reductionSlice, perLaneReduction, perLaneUnrollId);
-    }
-  } else {
-    // In cases where vecSize < unrollCount, we would pad the vector
-    // with identity elements until it's total bit size is 32.
-    TypedAttr identityAttr =
-        getCombiningKindIdentity(builder, kind, elementType);
-    identityAttr = DenseElementsAttr::get(unrolledLaneValType, identityAttr);
-    Value identity = builder.create<arith::ConstantOp>(loc, unrolledLaneValType,
-                                                       identityAttr);
-    perLaneReduction = builder.create<vector::InsertStridedSliceOp>(
-        loc, input, identity, /*offsets=*/ArrayRef<int64_t>{0},
-        /*strides=*/ArrayRef<int64_t>{1});
-  }
-  return perLaneReduction;
-}
-
 /// Emit identity variable.
-static Value getCombiningIdentityValue(Location loc, OpBuilder &builder,
-                                       vector::CombiningKind kind,
-                                       Type identityType) {
+Value getCombiningIdentityValue(Location loc, OpBuilder &builder,
+                                vector::CombiningKind kind, Type identityType) {
   auto vectorType = llvm::dyn_cast<VectorType>(identityType);
   Type elementType = identityType;
   if (vectorType) {
@@ -515,29 +540,31 @@ static Value getCombiningIdentityValue(Location loc, OpBuilder &builder,
   return identity;
 }
 
-/// Return a matching GPU reduction operations.
-static std::optional<gpu::AllReduceOperation>
-combiningKindToAllReduce(vector::CombiningKind kind) {
-  using gpu::AllReduceOperation;
-  using vector::CombiningKind;
-
+/// Returns the matching GPU reduction operation.
+gpu::AllReduceOperation combiningKindToAllReduce(vector::CombiningKind kind) {
   switch (kind) {
-  case CombiningKind::ADD:
-    return AllReduceOperation::ADD;
-  case CombiningKind::AND:
-    return AllReduceOperation::AND;
-  case CombiningKind::MUL:
-    return AllReduceOperation::MUL;
-  case CombiningKind::OR:
-    return AllReduceOperation::OR;
-  case CombiningKind::XOR:
-    return AllReduceOperation::XOR;
-  // Currently, the min/max reductions are not well-defined in the gpu dialect.
-  // See https://github.com/llvm/llvm-project/issues/72354.
-  default:
-    break;
+#define MAP_CASE(X)                                                            \
+  case vector::CombiningKind::X:                                               \
+    return gpu::AllReduceOperation::X
+
+    MAP_CASE(ADD);
+    MAP_CASE(MUL);
+    MAP_CASE(MINUI);
+    MAP_CASE(MINSI);
+    MAP_CASE(MINNUMF);
+    MAP_CASE(MAXSI);
+    MAP_CASE(MAXUI);
+    MAP_CASE(MAXNUMF);
+    MAP_CASE(AND);
+    MAP_CASE(OR);
+    MAP_CASE(XOR);
+    MAP_CASE(MINIMUMF);
+    MAP_CASE(MAXIMUMF);
+#undef MAP_CASE
   }
-  return std::nullopt;
+  // Upstream LLVM has the same assertion for the reverse direction (see
+  // mlir::gpu::convertReductionKind).
+  llvm_unreachable("Vector and GPU reduction kinds should match 1:1");
 }
 
 /// Emit reduction across a group for a given input.
@@ -549,19 +576,18 @@ Value emitGPUGroupReduction(Location loc, OpBuilder &builder, Value input,
       "Group reduction only support for sizes aligned on warp size for now.");
 
   if (!expandSubgroupReduce && size == warpSize) {
-    if (auto gpuReduceKind = combiningKindToAllReduce(kind)) {
-      // Simple case -- emit `gpu.subgroup_reduce` directly.
-      Value laneVal = builder.create<vector::ReductionOp>(loc, kind, input);
-      return builder.create<gpu::SubgroupReduceOp>(loc, laneVal,
-                                                   *gpuReduceKind);
-    }
+    auto gpuReduceKind = combiningKindToAllReduce(kind);
+    // Simple case -- emit `gpu.subgroup_reduce` directly.
+    Value laneVal = builder.create<vector::ReductionOp>(loc, kind, input);
+    return builder.create<gpu::SubgroupReduceOp>(loc, laneVal, gpuReduceKind,
+                                                 /*uniform=*/false);
   }
 
   // More-involved case -- generate `gpu.shuffle` ops over i32 values (using the
   // butterfly shuffle algorithm).
   //
   // First reduce on a single thread to get per lane reduction value.
-  Value laneVal = reduceToSupportedWidth(loc, builder, input, kind);
+  Value laneVal = builder.create<vector::ReductionOp>(loc, kind, input);
   laneVal = warpReduction(loc, builder, laneVal, kind, warpSize, warpSize);
   // if we have more than one warp, reduce across warps.
   if (size > warpSize) {
@@ -608,10 +634,7 @@ Value emitGPUGroupReduction(Location loc, OpBuilder &builder, Value input,
     }
     laneVal = warpReduction(loc, builder, loadVal, kind, warpSize, numWarp);
   }
-  // Handles cases for sub-32bit precision where output is still in vector form.
-  if (llvm::isa<VectorType>(laneVal.getType())) {
-    laneVal = builder.create<vector::ReductionOp>(loc, kind, laneVal);
-  }
+
   return laneVal;
 }
 
@@ -912,6 +935,82 @@ bool sharedMemTransposeFilter(AffineMap indexMap) {
     }
   }
   return false;
+}
+
+//===----------------------------------------------------------------------===//
+// GPU Target Information
+//===----------------------------------------------------------------------===//
+
+IREE::GPU::TargetAttr getCLGPUTarget(MLIRContext *context) {
+  if (clTestTarget.empty())
+    return nullptr;
+
+  auto [archAndFeatures, backend] = StringRef(clTestTarget).split("@");
+  if (backend.empty()) {
+    // Guess what the target API is based on common scheme. This does not work
+    // for cases like "ampere" which can be accepted by both CUDA and Vulkan;
+    // it's very limited. So it's targeting common cases to make writing tests
+    // simpler.
+    if (StringRef(clTestTarget).starts_with("sm_"))
+      backend = "cuda";
+    else if (StringRef(clTestTarget).starts_with("gfx"))
+      backend = "hip";
+    else if (StringRef(clTestTarget).starts_with("adreno"))
+      backend = "vulkan";
+    else if (StringRef(clTestTarget).starts_with("apple"))
+      backend = "vulkan";
+    else if (StringRef(clTestTarget).starts_with("valhall"))
+      backend = "vulkan";
+  }
+  auto [arch, features] = StringRef(archAndFeatures).split(':');
+  // Use the target specified in the command line for testing purposes.
+  return IREE::GPU::getFullTarget(backend, arch, features, context);
+}
+
+IREE::GPU::TargetAttr getGPUTargetAttr(IREE::HAL::ExecutableTargetAttr target) {
+  if (auto config = target.getConfiguration()) {
+    if (auto attr = config.getAs<IREE::GPU::TargetAttr>("iree.gpu.target"))
+      return attr;
+  }
+  return getCLGPUTarget(target.getContext());
+}
+
+IREE::GPU::TargetAttr getGPUTargetAttr(Operation *op) {
+  if (auto target = IREE::HAL::ExecutableTargetAttr::lookup(op)) {
+    return getGPUTargetAttr(target);
+  }
+  return getCLGPUTarget(op->getContext());
+}
+
+std::optional<int> getGPUSubgroupSize(mlir::FunctionOpInterface func) {
+  // First try to see if there is a subgroup size chosen in the CodeGen pipeline
+  // configuration.
+  if (std::optional<int64_t> subgroupSize = getSubgroupSize(func))
+    return subgroupSize.value();
+  // Then try to find the subgroup size from the target description.
+  if (IREE::GPU::TargetAttr target = getGPUTargetAttr(func))
+    return target.getPreferredSubgroupSize();
+  return std::nullopt;
+}
+
+SmallVector<IREE::HAL::ExecutableVariantOp>
+getExecutableVariantOps(mlir::ModuleOp moduleOp) {
+  SmallVector<IREE::HAL::ExecutableVariantOp> executableVariantOps;
+  moduleOp.walk([&](IREE::HAL::ExecutableVariantOp executableOp) {
+    executableVariantOps.push_back(executableOp);
+  });
+  return executableVariantOps;
+}
+
+SmallVector<IREE::GPU::MMAIntrinsic>
+queryMMAIntrinsics(IREE::HAL::ExecutableVariantOp executableOp) {
+  SmallVector<IREE::GPU::MMAIntrinsic> mmaIntrinsics;
+  if (IREE::GPU::TargetAttr target = getGPUTargetAttr(executableOp)) {
+    mmaIntrinsics = llvm::map_to_vector(
+        target.getWgp().getMma(),
+        [](IREE::GPU::MMAAttr attr) { return attr.getIntrinsic().getValue(); });
+  }
+  return mmaIntrinsics;
 }
 
 } // namespace mlir::iree_compiler

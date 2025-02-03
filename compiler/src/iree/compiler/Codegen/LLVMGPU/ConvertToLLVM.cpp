@@ -6,7 +6,7 @@
 
 #include "iree/compiler/Codegen/LLVMGPU/ConvertToLLVM.h"
 
-#include "iree/compiler/Codegen/LLVMGPU/PassDetail.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
@@ -24,6 +24,9 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_TESTLLVMGPUSCALARIZEMATHOPPASS
+#include "iree/compiler/Codegen/LLVMGPU/Passes.h.inc"
 
 void ConvertToDynamicSharedMemory(ModuleOp moduleOp) {
   SymbolTableCollection symbolTableCollection;
@@ -160,7 +163,7 @@ struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
     }
     // In CUDA workgroup memory is represented by a global variable.
     MemRefType allocType = allocOp.getType();
-    auto funcOp = allocOp->getParentOfType<func::FuncOp>();
+    auto funcOp = allocOp->getParentOfType<mlir::FunctionOpInterface>();
     auto moduleOp = funcOp->getParentOfType<ModuleOp>();
     SymbolTable symbolTable(moduleOp);
     OpBuilder::InsertionGuard guard(rewriter);
@@ -183,8 +186,9 @@ struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
 
 /// Pass to test in dialect transformation used to legalize the IR before
 /// convertToNVVM/ConvertToROCDL.
-class TestLLVMGPULegalizeOpPass
-    : public TestLLVMGPUScalarizeMathOpBase<TestLLVMGPULegalizeOpPass> {
+class TestLLVMGPULegalizeOpPass final
+    : public impl::TestLLVMGPUScalarizeMathOpPassBase<
+          TestLLVMGPULegalizeOpPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<vector::VectorDialect>();
   }
@@ -192,41 +196,49 @@ class TestLLVMGPULegalizeOpPass
     RewritePatternSet patterns(&getContext());
     populateScalarizeMathOps(patterns);
     populateConvertSharedMemoryAllocOps(patterns);
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
   }
 };
 
-using SetBinding = std::pair<APInt, APInt>;
-
-/// Convention with the HAL side to pass kernel arguments.
-/// The bindings are ordered based on binding set and binding index then
-/// compressed and mapped to dense set of arguments.
-/// This function looks at the symbols and return the mapping between
-/// InterfaceBindingOp and kernel argument index.
-/// For instance if the kernel has (set, bindings) A(0, 1), B(1, 5), C(0, 6) it
-/// will return the mapping [A, 0], [C, 1], [B, 2]
-static llvm::SmallDenseMap<SetBinding, size_t>
-getKernelArgMapping(Operation *funcOp) {
-  llvm::SetVector<SetBinding> usedBindingSet;
-  funcOp->walk([&](IREE::HAL::InterfaceBindingSubspanOp subspanOp) {
-    usedBindingSet.insert(
-        SetBinding(subspanOp.getSet(), subspanOp.getBinding()));
-  });
-  auto sparseBindings = usedBindingSet.takeVector();
-  std::sort(sparseBindings.begin(), sparseBindings.end(),
-            [](SetBinding lhs, SetBinding rhs) {
-              if (lhs.first == rhs.first)
-                return lhs.second.ult(rhs.second);
-              return lhs.first.ult(rhs.first);
-            });
-  llvm::SmallDenseMap<SetBinding, size_t> mapBindingArgIndex;
-  for (auto [index, binding] : llvm::enumerate(sparseBindings)) {
-    mapBindingArgIndex[binding] = index;
+namespace {
+/// A package for the results of `analyzeSubspanOps` to avoid
+/// arbitrary tuples. The default values are the results for an unused
+/// binding, which is read-only, unused, and in address space 0.
+struct BindingProperties {
+  bool readonly = true;
+  bool unused = true;
+  unsigned addressSpace = 0;
+};
+} // namespace
+/// Analyze subspan binding ops to recover properties of the binding, such as
+/// if it is read-only and the address space it lives in.
+static FailureOr<SmallVector<BindingProperties>>
+analyzeSubspans(llvm::SetVector<IREE::HAL::InterfaceBindingSubspanOp> &subspans,
+                int64_t numBindings, const LLVMTypeConverter *typeConverter) {
+  SmallVector<BindingProperties> result(numBindings, BindingProperties{});
+  for (auto subspan : subspans) {
+    int64_t binding = subspan.getBinding().getSExtValue();
+    result[binding].unused = false;
+    result[binding].readonly &= IREE::HAL::bitEnumContainsAny(
+        subspan.getDescriptorFlags().value_or(IREE::HAL::DescriptorFlags::None),
+        IREE::HAL::DescriptorFlags::ReadOnly);
+    unsigned bindingAddrSpace = 0;
+    auto bindingType = dyn_cast<BaseMemRefType>(subspan.getType());
+    if (bindingType) {
+      bindingAddrSpace = *typeConverter->getMemRefAddressSpace(bindingType);
+    }
+    if (result[binding].addressSpace != 0 &&
+        result[binding].addressSpace != bindingAddrSpace) {
+      return subspan.emitOpError("address space for this op (" +
+                                 Twine(bindingAddrSpace) +
+                                 ") doesn't match previously found space (" +
+                                 Twine(result[binding].addressSpace) + ")");
+    }
+    result[binding].addressSpace = bindingAddrSpace;
   }
-  return mapBindingArgIndex;
+  return result;
 }
 
 class ConvertFunc : public ConvertToLLVMPattern {
@@ -247,31 +259,46 @@ public:
     assert(fnType.getNumInputs() == 0 && fnType.getNumResults() == 0);
 
     TypeConverter::SignatureConversion signatureConverter(/*numOrigInputs=*/0);
-    auto argMapping = getKernelArgMapping(funcOp);
-    // There may be dead symbols, we pick i32 pointer as default argument type.
-    SmallVector<Type, 8> llvmInputTypes(
-        argMapping.size(), LLVM::LLVMPointerType::get(rewriter.getContext()));
+    // Note: we assume that the pipeline layout is the same for all bindings
+    // in this function.
+    IREE::HAL::PipelineLayoutAttr layout;
+    llvm::SetVector<IREE::HAL::InterfaceBindingSubspanOp> subspans;
     funcOp.walk([&](IREE::HAL::InterfaceBindingSubspanOp subspanOp) {
-      LLVM::LLVMPointerType llvmType;
-      if (auto memrefType = dyn_cast<BaseMemRefType>(subspanOp.getType())) {
-        unsigned addrSpace =
-            *getTypeConverter()->getMemRefAddressSpace(memrefType);
-        llvmType = LLVM::LLVMPointerType::get(rewriter.getContext(), addrSpace);
-      } else {
-        llvmType = LLVM::LLVMPointerType::get(rewriter.getContext());
+      if (!layout) {
+        layout = subspanOp.getLayout();
       }
-      llvmInputTypes[argMapping[SetBinding(subspanOp.getSet(),
-                                           subspanOp.getBinding())]] = llvmType;
+      subspans.insert(subspanOp);
     });
-    // As a convention with HAL, push constants are appended as kernel arguments
-    // after all the binding inputs.
-    uint64_t numConstants = 0;
-    funcOp.walk([&](IREE::HAL::InterfaceConstantLoadOp constantOp) {
-      numConstants =
-          std::max(constantOp.getIndex().getZExtValue() + 1, numConstants);
+
+    funcOp.walk([&](IREE::HAL::InterfaceConstantLoadOp constOp) {
+      if (!layout) {
+        layout = constOp.getLayout();
+      }
+      return WalkResult::interrupt();
     });
-    llvmInputTypes.resize(argMapping.size() + numConstants,
-                          rewriter.getI32Type());
+
+    int64_t numBindings = 0;
+    int64_t numConstants = 0;
+    if (layout) {
+      numConstants = layout.getConstants();
+      numBindings = layout.getBindings().size();
+    }
+
+    FailureOr<SmallVector<BindingProperties>> maybeBindingsInfo =
+        analyzeSubspans(subspans, numBindings, getTypeConverter());
+    if (failed(maybeBindingsInfo))
+      return failure();
+    auto bindingsInfo = std::move(*maybeBindingsInfo);
+
+    SmallVector<Type, 8> llvmInputTypes;
+    llvmInputTypes.reserve(numBindings + numConstants);
+    for (const auto &info : bindingsInfo) {
+      llvmInputTypes.push_back(
+          LLVM::LLVMPointerType::get(rewriter.getContext(), info.addressSpace));
+    }
+    // All the push constants are i32 and go at the end of the argument list.
+    llvmInputTypes.resize(numBindings + numConstants, rewriter.getI32Type());
+
     if (!llvmInputTypes.empty())
       signatureConverter.addInputs(llvmInputTypes);
 
@@ -302,6 +329,37 @@ public:
       return failure();
     }
 
+    // Set argument attributes.
+    Attribute unit = rewriter.getUnitAttr();
+    for (auto [idx, info] : llvm::enumerate(bindingsInfo)) {
+      // As a convention with HAL all the kernel argument pointers are 16Bytes
+      // aligned.
+      newFuncOp.setArgAttr(idx, LLVM::LLVMDialect::getAlignAttrName(),
+                           rewriter.getI32IntegerAttr(16));
+      // It is safe to set the noalias attribute as it is guaranteed that the
+      // ranges within bindings won't alias.
+      newFuncOp.setArgAttr(idx, LLVM::LLVMDialect::getNoAliasAttrName(), unit);
+      newFuncOp.setArgAttr(idx, LLVM::LLVMDialect::getNonNullAttrName(), unit);
+      newFuncOp.setArgAttr(idx, LLVM::LLVMDialect::getNoUndefAttrName(), unit);
+      if (info.unused) {
+        // While LLVM can work this out from the lack of use, we might as well
+        // be explicit here just to be safe.
+        newFuncOp.setArgAttr(idx, LLVM::LLVMDialect::getReadnoneAttrName(),
+                             unit);
+      } else if (info.readonly) {
+        // Setting the readonly attribute here will generate non-coherent cache
+        // loads.
+        newFuncOp.setArgAttr(idx, LLVM::LLVMDialect::getReadonlyAttrName(),
+                             unit);
+      }
+    }
+    for (int64_t i = 0; i < numConstants; ++i) {
+      // Push constants are never `undef`, annotate that here, just as with
+      // bindings.
+      newFuncOp.setArgAttr(numBindings + i,
+                           LLVM::LLVMDialect::getNoUndefAttrName(), unit);
+    }
+
     rewriter.eraseOp(funcOp);
     return success();
   }
@@ -315,25 +373,6 @@ public:
             IREE::HAL::InterfaceBindingSubspanOp::getOperationName(), context,
             converter) {}
 
-  /// Checks all subspanOps with the same binding has readonly attribute
-  static bool checkAllSubspansReadonly(LLVM::LLVMFuncOp llvmFuncOp,
-                                       APInt binding) {
-    bool allReadOnly = false;
-    llvmFuncOp.walk([&](IREE::HAL::InterfaceBindingSubspanOp op) {
-      if (op.getBinding() == binding) {
-        if (!bitEnumContainsAny(op.getDescriptorFlags().value_or(
-                                    IREE::HAL::DescriptorFlags::None),
-                                IREE::HAL::DescriptorFlags::ReadOnly)) {
-          allReadOnly = false;
-          return WalkResult::interrupt();
-        }
-        allReadOnly = true;
-      }
-      return WalkResult::advance();
-    });
-    return allReadOnly;
-  }
-
   LogicalResult
   matchAndRewrite(Operation *op, ArrayRef<Value> operands,
                   ConversionPatternRewriter &rewriter) const override {
@@ -343,36 +382,18 @@ public:
       return failure();
     assert(llvmFuncOp.getNumArguments() > 0);
 
-    auto argMapping = getKernelArgMapping(llvmFuncOp);
     Location loc = op->getLoc();
     auto subspanOp = cast<IREE::HAL::InterfaceBindingSubspanOp>(op);
     IREE::HAL::InterfaceBindingSubspanOpAdaptor adaptor(
         operands, op->getAttrDictionary());
     MemRefType memrefType =
         llvm::dyn_cast<MemRefType>(subspanOp.getResult().getType());
-    mlir::BlockArgument llvmBufferArg = llvmFuncOp.getArgument(
-        argMapping[SetBinding(subspanOp.getSet(), subspanOp.getBinding())]);
-    // As a convention with HAL all the kernel argument pointers are 16Bytes
-    // aligned.
-    llvmFuncOp.setArgAttr(llvmBufferArg.getArgNumber(),
-                          LLVM::LLVMDialect::getAlignAttrName(),
-                          rewriter.getI32IntegerAttr(16));
-    // It is safe to set the noalias attribute as it is guaranteed that the
-    // ranges within bindings won't alias.
-    llvmFuncOp.setArgAttr(llvmBufferArg.getArgNumber(),
-                          LLVM::LLVMDialect::getNoAliasAttrName(),
-                          rewriter.getUnitAttr());
-    if (checkAllSubspansReadonly(llvmFuncOp, subspanOp.getBinding())) {
-      // Setting the readonly attribute here will generate non-coherent cache
-      // loads.
-      llvmFuncOp.setArgAttr(llvmBufferArg.getArgNumber(),
-                            LLVM::LLVMDialect::getReadonlyAttrName(),
-                            rewriter.getUnitAttr());
-    }
+    mlir::BlockArgument llvmBufferArg =
+        llvmFuncOp.getArgument(subspanOp.getBinding().getZExtValue());
     // Add the byte offset.
     Value llvmBufferBasePtr = llvmBufferArg;
 
-    auto [strides, offset] = getStridesAndOffset(memrefType);
+    auto [strides, offset] = memrefType.getStridesAndOffset();
     if (memrefType.hasStaticShape() &&
         !llvm::any_of(strides, ShapedType::isDynamic) &&
         !ShapedType::isDynamic(offset)) {
@@ -436,12 +457,12 @@ public:
               currentStrideVal = rewriter.create<LLVM::ConstantOp>(
                   loc, llvmIndexType, currentStrideInt.value());
             } else {
-              currentStrideVal = currentStride.get<Value>();
+              currentStrideVal = cast<Value>(currentStride);
             }
             currentStride =
                 rewriter.create<LLVM::MulOp>(loc, currentStrideVal, dim)
                     .getResult();
-            desc.setStride(rewriter, loc, i - 1, currentStride.get<Value>());
+            desc.setStride(rewriter, loc, i - 1, cast<Value>(currentStride));
           } else {
             currentStride = rewriter.getIndexAttr(strides[i - 1]);
             desc.setConstantStride(rewriter, loc, i - 1, strides[i - 1]);
@@ -471,11 +492,12 @@ public:
       return failure();
     assert(llvmFuncOp.getNumArguments() > 0);
 
-    auto argMapping = getKernelArgMapping(llvmFuncOp);
     auto ireeConstantOp = cast<IREE::HAL::InterfaceConstantLoadOp>(op);
+    size_t numBindings = ireeConstantOp.getLayout().getBindings().size();
     mlir::BlockArgument llvmBufferArg = llvmFuncOp.getArgument(
-        argMapping.size() + ireeConstantOp.getIndex().getZExtValue());
+        numBindings + ireeConstantOp.getOrdinal().getZExtValue());
     assert(llvmBufferArg.getType().isInteger(32));
+
     Type dstType = getTypeConverter()->convertType(ireeConstantOp.getType());
     // llvm.zext requires that the result type has a larger bitwidth.
     if (dstType == llvmBufferArg.getType()) {
@@ -500,7 +522,24 @@ struct HALInterfaceWorkgroupOpsConverter final
     int32_t index = static_cast<int32_t>(op.getDimension().getSExtValue());
     std::array<gpu::Dimension, 3> dimAttr{gpu::Dimension::x, gpu::Dimension::y,
                                           gpu::Dimension::z};
-    rewriter.replaceOpWithNewOp<NewOpTy>(op, op.getType(), dimAttr[index]);
+    NewOpTy newOp =
+        rewriter.replaceOpWithNewOp<NewOpTy>(op, op.getType(), dimAttr[index]);
+    if (IntegerAttr bound = op.getUpperBoundAttr())
+      newOp.setUpperBoundAttr(bound);
+    return success();
+  }
+};
+
+class ConvertNullPointerOp : public ConvertToLLVMPattern {
+public:
+  ConvertNullPointerOp(MLIRContext *context, LLVMTypeConverter &converter)
+      : ConvertToLLVMPattern(IREE::Codegen::NullPointerOp::getOperationName(),
+                             context, converter) {}
+  LogicalResult
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<LLVM::ZeroOp>(
+        op, LLVM::LLVMPointerType::get(getContext()));
     return success();
   }
 };
@@ -510,22 +549,24 @@ struct HALInterfaceWorkgroupOpsConverter final
 void populateLLVMConversionPatterns(MLIRContext *context,
                                     RewritePatternSet &patterns,
                                     LLVMTypeConverter &converter) {
-  patterns
-      .insert<ConvertFunc, ConvertIREEBindingSubspanOp, ConvertIREEConstantOp>(
-          context, converter);
+  patterns.add<ConvertFunc, ConvertIREEBindingSubspanOp, ConvertIREEConstantOp,
+               ConvertNullPointerOp>(context, converter);
+  converter.addConversion([context](IREE::Codegen::NullPointerType type) {
+    return LLVM::LLVMPointerType::get(context);
+  });
 }
 
 void populateScalarizeMathOps(RewritePatternSet &patterns) {
   patterns.add<ScalarizeMathOp<math::SqrtOp>, ScalarizeMathOp<math::AbsFOp>,
                ScalarizeMathOp<math::AtanOp>, ScalarizeMathOp<math::Atan2Op>,
                ScalarizeMathOp<math::CeilOp>, ScalarizeMathOp<math::CosOp>,
-               ScalarizeMathOp<math::ExpOp>, ScalarizeMathOp<math::ExpM1Op>,
-               ScalarizeMathOp<math::FloorOp>, ScalarizeMathOp<math::LogOp>,
-               ScalarizeMathOp<math::Log1pOp>, ScalarizeMathOp<math::Log10Op>,
-               ScalarizeMathOp<math::Log2Op>, ScalarizeMathOp<math::PowFOp>,
-               ScalarizeMathOp<math::RsqrtOp>, ScalarizeMathOp<math::SinOp>,
-               ScalarizeMathOp<math::SqrtOp>, ScalarizeMathOp<math::TanhOp>>(
-      patterns.getContext());
+               ScalarizeMathOp<math::ExpOp>, ScalarizeMathOp<math::Exp2Op>,
+               ScalarizeMathOp<math::ExpM1Op>, ScalarizeMathOp<math::FloorOp>,
+               ScalarizeMathOp<math::LogOp>, ScalarizeMathOp<math::Log1pOp>,
+               ScalarizeMathOp<math::Log10Op>, ScalarizeMathOp<math::Log2Op>,
+               ScalarizeMathOp<math::PowFOp>, ScalarizeMathOp<math::RsqrtOp>,
+               ScalarizeMathOp<math::SinOp>, ScalarizeMathOp<math::SqrtOp>,
+               ScalarizeMathOp<math::TanhOp>>(patterns.getContext());
 }
 
 void populateConvertSharedMemoryAllocOps(RewritePatternSet &patterns) {
@@ -533,15 +574,13 @@ void populateConvertSharedMemoryAllocOps(RewritePatternSet &patterns) {
 }
 
 void populateLowerHALInterfaceOp(RewritePatternSet &patterns) {
-  patterns.insert<HALInterfaceWorkgroupOpsConverter<
-                      IREE::HAL::InterfaceWorkgroupIDOp, gpu::BlockIdOp>,
-                  HALInterfaceWorkgroupOpsConverter<
-                      IREE::HAL::InterfaceWorkgroupCountOp, gpu::GridDimOp>>(
+  patterns.add<HALInterfaceWorkgroupOpsConverter<
+                   IREE::HAL::InterfaceWorkgroupIDOp, gpu::BlockIdOp>,
+               HALInterfaceWorkgroupOpsConverter<
+                   IREE::HAL::InterfaceWorkgroupSizeOp, gpu::BlockDimOp>,
+               HALInterfaceWorkgroupOpsConverter<
+                   IREE::HAL::InterfaceWorkgroupCountOp, gpu::GridDimOp>>(
       patterns.getContext());
-}
-
-std::unique_ptr<OperationPass<ModuleOp>> createTestLLVMGPULegalizePass() {
-  return std::make_unique<TestLLVMGPULegalizeOpPass>();
 }
 
 static IntegerAttr wrapNumericMemorySpace(MLIRContext *ctx, unsigned space) {

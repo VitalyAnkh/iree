@@ -24,13 +24,13 @@
 //
 //===---------------------------------------------------------------------===//
 
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtDialect.h"
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtOps.h"
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "iree/compiler/Utils/ElementPackingUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -38,6 +38,9 @@
 #include "mlir/Transforms/DialectConversion.h"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_TYPEPROPAGATIONPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 /// Insert instructions to convert from one element type to another.
 static Value convertElementType(OpBuilder &b, Location loc, Type targetType,
@@ -75,6 +78,13 @@ static std::optional<Type> getLegalizedType(Type t) {
 }
 
 namespace {
+
+/// Materialize
+Value materializeAsConvertElementType(OpBuilder &builder, Type type,
+                                      ValueRange inputs, Location loc) {
+  assert(inputs.size() == 1 && "expected exactly one input");
+  return convertElementType(builder, loc, type, inputs[0]);
+}
 
 /// Type converter to use for type propagation.
 struct TypePropagationTypeConverter : public TypeConverter {
@@ -225,29 +235,14 @@ struct GenericOpTypePropagation
       }
       signatureConverter.addInputs(index, legalizedArgType.value());
     }
-    rewriter.applySignatureConversion(&modifiedOpRegion, signatureConverter);
+    rewriter.applySignatureConversion(&modifiedOpRegion.front(),
+                                      signatureConverter, getTypeConverter());
 
     // 6. Introduce scalar conversion operations to convert back to the
     // original scalar type.
     {
       OpBuilder::InsertionGuard g(rewriter);
       Block *entryBlock = modifiedOp.getBlock();
-      for (auto modifiedOperandIndex : modifiedOperandIndex) {
-        OpOperand *modifiedOpOperand =
-            &modifiedOp->getOpOperand(modifiedOperandIndex);
-        BlockArgument source =
-            modifiedOp.getMatchingBlockArgument(modifiedOpOperand);
-        Type destType = getElementTypeOrSelf(
-            genericOp.getOperand(modifiedOperandIndex).getType());
-
-        // 6a. If the value of the argument is used the argument is in the
-        // legalized type. Convert it to a value that is in the original
-        // element type for replacement of all uses in the block.
-        rewriter.setInsertionPointToStart(entryBlock);
-        Value replacement =
-            convertElementType(rewriter, source.getLoc(), destType, source);
-        rewriter.replaceUsesOfBlockArgument(source, replacement);
-      }
 
       // 6b. If any of the operands modified were outputs, the yield values
       // need to be modified as well.
@@ -367,27 +362,14 @@ struct IREELinalgExtScatterTypePropagation
     }
     signatureConverter.addInputs(0, legalizedArgType.value());
     signatureConverter.addInputs(1, legalizedArgType.value());
-    rewriter.applySignatureConversion(&modifiedOpRegion, signatureConverter);
+    rewriter.applySignatureConversion(&modifiedOpRegion.front(),
+                                      signatureConverter, getTypeConverter());
 
     {
       // Introduce scalar conversion operations to convert back to the original
       // scalar type.
       OpBuilder::InsertionGuard g(rewriter);
       Block *entryBlock = &modifiedOp->getRegion(0).getBlocks().front();
-      BlockArgument inputArg = entryBlock->getArgument(0);
-      BlockArgument outputArg = entryBlock->getArgument(1);
-
-      auto destType = getElementTypeOrSelf(inputType);
-      rewriter.setInsertionPointToStart(entryBlock);
-
-      Value replacementInput =
-          convertElementType(rewriter, inputArg.getLoc(), destType, inputArg);
-      rewriter.replaceUsesOfBlockArgument(entryBlock->getArgument(0),
-                                          replacementInput);
-      Value replacementOutput =
-          convertElementType(rewriter, outputArg.getLoc(), destType, outputArg);
-      rewriter.replaceUsesOfBlockArgument(entryBlock->getArgument(1),
-                                          replacementOutput);
 
       // If the output is of an illegal type, the yield value needs to be
       // modified
@@ -443,31 +425,8 @@ struct IREELinalgExtSortTypePropagation
       }
       signatureConverter.addInputs(index, legalizedArgType.value());
     }
-    rewriter.applySignatureConversion(&modifiedOpRegion, signatureConverter);
-
-    {
-      // Introduce scalar conversion operations to convert back to the original
-      // scalar type.
-      OpBuilder::InsertionGuard g(rewriter);
-      Block *entryBlock = &modifiedOp->getRegion(0).getBlocks().front();
-      for (auto [index, operand] : llvm::enumerate(sortOp->getOpOperands())) {
-        BlockArgument firstInputArg = entryBlock->getArgument(index * 2);
-        BlockArgument secondInputArg = entryBlock->getArgument(index * 2 + 1);
-
-        auto destType = getElementTypeOrSelf(operand.get().getType());
-        rewriter.setInsertionPointToStart(entryBlock);
-        if (destType != getElementTypeOrSelf(legalizedResultTypes[index])) {
-          Value replacementFirstInput = convertElementType(
-              rewriter, firstInputArg.getLoc(), destType, firstInputArg);
-          rewriter.replaceUsesOfBlockArgument(firstInputArg,
-                                              replacementFirstInput);
-          Value replacementSecondInput = convertElementType(
-              rewriter, secondInputArg.getLoc(), destType, secondInputArg);
-          rewriter.replaceUsesOfBlockArgument(secondInputArg,
-                                              replacementSecondInput);
-        }
-      }
-    }
+    rewriter.applySignatureConversion(&modifiedOpRegion.front(),
+                                      signatureConverter, getTypeConverter());
     rewriter.replaceOp(sortOp, modifiedOp->getResults());
     return success();
   }
@@ -535,7 +494,8 @@ struct LegalizeResultElementType : public ConversionPattern {
         doSignatureConversion |= argType != legalizedType;
       }
       if (doSignatureConversion) {
-        rewriter.applySignatureConversion(&newOpRegion, signatureConverter);
+        rewriter.applySignatureConversion(&newOpRegion.front(),
+                                          signatureConverter);
       }
     }
     rewriter.replaceOp(op, newOp->getResults());
@@ -558,13 +518,13 @@ struct LegalizeBasicBlocks : public TypePropagationPattern<OpTy> {
       return rewriter.notifyMatchFailure(funcOp,
                                          "failed to convert region types");
     }
-    rewriter.updateRootInPlace(funcOp, []() {});
+    rewriter.modifyOpInPlace(funcOp, []() {});
     return success();
   }
 };
 
-struct TypePropagationPass : public TypePropagationBase<TypePropagationPass> {
-  TypePropagationPass() = default;
+struct TypePropagationPass final
+    : impl::TypePropagationPassBase<TypePropagationPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect>();
   }
@@ -573,6 +533,10 @@ struct TypePropagationPass : public TypePropagationBase<TypePropagationPass> {
     RewritePatternSet patterns(context);
 
     TypePropagationTypeConverter typeConverter;
+    typeConverter.addArgumentMaterialization(materializeAsConvertElementType);
+    typeConverter.addSourceMaterialization(materializeAsConvertElementType);
+    typeConverter.addTargetMaterialization(materializeAsConvertElementType);
+
     patterns.insert<
         ConstantOpTypeConversion, ForwardSourceType<arith::ExtUIOp>,
         ForwardSourceType<arith::TruncIOp>, GenericOpTypePropagation,
@@ -622,9 +586,4 @@ struct TypePropagationPass : public TypePropagationBase<TypePropagationPass> {
   }
 };
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>> createTypePropagationPass() {
-  return std::make_unique<TypePropagationPass>();
-}
-
 } // namespace mlir::iree_compiler

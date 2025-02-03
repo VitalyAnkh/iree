@@ -5,6 +5,7 @@ import numpy as np
 from . import squad_test_data
 from . import test_util
 
+# TODO(#18518): Migrate this file to a new (ideally public) location
 # Source https://tfhub.dev/iree/lite-model/mobilebert/int8/1
 model_path = "https://storage.googleapis.com/iree-model-artifacts/mobilebert-baseline-tf2-quant.tflite"
 
@@ -39,7 +40,7 @@ class MobileBertTest(test_util.TFLiteModelTest):
         )
         # We have confirmed in large scale accuracy tests that differences as large
         # as 5.0 is acceptable. We later further relaxed from 5.0 to 7.0 in
-        # https://github.com/openxla/iree/pull/9337 when quantized Softmax got
+        # https://github.com/iree-org/iree/pull/9337 when quantized Softmax got
         # de-quantized, which should be numerically correct albeit not bit-exact.
         # The actual observed max error was ~ 6.36. The value 7.0 is that rounded up
         # to the next integer.

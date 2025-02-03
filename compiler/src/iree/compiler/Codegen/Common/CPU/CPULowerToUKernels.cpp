@@ -4,16 +4,15 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/builtins/ukernel/exported_bits.h"
-#include "iree/compiler/Codegen/Common/CPU/PassDetail.h"
 #include "iree/compiler/Codegen/Common/CPU/Passes.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenDialect.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenOps.h"
-#include "iree/compiler/Codegen/Dialect/UKernelOps.h"
+#include "iree/compiler/Codegen/Common/EncodingUtils.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
+#include "iree/compiler/Dialect/Encoding/IR/EncodingOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -26,6 +25,9 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_CPULOWERTOUKERNELSPASS
+#include "iree/compiler/Codegen/Common/CPU/Passes.h.inc"
 
 // Returns the CastOpInterface op of the body, if
 //   - the `genericOp` is element-wise with identity maps, and
@@ -45,8 +47,8 @@ getCastOpOfElementWiseCast(linalg::GenericOp genericOp) {
     return std::nullopt;
   }
   Value castIn = castOp->getOperand(0);
-  if (castIn.isa<BlockArgument>() &&
-      castIn.cast<BlockArgument>().getArgNumber() != 0) {
+  if (isa<BlockArgument>(castIn) &&
+      cast<BlockArgument>(castIn).getArgNumber() != 0) {
     return std::nullopt;
   }
   return castOp;
@@ -54,30 +56,18 @@ getCastOpOfElementWiseCast(linalg::GenericOp genericOp) {
 
 namespace {
 class CPULowerToUKernelsPass
-    : public CPULowerToUKernelsBase<CPULowerToUKernelsPass> {
+    : public impl::CPULowerToUKernelsPassBase<CPULowerToUKernelsPass> {
 public:
-  CPULowerToUKernelsPass(bool skipIntermediateRoundings)
-      : skipIntermediateRoundings(skipIntermediateRoundings) {}
-
+  using impl::CPULowerToUKernelsPassBase<
+      CPULowerToUKernelsPass>::CPULowerToUKernelsPassBase;
+  explicit CPULowerToUKernelsPass(bool skipIntermediateRoundings) {
+    this->skipIntermediateRoundings = skipIntermediateRoundings;
+  }
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<IREE::Codegen::IREECodegenDialect>();
   }
 
   void runOnOperation() override;
-
-  LogicalResult initializeOptions(StringRef options) override {
-    if (failed(Pass::initializeOptions(options))) {
-      return failure();
-    }
-    // This option defaults to `true` both in Passes.td and in C++ code.
-    // If either side has `false`, that's a non-default choice, so we let that
-    // override a `true` on the other side.
-    skipIntermediateRoundings &= optionSkipIntermediateRoundings;
-    return success();
-  }
-
-private:
-  bool skipIntermediateRoundings;
 };
 } // namespace
 
@@ -119,11 +109,6 @@ getFnNameAndDefAttrs(const char *ukernelName, RewriterBase &rewriter,
         rewriter.getArrayAttr({rewriter.getStringAttr("processor_data")}));
     result.defAttrs.emplace_back(rewriter.getStringAttr("hal.import.bitcode"),
                                  rewriter.getBoolAttr(true));
-    result.defAttrs.emplace_back(
-        rewriter.getStringAttr("hal.import.cconv"),
-        IREE::HAL::CallingConventionAttr::get(
-            rewriter.getContext(),
-            IREE::HAL::CallingConvention::ParameterStruct));
   }
   return result;
 }
@@ -157,6 +142,19 @@ static Type getElementTypeForUKernel(Value input) {
   return castOpSrcType;
 }
 
+static SmallVector<Type>
+getUKernelGenericReturnTypes(IREE::HAL::ExecutableTargetAttr targetAttr,
+                             Type outType) {
+  SmallVector<Type> returnTypes{outType};
+  if (!isVMVXBackend(targetAttr)) {
+    // Hack to avoid issues with void-returning functions in llvm-cpu.
+    // Note that the first return value, of tensor type, disappears in
+    // bufferization.
+    returnTypes.push_back(IntegerType::get(outType.getContext(), 32));
+  }
+  return returnTypes;
+}
+
 /// Matches an (linalg.fill -> )? linalg.mmt4d operation sequence and converts
 /// it into a iree_codegen.ukernel.mmt4d operation, that is later lowered
 /// into a call to the microkernel.
@@ -179,6 +177,10 @@ matchDAGForUKernel(RewriterBase &rewriter, linalg::Mmt4DOp op,
   if (lhsElemType.isSignlessInteger(8) && rhsElemType.isSignlessInteger(8) &&
       outElemType.isSignlessInteger(32)) {
     flags = IREE_UK_FLAG_MMT4D_TYPE_S8S8S32;
+  } else if (lhsElemType.isSignlessInteger(8) &&
+             rhsElemType.isSignlessInteger(4) &&
+             outElemType.isSignlessInteger(32)) {
+    flags = IREE_UK_FLAG_MMT4D_TYPE_S8S4S32;
   } else if (lhsElemType.isSignlessInteger(16) &&
              rhsElemType.isSignlessInteger(16) &&
              outElemType.isSignlessInteger(32)) {
@@ -227,6 +229,11 @@ matchDAGForUKernel(RewriterBase &rewriter, linalg::Mmt4DOp op,
     flags |= IREE_UK_FLAG_MMT4D_SKIP_INTERMEDIATE_ROUNDINGS;
   }
 
+  // TODO(#15784): drop the fallback flag, instead create a iree_uk_mmt4d_info
+  // ukernel op to query whether the ukernel has fast code for this case, and
+  // preserve the original `linalg.mmt4d` as a fallback in the `else` branch.
+  flags |= IREE_UK_FLAG_MMT4D_ALLOW_GENERIC_FALLBACK_TILE_FUNCTION;
+
   Location loc = op.getLoc();
   Value m = rewriter.create<tensor::DimOp>(loc, lhs, 0);
   Value n = rewriter.create<tensor::DimOp>(loc, rhs, 0);
@@ -244,8 +251,10 @@ matchDAGForUKernel(RewriterBase &rewriter, linalg::Mmt4DOp op,
   Value flagsVal = rewriter.create<arith::ConstantOp>(
       loc, rewriter.getI32IntegerAttr(flags));
   auto fn = getFnNameAndDefAttrs(ukernelName, rewriter, targetAttr);
+  SmallVector<Type> returnTypes =
+      getUKernelGenericReturnTypes(targetAttr, outType);
   auto genericMicroKernelOp = rewriter.create<IREE::Codegen::UKernelGenericOp>(
-      loc, outType, fn.name, ValueRange{lhs, rhs}, out,
+      loc, returnTypes, fn.name, ValueRange{lhs, rhs}, out,
       ValueRange{m, n, k, m0, n0, k0, flagsVal},
       /*fn_def_attrs=*/rewriter.getDictionaryAttr(fn.defAttrs),
       /*strided_outer_dims=*/rewriter.getIndexAttr(1));
@@ -364,12 +373,14 @@ matchDAGForUKernel(RewriterBase &rewriter, tensor::PackOp op,
   Value flagsVal = rewriter.create<arith::ConstantOp>(
       loc, rewriter.getI32IntegerAttr(flags));
   auto fn = getFnNameAndDefAttrs(ukernelName, rewriter, targetAttr);
+  SmallVector<Type> returnTypes =
+      getUKernelGenericReturnTypes(targetAttr, outType);
   auto genericMicroKernelOp = rewriter.create<IREE::Codegen::UKernelGenericOp>(
-      loc, outType, fn.name, in, out,
+      loc, returnTypes, fn.name, in, out,
       ValueRange{in_size0, in_size1, out_size0, out_size1, out_size2, out_size3,
                  paddingVal, flagsVal},
       /*fn_def_attrs=*/rewriter.getDictionaryAttr(fn.defAttrs),
-      /*strided_outer_dims=*/rewriter.getIndexAttr(1));
+      /*strided_outer_dims=*/rewriter.getIndexAttr(2));
   return cast<IREE::Codegen::UKernelOpInterface>(
       genericMicroKernelOp.getOperation());
 }
@@ -450,27 +461,31 @@ matchDAGForUKernel(RewriterBase &rewriter, tensor::UnPackOp op,
   Value flagsVal = rewriter.create<arith::ConstantOp>(
       loc, rewriter.getI32IntegerAttr(flags));
   auto fn = getFnNameAndDefAttrs(ukernelName, rewriter, targetAttr);
+  SmallVector<Type> returnTypes =
+      getUKernelGenericReturnTypes(targetAttr, outType);
   auto genericMicroKernelOp = rewriter.create<IREE::Codegen::UKernelGenericOp>(
-      loc, outType, fn.name, in, out,
+      loc, returnTypes, fn.name, in, out,
       ValueRange{in_size0, in_size1, in_size2, in_size3, out_size0, out_size1,
                  flagsVal},
       /*fn_def_attrs=*/rewriter.getDictionaryAttr(fn.defAttrs),
-      /*strided_outer_dims=*/rewriter.getIndexAttr(1));
+      /*strided_outer_dims=*/rewriter.getIndexAttr(2));
   return cast<IREE::Codegen::UKernelOpInterface>(
       genericMicroKernelOp.getOperation());
 }
 
 static uint32_t
-getFlagForUserAndOperandTypes(IREE::LinalgExt::EncodingUser user,
-                              ArrayRef<Attribute> operandTypes) {
-  if (user != IREE::LinalgExt::EncodingUser::MATMUL ||
-      operandTypes.size() != 3) {
+getFlagForUserAndOperandTypes(IREE::Encoding::EncodingAttr encoding,
+                              ArrayRef<Type> operandTypes) {
+  // There are currently no batch_mmt4d ukernels, so check for no batch
+  // dimension.
+  auto cDims = IREE::Encoding::getEncodingContractionDims(encoding);
+  if (failed(cDims) || !cDims->batch.empty() || operandTypes.size() != 3) {
     return IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_NONE;
   }
 
-  Type lhs = operandTypes[0].cast<TypeAttr>().getValue();
-  Type rhs = operandTypes[1].cast<TypeAttr>().getValue();
-  Type out = operandTypes[2].cast<TypeAttr>().getValue();
+  Type lhs = operandTypes[0];
+  Type rhs = operandTypes[1];
+  Type out = operandTypes[2];
 
   if (lhs.isF32() && rhs.isF32() && out.isF32()) {
     return IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_MATMUL_F32F32F32;
@@ -490,13 +505,13 @@ getFlagForUserAndOperandTypes(IREE::LinalgExt::EncodingUser user,
   }
 }
 
-static uint32_t getFlagForRole(IREE::LinalgExt::EncodingRole role) {
-  switch (role) {
-  case IREE::LinalgExt::EncodingRole::LHS:
+static uint32_t getFlagForIndex(int64_t operandIndex) {
+  switch (operandIndex) {
+  case IREE::Encoding::MATMUL_LHS:
     return IREE_UK_FLAG_QUERY_TILE_SIZES_OPERAND_ROLE_LHS;
-  case IREE::LinalgExt::EncodingRole::RHS:
+  case IREE::Encoding::MATMUL_RHS:
     return IREE_UK_FLAG_QUERY_TILE_SIZES_OPERAND_ROLE_RHS;
-  case IREE::LinalgExt::EncodingRole::RESULT:
+  case IREE::Encoding::MATMUL_RESULT:
     return IREE_UK_FLAG_QUERY_TILE_SIZES_OPERAND_ROLE_RESULT;
   default:
     return IREE_UK_FLAG_QUERY_TILE_SIZES_OPERAND_ROLE_NONE;
@@ -511,7 +526,7 @@ matchDAGForUKernel(RewriterBase &rewriter, IREE::Codegen::QueryTileSizesOp op,
   if (!hasUkernel(targetAttr, ukernelName)) {
     return failure();
   }
-  auto tensorType = op.getTensorType().dyn_cast<RankedTensorType>();
+  auto tensorType = dyn_cast<RankedTensorType>(op.getTensorType());
   if (!tensorType) {
     return rewriter.notifyMatchFailure(op,
                                        "need a ranked tensor type attribute");
@@ -519,8 +534,8 @@ matchDAGForUKernel(RewriterBase &rewriter, IREE::Codegen::QueryTileSizesOp op,
   if (tensorType.getRank() != 2) {
     return rewriter.notifyMatchFailure(op, "only the 2D case is implemented");
   }
-  auto encoding = tensorType.getEncoding()
-                      .dyn_cast_or_null<IREE::LinalgExt::EncodingAttr>();
+  auto encoding =
+      dyn_cast_or_null<IREE::Encoding::EncodingAttr>(tensorType.getEncoding());
   if (!encoding) {
     return rewriter.notifyMatchFailure(op, "no encoding attribute");
   }
@@ -530,14 +545,15 @@ matchDAGForUKernel(RewriterBase &rewriter, IREE::Codegen::QueryTileSizesOp op,
   for (int64_t i : tensorType.getShape()) {
     inputValues.push_back(rewriter.create<arith::ConstantIndexOp>(loc, i));
   }
-  uint32_t flagForUserAndOperandTypes = getFlagForUserAndOperandTypes(
-      encoding.getUser().getValue(), encoding.getElementTypes().getValue());
-  uint32_t flagForRole = getFlagForRole(encoding.getRole().getValue());
-  if (!flagForUserAndOperandTypes || !flagForRole) {
+  uint32_t flagForUserAndOperandTypes =
+      getFlagForUserAndOperandTypes(encoding, encoding.getElementTypesArray());
+  uint32_t flagForIndex =
+      getFlagForIndex(encoding.getOperandIndex().getValue().getZExtValue());
+  if (!flagForUserAndOperandTypes || !flagForIndex) {
     return rewriter.notifyMatchFailure(op, "unhandled encoding");
   }
   inputValues.push_back(rewriter.create<arith::ConstantIntOp>(
-      loc, flagForUserAndOperandTypes | flagForRole, 32));
+      loc, flagForUserAndOperandTypes | flagForIndex, 32));
   auto fn = getFnNameAndDefAttrs(ukernelName, rewriter, targetAttr);
   auto genericMicroKernelOp = rewriter.create<IREE::Codegen::UKernelGenericOp>(
       loc, resultTypes, fn.name, inputValues, /*outs=*/ValueRange{},
@@ -571,7 +587,9 @@ struct LowerToUKernelPattern : OpRewritePattern<OpType> {
       return rewriter.notifyMatchFailure(
           op, "failed to find microkernel op to replace with");
     }
-    rewriter.replaceOp(op, ukernelOp.value()->getResults());
+    SmallVector<Value> results = ukernelOp.value()->getResults();
+    results.truncate(op->getNumResults());
+    rewriter.replaceOp(op, results);
     return success();
   }
 
@@ -597,25 +615,14 @@ void CPULowerToUKernelsPass::runOnOperation() {
   // performance, and that consideration overrides the benefit of fusions for
   // these ops.
   auto allTargets = [](auto target) { return true; };
-  patterns.insert<LowerToUKernelPattern<linalg::Mmt4DOp>>(
+  patterns.insert<LowerToUKernelPattern<linalg::Mmt4DOp>,
+                  LowerToUKernelPattern<tensor::PackOp>,
+                  LowerToUKernelPattern<tensor::UnPackOp>>(
       context, allTargets, skipIntermediateRoundings);
-  // These patterns could in principle be used on LLVMCPU, not just VMVX, but
-  // we choose not to, for two reasons:
-  // 1. Codegen for these ops is thought to be good enough, that we do not
-  //    really need microkernels.
-  // 2. Fusions matter particularly for pack/unpack ops due to the memcpy-like
-  //    nature of these ops and the typical patterns ML workload offering
-  //    fusions opportunities there. The combinatorics of what could get fused
-  //    there seem unbounded, so any attempt to add microkernels for fusions
-  //    would have difficulty scaling.
-  patterns.insert<LowerToUKernelPattern<tensor::PackOp>,
-                  LowerToUKernelPattern<tensor::UnPackOp>>(context,
-                                                           isVMVXBackend);
   // These patterns are inherently specific to the VMVX backend.
   patterns.insert<LowerToUKernelPattern<IREE::Codegen::QueryTileSizesOp>>(
       context, isVMVXBackend);
-  if (failed(
-          applyPatternsAndFoldGreedily(getOperation(), std::move(patterns)))) {
+  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
     return signalPassFailure();
   }
 }

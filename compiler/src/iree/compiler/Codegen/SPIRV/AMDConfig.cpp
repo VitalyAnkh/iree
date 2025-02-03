@@ -10,14 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "iree/compiler/Codegen/Dialect/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/SPIRV/KernelConfig.h"
-#include "iree/compiler/Codegen/Utils/Utils.h"
-#include "llvm/Support/Debug.h"
+#include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/IR/BuiltinOps.h"
 
 #define DEBUG_TYPE "iree-spirv-amd-config"
 
@@ -34,25 +30,24 @@ constexpr unsigned AMDNumSubgroupsPerWorkgroup = 4;
 constexpr unsigned AMDNumMNTilesPerSubgroup = 8;
 
 static LogicalResult setAMDMatmulConfig(linalg::LinalgOp op,
-                                        const spirv::TargetEnv &targetEnv) {
+                                        IREE::GPU::TargetAttr target) {
   if (succeeded(setCooperativeMatrixConfig(
-          targetEnv, op, AMDNumSubgroupsPerWorkgroup, AMDNumMNTilesPerSubgroup,
+          target, op, AMDNumSubgroupsPerWorkgroup, AMDNumMNTilesPerSubgroup,
           AMDCoopMatrixSoftwarePipelineDepth,
           AMDCoopMatrixSoftwarePipelineStoreStage)))
     return success();
 
-  spirv::ResourceLimitsAttr limits = targetEnv.getResourceLimits();
-  const int subgroupSize = limits.getSubgroupSize();
+  int subgroupSize = target.getPreferredSubgroupSize();
   const std::array<int64_t, 2> workgroupXY = {subgroupSize / 2, 8};
   std::array<int64_t, 3> threadMNK;
   auto inputType =
       llvm::cast<ShapedType>(op.getDpsInputOperand(0)->get().getType());
-  if (inputType.getElementType().getIntOrFloatBitWidth() == 16) {
+  if (IREE::Util::getTypeBitWidth(inputType.getElementType()) == 16) {
     threadMNK = {8, 8, 32};
   } else {
     threadMNK = {8, 4, 16};
   }
-  return setMatmulOpConfig(limits, op, workgroupXY, threadMNK,
+  return setMatmulOpConfig(target, op, workgroupXY, threadMNK,
                            /*enablePromotion=*/true,
                            AMDSimtSoftwarePipelineDepth,
                            AMDSimtSoftwarePipelineStoreStage);
@@ -70,14 +65,13 @@ static LogicalResult setAMDMatmulConfig(linalg::LinalgOp op,
 // * Max 20 waves per SIMD32
 // * Max 64KB LDS per workgroup
 
-LogicalResult setAMDCodeGenConfig(const spirv::TargetEnv &targetEnv,
+LogicalResult setAMDCodeGenConfig(IREE::GPU::TargetAttr target,
                                   Operation *rootOp) {
-  spirv::ResourceLimitsAttr limits = targetEnv.getResourceLimits();
-  int subgroupSize = limits.getSubgroupSize();
+  int subgroupSize = target.getPreferredSubgroupSize();
 
   if (auto linalgOp = dyn_cast<linalg::LinalgOp>(rootOp)) {
     if (isMatmulOrBatchMatmul(linalgOp))
-      return setAMDMatmulConfig(linalgOp, targetEnv);
+      return setAMDMatmulConfig(linalgOp, target);
   }
 
   if (auto convOp = dyn_cast<linalg::ConvolutionOpInterface>(rootOp)) {

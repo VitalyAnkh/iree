@@ -29,7 +29,7 @@ bool emitEncodeFnDefs(const llvm::RecordKeeper &recordKeeper, raw_ostream &os) {
   auto opcodes = recordKeeper.getAllDerivedDefinitions("VM_OPC");
   for (const auto *opcode : opcodes) {
     auto symbol = opcode->getValueAsString("symbol");
-    if (symbol.startswith("Prefix")) {
+    if (symbol.starts_with("Prefix")) {
       prefixOpcodes[symbol] = opcode->getValueAsInt("value");
     }
   }
@@ -62,23 +62,31 @@ bool emitEncodeFnDefs(const llvm::RecordKeeper &recordKeeper, raw_ostream &os) {
     }
 
     os << "  if (";
-    auto printOneCondition = [&](Record *encodingExpr) {
+    auto printOneCondition = [&](const Record *encodingExpr) {
       StringRef expr = encodingExpr->getValueAsString("expr");
       std::vector<StringRef> params =
           encodingExpr->getValueAsListOfStrings("params");
-      assert(params.size() <= 1);
 
-      // Note the following relies on the fact that only encoding expressions
-      // involving operands/results have one parameter. It's a bit inflexible,
+      // Note the following relies on the fact that encoding expressions
+      // have zero or one parameter. It's a bit inflexible,
       // but it works for now and we can change when the extra flexibility is
       // really needed.
-      std::string param;
-      if (params.size() == 1) {
-        param = "get" + llvm::convertToCamelFromSnakeCase(params.front(), true);
-      } else {
-        param = expr;
+      switch (params.size()) {
+      case 0: {
+        os << "failed(" << formatv(expr.data()) << ")";
+        break;
       }
-      os << formatv("failed({0})", formatv(expr.data(), param));
+      case 1: {
+        std::string param =
+            "get" + llvm::convertToCamelFromSnakeCase(params.front(), true);
+        os << "failed(" << formatv(expr.data(), param) << ")";
+        break;
+      }
+      default: {
+        assert(false && "unhandled parameter size");
+        break;
+      }
+      }
     };
     interleave(encodingExprs, os, printOneCondition, " ||\n      ");
     os << ") {\n";

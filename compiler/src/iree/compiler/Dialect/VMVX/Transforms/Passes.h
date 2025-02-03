@@ -9,7 +9,6 @@
 
 #include "iree/compiler/Dialect/VMVX/IR/VMVXOps.h"
 #include "llvm/ADT/StringMap.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -23,7 +22,7 @@ namespace mlir::iree_compiler::IREE::VMVX {
 
 // Adds a set of passes to the given pass manager that configure the required
 // VMVX transforms and tiling parameters.
-void buildVMVXConfigurationPassPipeline(OpPassManager &passManager);
+void buildVMVXConfigurationPassPipeline(OpPassManager &variantPassManager);
 
 // Adds a set of passes to the given pass manager that run the required VMVX
 // transforms in the canonical order.
@@ -36,24 +35,14 @@ void buildVMVXConfigurationPassPipeline(OpPassManager &passManager);
 //   buildVMVXConfigurationPassPipeline & run
 //   buildVMVXTransformPassPipeline & run
 //   <serialize VM module>
-void buildVMVXTransformPassPipeline(OpPassManager &passManager);
-
-//===----------------------------------------------------------------------===//
-// Dialect conversion
-//===----------------------------------------------------------------------===//
-
-// Converts from various dialects (HAL, standard, etc) to the VMVX dialect.
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createConversionPass();
-
-// Materializes executable constant global values.
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createMaterializeConstantsPass();
-
-// Resolves any outstanding get_buffer_descriptor ops.
-std::unique_ptr<OperationPass<>> createResolveBufferDescriptorsPass();
+void buildVMVXTransformPassPipeline(OpPassManager &variantPassManager);
 
 //===----------------------------------------------------------------------===//
 // Register all Passes
 //===----------------------------------------------------------------------===//
+
+#define GEN_PASS_DECL
+#include "iree/compiler/Dialect/VMVX/Transforms/Passes.h.inc"
 
 void registerVMVXPasses();
 

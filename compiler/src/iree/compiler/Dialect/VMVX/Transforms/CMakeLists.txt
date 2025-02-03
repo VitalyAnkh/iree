@@ -23,12 +23,12 @@ iree_cc_library(
   NAME
     PassHeaders
   HDRS
-    "PassDetail.h"
     "Passes.h"
     "Passes.h.inc"
   DEPS
     ::PassesIncGen
     MLIRPass
+    MLIRTransformUtils
     MLIRTransforms
   PUBLIC
 )
@@ -45,7 +45,6 @@ iree_cc_library(
     "ResolveBufferDescriptors.cpp"
   DEPS
     ::PassHeaders
-    IREELinalgExtPasses
     LLVMSupport
     MLIRAffineDialect
     MLIRAffineToStandard
@@ -56,6 +55,7 @@ iree_cc_library(
     MLIRBufferizationDialect
     MLIRFuncDialect
     MLIRFuncTransforms
+    MLIRFunctionInterfaces
     MLIRIR
     MLIRLinalgDialect
     MLIRLinalgTransforms
@@ -69,6 +69,7 @@ iree_cc_library(
     MLIRSupport
     MLIRTensorDialect
     MLIRTosaToArith
+    MLIRTransformUtils
     MLIRTransforms
     MLIRVectorDialect
     MLIRVectorToSCF
@@ -80,6 +81,7 @@ iree_cc_library(
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::HAL::IR::HALDialect
     iree::compiler::Dialect::HAL::Transforms
+    iree::compiler::Dialect::LinalgExt::Transforms
     iree::compiler::Dialect::Util::Conversion
     iree::compiler::Dialect::Util::Conversion::MemRefToUtil
     iree::compiler::Dialect::Util::IR

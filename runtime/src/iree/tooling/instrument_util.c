@@ -39,7 +39,7 @@ static iree_status_t iree_tooling_write_iovec(iree_vm_ref_t iovec, FILE* file) {
         z0, iree_hal_buffer_map_range(iree_hal_buffer_view_buffer(buffer_view),
                                       IREE_HAL_MAPPING_MODE_SCOPED,
                                       IREE_HAL_MEMORY_ACCESS_READ, 0,
-                                      IREE_WHOLE_BUFFER, &mapping));
+                                      IREE_HAL_WHOLE_BUFFER, &mapping));
     write_ok = fwrite(mapping.contents.data, 1, mapping.contents.data_length,
                       file) == mapping.contents.data_length;
     IREE_IGNORE_ERROR(iree_hal_buffer_unmap_range(&mapping));
@@ -94,7 +94,7 @@ iree_status_t iree_tooling_process_instrument_data(
       // Find the query function, if present.
       iree_vm_function_t query_func;
       iree_status_t lookup_status = iree_vm_module_lookup_function_by_name(
-          module, IREE_VM_FUNCTION_LINKAGE_EXPORT,
+          module, IREE_VM_FUNCTION_LINKAGE_EXPORT_OPTIONAL,
           IREE_SV("__query_instruments"), &query_func);
       if (!iree_status_is_ok(lookup_status)) {
         // Skip missing/invalid query function.

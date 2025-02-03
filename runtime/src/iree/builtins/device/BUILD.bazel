@@ -6,7 +6,7 @@
 
 load("//build_tools/bazel:build_defs.oss.bzl", "iree_cmake_extra_content", "iree_runtime_cc_library")
 load("//build_tools/bazel:iree_bitcode_library.bzl", "iree_bitcode_library")
-load("//build_tools/embed_data:build_defs.bzl", "c_embed_data")
+load("//build_tools/embed_data:build_defs.bzl", "iree_c_embed_data")
 
 package(
     default_visibility = ["//visibility:public"],
@@ -52,6 +52,13 @@ endif()
 # TODO(benvanik): rule for building a matrix of bitcode files.
 
 iree_bitcode_library(
+    name = "libdevice_aarch64_sme",
+    srcs = BITCODE_SRCS + ["arch/arm_64/sme_abi.c"],
+    arch = "arm_64",
+    internal_hdrs = BITCODE_HDRS,
+)
+
+iree_bitcode_library(
     name = "libdevice_wasm32_generic",
     srcs = BITCODE_SRCS,
     arch = "wasm_32",
@@ -65,9 +72,10 @@ iree_bitcode_library(
     internal_hdrs = BITCODE_HDRS,
 )
 
-c_embed_data(
+iree_c_embed_data(
     name = "libdevice_bitcode",
     srcs = [
+        ":libdevice_aarch64_sme.bc",
         ":libdevice_wasm32_generic.bc",
         ":libdevice_wasm64_generic.bc",
     ],

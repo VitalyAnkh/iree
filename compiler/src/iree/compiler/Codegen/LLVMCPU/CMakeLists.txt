@@ -23,7 +23,6 @@ iree_cc_library(
   NAME
     PassHeaders
   HDRS
-    "PassDetail.h"
     "Passes.h"
     "Passes.h.inc"
   DEPS
@@ -31,8 +30,9 @@ iree_cc_library(
     MLIRLinalgTransforms
     MLIRMemRefDialect
     MLIRPass
+    MLIRTransformUtils
     MLIRTransforms
-    iree::compiler::Codegen::Dialect::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Utils
   PUBLIC
@@ -52,6 +52,7 @@ iree_cc_library(
     "DispatchABI.cpp"
     "ExpandF16OpToF32Pass.cpp"
     "KernelDispatch.cpp"
+    "LLVMCPU2DScalableTo1DScalable.cpp"
     "LLVMCPUAssignConstantOrdinals.cpp"
     "LLVMCPUAssignImportOrdinals.cpp"
     "LLVMCPUCheckIRBeforeLLVMConversion.cpp"
@@ -63,11 +64,14 @@ iree_cc_library(
     "LLVMCPUSelectLoweringStrategy.cpp"
     "LLVMCPUSplitReduction.cpp"
     "LLVMCPUSynchronizeSymbolVisibility.cpp"
-    "LLVMCPUTensorPad.cpp"
     "LLVMCPUTile.cpp"
     "LLVMCPUTileAndFuse.cpp"
+    "LLVMCPUTileRootAndFuseProducerConsumer.cpp"
     "LLVMCPUUnfuseFMAOps.cpp"
-    "LLVMCPUVectorLowering.cpp"
+    "LLVMCPUVectorShapeCastLowering.cpp"
+    "LLVMCPUVectorTransposeLowering.cpp"
+    "LLVMCPUVerifyVectorSizeLegality.cpp"
+    "LLVMCPUVirtualVectorLowering.cpp"
     "Passes.cpp"
     "TargetMLTransformInfo.cpp"
     "Utils.cpp"
@@ -76,9 +80,6 @@ iree_cc_library(
   DEPS
     ::PassHeaders
     ::PassesIncGen
-    IREELinalgExtDialect
-    IREELinalgExtPasses
-    IREELinalgExtUtils
     IREELinalgTransformDialect
     IREELinalgTransformDialectPasses
     LLVMBinaryFormat
@@ -89,11 +90,18 @@ iree_cc_library(
     MLIRAffineUtils
     MLIRAnalysis
     MLIRArithDialect
+    MLIRArithToArmSME
     MLIRArithToLLVM
     MLIRArithTransforms
     MLIRArmNeon2dToIntr
     MLIRArmNeonDialect
+    MLIRArmNeonTransforms
+    MLIRArmSMEToLLVM
+    MLIRArmSMEToLLVMIRTranslation
+    MLIRArmSMEToSCF
     MLIRArmSMETransforms
+    MLIRArmSVEDialect
+    MLIRArmSVETransforms
     MLIRBufferizationDialect
     MLIRComplexToLLVM
     MLIRComplexToStandard
@@ -101,7 +109,9 @@ iree_cc_library(
     MLIRFuncDialect
     MLIRFuncToLLVM
     MLIRFuncTransforms
+    MLIRFunctionInterfaces
     MLIRIR
+    MLIRIndexToLLVM
     MLIRLLVMCommonConversion
     MLIRLLVMDialect
     MLIRLinalgDialect
@@ -126,23 +136,28 @@ iree_cc_library(
     MLIRTosaDialect
     MLIRTosaToArith
     MLIRTransformDialect
+    MLIRTransformUtils
     MLIRTransforms
     MLIRValueBoundsOpInterface
     MLIRVectorDialect
+    MLIRVectorToArmSME
     MLIRVectorToLLVM
     MLIRVectorToSCF
     MLIRVectorTransforms
+    MLIRX86VectorTransforms
     iree::compiler::Codegen::Common
     iree::compiler::Codegen::Common::CPU::CommonCPUPasses
     iree::compiler::Codegen::Common::TransformDialectInterpreterPass
-    iree::compiler::Codegen::Dialect::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
     iree::compiler::Codegen::Interfaces::PartitionableLoopsInterface
-    iree::compiler::Codegen::TransformStrategies::CPU
     iree::compiler::Codegen::Transforms
     iree::compiler::Codegen::Utils
     iree::compiler::Dialect::Flow::IR
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::HAL::IR::HALDialect
+    iree::compiler::Dialect::LinalgExt::IR
+    iree::compiler::Dialect::LinalgExt::Transforms
+    iree::compiler::Dialect::LinalgExt::Utils
     iree::compiler::Dialect::Util::IR
     iree::compiler::Dialect::Util::Transforms
     iree::compiler::Utils

@@ -41,9 +41,9 @@ iree_cc_library(
     iree::hal::local
     iree::hal::local::executable_environment
     iree::hal::local::executable_library
-    iree::hal::utils::buffer_transfer
+    iree::hal::utils::deferred_command_buffer
     iree::hal::utils::file_transfer
-    iree::hal::utils::memory_file
+    iree::hal::utils::files
     iree::hal::utils::resource_set
     iree::hal::utils::semaphore_base
     iree::task

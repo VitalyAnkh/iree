@@ -19,6 +19,16 @@ function(fetch_cuda_toolkit)
   set(CUDAToolkit_ROOT ${_ACTUAL_DOWNLOAD_PATH} PARENT_SCOPE)
 endfunction()
 
+function(clear_cuda_toolkit_cache_garbage)
+  # This is a workaround for CMake bug
+  # when having a older than required system version of CUDA.
+  # https://gitlab.kitware.com/cmake/cmake/-/issues/22010
+  unset(CUDAToolkit_BIN_DIR CACHE)
+  unset(CUDAToolkit_NVCC_EXECUTABLE CACHE)
+  unset(_cmake_CUDAToolkit_implicit_link_directories CACHE)
+  unset(_cmake_CUDAToolkit_include_directories CACHE)
+endfunction()
+
 if(DEFINED ENV{IREE_CUDA_DEPS_DIR})
   # We define the magic IREE_CUDA_DEPS_DIR env var in our CI docker images if we
   # have a stripped down CUDA toolkit suitable for compiling available. We
@@ -44,15 +54,13 @@ else()
         # Download succeeded.
         message(STATUS "Using downloaded CUDA toolkit: ${CUDAToolkit_ROOT}")
         set(CUDAToolkit_ROOT "${CUDAToolkit_ROOT}" PARENT_SCOPE)
-        # For some reason having the BIN_DIR set wrong can cause mayhem. Just make
-        # sure it is right.
-        set(CUDAToolkit_BIN_DIR "${CUDAToolkit_ROOT}/bin" PARENT_SCOPE)
+        clear_cuda_toolkit_cache_garbage()
       else()
         message(SEND_ERROR "Failed to download a CUDA toolkit. Check the logs and/or set CUDAToolkit_ROOT to an existing installation.")
       endif()
     endif()
   endif()
-  find_package(CUDAToolkit REQUIRED)
+  find_package(CUDAToolkit ${IREE_CUDA_MIN_VERSION_REQUIRED} REQUIRED)
 endif()
 
 # Locate the libdevice file.
@@ -108,6 +116,13 @@ endif()
 # Targets that IREE depends on which encapsulate access to CUDA.
 ################################################################################
 
+# We don't install any headers because their only use is in built code
+# (not public).
+set(IREE_HDRS_ROOT_PATH OFF)
+# Considered part of the runtime. See runtime/src/CMakeLists.txt.
+set(IREE_INSTALL_LIBRARY_TARGETS_DEFAULT_COMPONENT IREEDevLibraries)
+set(IREE_INSTALL_LIBRARY_TARGETS_DEFAULT_EXPORT_SET Runtime)
+
 iree_c_embed_data(
   PACKAGE
     iree_cuda
@@ -121,10 +136,15 @@ iree_c_embed_data(
     "iree_cuda/libdevice_embedded.h"
   INCLUDES
     # Allows an include like "iree_cuda/libdevice_embedded.h"
-    "${CMAKE_CURRENT_BINARY_DIR}"
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
   FLATTEN
   PUBLIC
 )
+
+# Make include dirs only for the BUILD_INTERFACE
+set(_include_dirs ${CUDAToolkit_INCLUDE_DIRS})
+list(TRANSFORM _include_dirs PREPEND "$<BUILD_INTERFACE:")
+list(TRANSFORM _include_dirs APPEND ">")
 
 iree_cc_library(
   PACKAGE
@@ -132,5 +152,5 @@ iree_cc_library(
   NAME
     headers
   INCLUDES
-    ${CUDAToolkit_INCLUDE_DIRS}
+    ${_include_dirs}
 )

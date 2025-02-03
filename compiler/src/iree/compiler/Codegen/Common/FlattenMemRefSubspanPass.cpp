@@ -33,14 +33,12 @@
 
 #include <memory>
 
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
-#include "iree/compiler/Codegen/Dialect/UKernelOps.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
@@ -54,6 +52,7 @@
 #include "mlir/IR/DialectResourceBlobManager.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -61,6 +60,9 @@
 #define DEBUG_TYPE "iree-flatten-memref-subspan"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_FLATTENMEMREFSUBSPANPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 namespace {
 
@@ -94,7 +96,7 @@ struct FlattenMemRefTypeConverter final : public TypeConverter {
     addConversion([](MemRefType type) -> std::optional<Type> {
       int64_t offset;
       SmallVector<int64_t> strides;
-      if (failed(getStridesAndOffset(type, strides, offset))) {
+      if (failed(type.getStridesAndOffset(strides, offset))) {
         return nullptr;
       }
       // Since the memref gets linearized, use a stride 1, offset 0.
@@ -283,8 +285,8 @@ struct FlattenBindingSubspan final
 
     auto newOffset = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     auto newOp = rewriter.create<IREE::HAL::InterfaceBindingSubspanOp>(
-        subspanOp.getLoc(), newType, subspanOp.getSet(), subspanOp.getBinding(),
-        subspanOp.getDescriptorType(), newOffset, dynamicShape,
+        subspanOp.getLoc(), newType, subspanOp.getLayout(),
+        subspanOp.getBinding(), newOffset, dynamicShape,
         subspanOp.getAlignmentAttr(), subspanOp.getDescriptorFlagsAttr());
 
     Value replacement = newOp;
@@ -327,8 +329,8 @@ struct FlattenReinterpretCast
       return rewriter.notifyMatchFailure(op, "unhandled non-zero offset");
     }
 
-    rewriter.updateRootInPlace(op,
-                               [&] { op->setOperand(0, adaptor.getSource()); });
+    rewriter.modifyOpInPlace(op,
+                             [&] { op->setOperand(0, adaptor.getSource()); });
     return success();
   }
 };
@@ -352,7 +354,7 @@ static Value linearizeIndices(Value sourceValue, ValueRange indices,
   // dynamic.
   SmallVector<int64_t> strides;
   int64_t offset;
-  if (succeeded(getStridesAndOffset(sourceType, strides, offset))) {
+  if (succeeded(sourceType.getStridesAndOffset(strides, offset))) {
     // The memref itself might have an offset, but we should not account for it
     // when computing the linearization. The original memref might be
     // `memref<?x?xf32, strided<[?, ?], offset: ?>`
@@ -740,11 +742,8 @@ struct RemoveDynamicCastOp final : public OpRewritePattern<memref::CastOp> {
 // Pass
 //===----------------------------------------------------------------------===//
 
-struct FlattenMemRefSubspanPass
-    : public FlattenMemRefSubspanBase<FlattenMemRefSubspanPass> {
-  FlattenMemRefSubspanPass() {}
-  FlattenMemRefSubspanPass(const FlattenMemRefSubspanPass &pass) {}
-
+struct FlattenMemRefSubspanPass final
+    : impl::FlattenMemRefSubspanPassBase<FlattenMemRefSubspanPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<affine::AffineDialect, memref::MemRefDialect>();
   }
@@ -758,7 +757,7 @@ struct FlattenMemRefSubspanPass
     // This pass currently doesn't support alignment hints so remove them first.
     RewritePatternSet patterns(context);
     patterns.add<RemoveAssumeAlignOp>(context);
-    (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+    (void)applyPatternsGreedily(getOperation(), std::move(patterns));
 
     RewritePatternSet flattenPatterns(context);
 
@@ -880,8 +879,8 @@ struct FlattenMemRefSubspanPass
     // Fold subviews if any new oportuinity has been created.
     RewritePatternSet foldSubviewPatterns(context);
     memref::populateFoldMemRefAliasOpPatterns(foldSubviewPatterns);
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(foldSubviewPatterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(),
+                                     std::move(foldSubviewPatterns)))) {
       return signalPassFailure();
     }
 
@@ -895,17 +894,12 @@ struct FlattenMemRefSubspanPass
     memref::SubViewOp::getCanonicalizationPatterns(cleanupPatterns, context);
     cleanupPatterns.add<RemoveDynamicCastOp>(context);
 
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(cleanupPatterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(),
+                                     std::move(cleanupPatterns)))) {
       return signalPassFailure();
     }
   }
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<ModuleOp>> createFlattenMemRefSubspanPass() {
-  return std::make_unique<FlattenMemRefSubspanPass>();
-}
-
 } // namespace mlir::iree_compiler

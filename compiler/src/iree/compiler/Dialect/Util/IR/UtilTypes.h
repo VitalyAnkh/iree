@@ -20,6 +20,13 @@
 #include "mlir/IR/TypeSupport.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Types.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+
+#include <numeric>
+
+// clang-format off: must be included after all LLVM/MLIR headers.
+#include "iree/compiler/Dialect/Util/IR/UtilEnums.h.inc" // IWYU pragma: keep
+// clang-format on
 
 namespace mlir::iree_compiler::IREE::Util {
 
@@ -55,6 +62,7 @@ enum class StatusCode : int32_t {
   DataLoss = 15,
   Unauthenticated = 16,
   Deferred = 17,
+  Incompatible = 18,
   DoNotUseReservedForFutureExpansionUseDefaultInSwitchInstead_ = 20
 };
 
@@ -100,6 +108,11 @@ bool isValueUsableForOp(Value value, Operation *op);
 // Returns true if the move was successful.
 bool tryMoveProducerBefore(Value value, Operation *consumerOp);
 
+// Returns true if the given callable op is public or external (no body).
+// Such callables cannot have their signature changed without (potentially)
+// breaking linking.
+bool isPublicOrExternal(CallableOpInterface callableOp);
+
 //===----------------------------------------------------------------------===//
 // Global and structural interface utilities
 //===----------------------------------------------------------------------===//
@@ -126,6 +139,7 @@ lookupGlobalOp(Operation *accessorOp, SymbolRefAttr globalRefAttr,
 
 namespace detail {
 
+void getAllTiedOperands(Operation *op, SmallVectorImpl<int64_t> &indices);
 std::optional<unsigned> getTiedResultOperandIndex(Operation *op,
                                                   unsigned resultIndex);
 void setTiedResultOperandIndex(Operation *op, unsigned resultIndex,
@@ -145,6 +159,94 @@ void excludeTiedOperandAndResultIndices(
     SmallVector<int64_t> &tiedOperandIndices);
 
 //===----------------------------------------------------------------------===//
+// Forward defines for InferIntDivisibilityOpInterface
+// See implementations in IntegerDivisibility.h.
+//===----------------------------------------------------------------------===//
+
+class ConstantIntDivisibility {
+public:
+  ConstantIntDivisibility() = default;
+  ConstantIntDivisibility(uint64_t udiv, uint64_t sdiv)
+      : udivVal(udiv), sdivVal(sdiv) {}
+
+  bool operator==(const ConstantIntDivisibility &other) const {
+    return udivVal == other.udivVal && sdivVal == other.sdivVal;
+  }
+
+  uint64_t udiv() const { return this->udivVal; }
+  uint64_t sdiv() const { return this->sdivVal; }
+
+  // Returns the union (computed separately for signed and unsigned bounds)
+  // for this range and `other`.
+  ConstantIntDivisibility getUnion(const ConstantIntDivisibility &other) const {
+    return ConstantIntDivisibility(
+        /*udiv=*/std::gcd(udiv(), other.udiv()),
+        /*sdiv=*/std::gcd(sdiv(), other.sdiv()));
+  }
+
+private:
+  uint64_t udivVal;
+  uint64_t sdivVal;
+
+  friend raw_ostream &operator<<(raw_ostream &os,
+                                 const ConstantIntDivisibility &div);
+};
+
+inline raw_ostream &operator<<(raw_ostream &os,
+                               const ConstantIntDivisibility &div) {
+  os << "ConstantIntDivisibility(udiv = " << div.udivVal
+     << ", sdiv = " << div.sdivVal << ")";
+  return os;
+}
+
+class IntegerDivisibility {
+public:
+  IntegerDivisibility(ConstantIntDivisibility value)
+      : value(std::move(value)) {}
+  IntegerDivisibility(
+      std::optional<ConstantIntDivisibility> value = std::nullopt)
+      : value(std::move(value)) {}
+  // Gets the minimum divisibility of 1 that is used to indicate that the value
+  // cannot be analyzed further.
+  static IntegerDivisibility getMinDivisibility() {
+    return IntegerDivisibility(ConstantIntDivisibility(1, 1));
+  }
+
+  bool isUninitialized() const { return !value.has_value(); }
+  const ConstantIntDivisibility &getValue() const {
+    assert(!isUninitialized());
+    return *value;
+  }
+
+  bool operator==(const IntegerDivisibility &rhs) const {
+    return value == rhs.value;
+  }
+
+  static IntegerDivisibility join(const IntegerDivisibility &lhs,
+                                  const IntegerDivisibility &rhs) {
+    if (lhs.isUninitialized())
+      return rhs;
+    if (rhs.isUninitialized())
+      return lhs;
+    return IntegerDivisibility(lhs.getValue().getUnion(rhs.getValue()));
+  }
+
+  void print(raw_ostream &os) const { os << value; }
+
+private:
+  std::optional<ConstantIntDivisibility> value;
+};
+
+inline raw_ostream &operator<<(raw_ostream &os,
+                               const IntegerDivisibility &div) {
+  div.print(os);
+  return os;
+}
+
+using SetIntDivisibilityFn =
+    llvm::function_ref<void(Value, const ConstantIntDivisibility &)>;
+
+//===----------------------------------------------------------------------===//
 // Shape-aware interface utilities
 //===----------------------------------------------------------------------===//
 
@@ -159,8 +261,18 @@ std::optional<ValueRange> findDynamicDims(Value shapedValue, Block *block,
                                           Block::iterator insertionPoint);
 
 // Returns the dynamic dimensions for the value at |idx|.
-ValueRange findVariadicDynamicDims(unsigned idx, ValueRange values,
-                                   ValueRange dynamicDims);
+// |dynamicDims| is zero or more dynamic dimensions corresponding to the
+// |values| list of arbitrary types.
+// Shaped types will return zero or more dynamic dimension values.
+// Sized types will return exactly one value.
+ValueRange findDynamicDimsInList(unsigned idx, ValueRange values,
+                                 ValueRange dynamicDims);
+
+// Returns the size of the size-aware typed value at |idx| in |values|.
+// |dynamicDims| is zero or more dynamic dimensions corresponding to the
+// |values| list of arbitrary types.
+Value findValueSizeInList(unsigned idx, ValueRange values,
+                          ValueRange dynamicDims);
 
 // Returns dimension values for each dynamic dimension of the given |value|.
 // |value| must be a ShapedType. The returned value range will be empty if the
@@ -197,10 +309,10 @@ static inline uint64_t align(uint64_t value, const APInt &alignment) {
 // Returns the bit-width of the scalar type. If the type is complex, it returns
 // the type of individual elements * 2 (1 for real and 1 for complex).
 static inline unsigned getTypeBitWidth(Type type) {
-  if (auto complexType = type.dyn_cast<ComplexType>()) {
+  if (auto complexType = dyn_cast<ComplexType>(type)) {
     return 2 * complexType.getElementType().getIntOrFloatBitWidth();
   }
-  if (auto vectorType = type.dyn_cast<VectorType>()) {
+  if (auto vectorType = dyn_cast<VectorType>(type)) {
     return vectorType.getNumElements() *
            getTypeBitWidth(vectorType.getElementType());
   }
@@ -230,12 +342,12 @@ static inline unsigned getTypePhysicalStorageBitWidth(Type type) {
 //   getRoundedElementByteWidth(i33) = 8
 //   getRoundedElementByteWidth(complex<f32>) = 8
 static inline int32_t getRoundedElementByteWidth(Type type) {
-  if (auto complexType = type.dyn_cast<ComplexType>()) {
+  if (auto complexType = dyn_cast<ComplexType>(type)) {
     return 2 * getRoundedElementByteWidth(complexType.getElementType());
   }
   // TODO(ravishankarm): evaluate if this vector packing works with sub-byte
   // element types.
-  if (auto vectorType = type.dyn_cast<VectorType>()) {
+  if (auto vectorType = dyn_cast<VectorType>(type)) {
     return vectorType.getNumElements() *
            getRoundedElementByteWidth(vectorType.getElementType());
   }

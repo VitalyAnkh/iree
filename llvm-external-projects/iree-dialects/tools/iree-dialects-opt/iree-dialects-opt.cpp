@@ -5,18 +5,15 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree-dialects/Dialect/Input/InputDialect.h"
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtDialect.h"
-#include "iree-dialects/Dialect/LinalgExt/Passes/Passes.h"
-#include "iree-dialects/Dialect/LinalgExt/TransformOps/LinalgExtTransformOps.h"
 #include "iree-dialects/Dialect/LinalgTransform/Passes.h"
 #include "iree-dialects/Dialect/LinalgTransform/StructuredTransformOpsExt.h"
-#include "iree-dialects/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Async/IR/Async.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
 #include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
@@ -43,13 +40,6 @@
 using namespace mlir;
 namespace IREE = mlir::iree_compiler::IREE;
 
-namespace mlir {
-namespace test_ext {
-/// Test passes, do not deserve an include.
-void registerTestListenerPasses();
-} // namespace test_ext
-} // namespace mlir
-
 int main(int argc, char **argv) {
   registerAsmPrinterCLOptions();
   registerMLIRContextCLOptions();
@@ -59,8 +49,6 @@ int main(int argc, char **argv) {
       // clang-format off
       // Local dialects
       mlir::iree_compiler::IREE::Input::IREEInputDialect,
-      mlir::iree_compiler::IREE::LinalgExt::IREELinalgExtDialect,
-      mlir::iree_compiler::IREE::VectorExt::IREEVectorExtDialect,
       // Upstream dialects
       mlir::async::AsyncDialect,
       mlir::arith::ArithDialect,
@@ -83,18 +71,14 @@ int main(int argc, char **argv) {
   registerTransformsPasses();
   registerSCFPasses();
   // Local dialect passes.
-  mlir::iree_compiler::IREE::LinalgExt::registerPasses();
-  mlir::linalg::transform::registerTransformDialectInterpreterPass();
   mlir::linalg::transform::registerDropSchedulePass();
-  // Local test passes.
-  mlir::test_ext::registerTestListenerPasses();
 
   // External models.
   mlir::func::registerInlinerExtension(registry);
+  mlir::LLVM::registerInlinerInterface(registry);
   mlir::linalg::registerTilingInterfaceExternalModels(registry);
 
-  registry.addExtensions<IREE::LinalgExt::LinalgExtTransformOpsExtension,
-                         transform_ext::StructuredTransformOpsExtension>();
+  registry.addExtensions<transform_ext::StructuredTransformOpsExtension>();
   mlir::bufferization::registerTransformDialectExtension(registry);
   mlir::linalg::registerTransformDialectExtension(registry);
   mlir::scf::registerTransformDialectExtension(registry);

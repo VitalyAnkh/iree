@@ -194,8 +194,8 @@ static iree_cpuid_regs_t iree_cpuid_raw(uint32_t eax, uint32_t ecx) {
 // The noinline is a tentative work-around for what might be a MSVC miscompile.
 // The symptom is that MSVC builds incorrectly report some CPU features as
 // supported. This only happens for CPU feature bits in the EDX output register.
-__declspec(noinline) static iree_cpuid_regs_t
-    iree_cpuid_raw(uint32_t eax, uint32_t ecx) {
+__declspec(noinline) static iree_cpuid_regs_t iree_cpuid_raw(uint32_t eax,
+                                                             uint32_t ecx) {
   int eax_int;
   int ecx_int;
   memcpy(&eax_int, &eax, sizeof eax);
@@ -324,6 +324,12 @@ static void iree_cpu_initialize_from_platform_riscv_64(uint64_t* out_fields) {
   unsigned long hwcap = getauxval(AT_HWCAP);
   IREE_COPY_BITS(out_fields[0], IREE_CPU_DATA0_RISCV_64_RVV, hwcap,
                  IREE_HWCAP_ISA_V);
+}
+
+#else
+
+static void iree_cpu_initialize_from_platform_riscv_64(uint64_t* out_fields) {
+  // No implementation available. CPU data will be all zeros.
 }
 
 #endif  // IREE_PLATFORM_*

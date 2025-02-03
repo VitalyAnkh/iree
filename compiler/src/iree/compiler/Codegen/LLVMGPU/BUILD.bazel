@@ -12,6 +12,10 @@ package(
     licenses = ["notice"],  # Apache 2.0
 )
 
+################################################################################
+# LLVMGPU common
+################################################################################
+
 iree_gentbl_cc_library(
     name = "PassesIncGen",
     tbl_outs = [
@@ -28,13 +32,12 @@ iree_gentbl_cc_library(
 iree_compiler_cc_library(
     name = "PassHeaders",
     hdrs = [
-        "PassDetail.h",
         "Passes.h",
         "Passes.h.inc",
     ],
     deps = [
         ":PassesIncGen",
-        "//compiler/src/iree/compiler/Codegen/Dialect:IREECodegenDialect",
+        "//compiler/src/iree/compiler/Codegen/Dialect/Codegen/IR:IREECodegenDialect",
         "//compiler/src/iree/compiler/Dialect/HAL/IR",
         "//compiler/src/iree/compiler/Utils",
         "@llvm-project//mlir:LinalgTransforms",
@@ -45,6 +48,40 @@ iree_compiler_cc_library(
     ],
 )
 
+################################################################################
+# ROCDL specific
+################################################################################
+
+iree_gentbl_cc_library(
+    name = "ROCDLPassesIncGen",
+    tbl_outs = [
+        (
+            ["--gen-pass-decls"],
+            "ROCDLPasses.h.inc",
+        ),
+    ],
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "ROCDLPasses.td",
+    deps = ["@llvm-project//mlir:PassBaseTdFiles"],
+)
+
+iree_compiler_cc_library(
+    name = "ROCDLPassHeaders",
+    hdrs = [
+        "ROCDLPasses.h",
+        "ROCDLPasses.h.inc",
+    ],
+    deps = [
+        ":ROCDLPassesIncGen",
+        "//compiler/src/iree/compiler/Dialect/HAL/IR",
+        "@llvm-project//mlir:Pass",
+    ],
+)
+
+################################################################################
+# Common library
+################################################################################
+
 iree_compiler_cc_library(
     name = "LLVMGPU",
     srcs = [
@@ -53,43 +90,70 @@ iree_compiler_cc_library(
         "ConvertToROCDL.cpp",
         "ExtractAddressComputationGPUPass.cpp",
         "KernelConfig.cpp",
+        "LLVMGPUAssignConstantOrdinals.cpp",
         "LLVMGPUCastAddressSpaceFunction.cpp",
+        "LLVMGPUCastTypeToFitMMA.cpp",
+        "LLVMGPUConfigureTensorLayouts.cpp",
+        "LLVMGPULinkExecutables.cpp",
         "LLVMGPULowerExecutableTarget.cpp",
         "LLVMGPUPackSharedMemoryAlloc.cpp",
+        "LLVMGPUPrefetching.cpp",
+        "LLVMGPUPromoteMatmulToFitMMA.cpp",
         "LLVMGPUSelectLoweringStrategy.cpp",
         "LLVMGPUTensorCoreVectorization.cpp",
         "LLVMGPUTensorPad.cpp",
         "LLVMGPUTileAndDistribute.cpp",
+        "LLVMGPUVectorDistribute.cpp",
         "LLVMGPUVectorLowering.cpp",
         "LLVMGPUVectorToGPU.cpp",
         "Passes.cpp",
+        "ROCDLAnnotateKernelForTranslation.cpp",
+        "ROCDLKernelConfig.cpp",
+        "ROCDLLowerExecutableTarget.cpp",
+        "ROCDLSelectLoweringStrategy.cpp",
+        "TestLLVMGPUQueryMMAPass.cpp",
         "Verifiers.cpp",
     ],
     hdrs = [
         "ConvertToLLVM.h",
         "KernelConfig.h",
         "Passes.h",
+        "ROCDLKernelConfig.h",
+        "ROCDLPasses.h",
     ],
     deps = [
         ":PassHeaders",
         ":PassesIncGen",
+        ":ROCDLPassHeaders",
+        ":ROCDLPassesIncGen",
         "//compiler/src/iree/compiler/Codegen/Common",
         "//compiler/src/iree/compiler/Codegen/Common:TransformDialectInterpreterPass",
+        "//compiler/src/iree/compiler/Codegen/Common:VectorLayoutAnalysis",
         "//compiler/src/iree/compiler/Codegen/Common/GPU:CommonGPUPasses",
-        "//compiler/src/iree/compiler/Codegen/Dialect:IREECodegenDialect",
+        "//compiler/src/iree/compiler/Codegen/Common/GPU:GPUHeuristics",
+        "//compiler/src/iree/compiler/Codegen/Dialect/Codegen/IR:IREECodegenDialect",
+        "//compiler/src/iree/compiler/Codegen/Dialect/GPU/IR:IREEGPUDialect",
+        "//compiler/src/iree/compiler/Codegen/Dialect/GPU/TargetUtils:ConfigUtils",
+        "//compiler/src/iree/compiler/Codegen/Dialect/GPU/Transforms:GPUTransforms",
+        "//compiler/src/iree/compiler/Codegen/Dialect/VectorExt/IR:IREEVectorExtDialect",
+        "//compiler/src/iree/compiler/Codegen/Dialect/VectorExt/Transforms:VectorExtTransforms",
+        "//compiler/src/iree/compiler/Codegen/Interfaces:PartitionableLoopsInterface",
         "//compiler/src/iree/compiler/Codegen/Interfaces:UKernelOpInterface",
         "//compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions:LLVMGPUExtensions",
         "//compiler/src/iree/compiler/Codegen/LLVMGPU/Utils",
-        "//compiler/src/iree/compiler/Codegen/TransformStrategies/GPU",
         "//compiler/src/iree/compiler/Codegen/Transforms",
         "//compiler/src/iree/compiler/Codegen/Utils",
+        "//compiler/src/iree/compiler/Codegen/Utils:VectorOpUtils",
         "//compiler/src/iree/compiler/Dialect/Flow/IR",
+        "//compiler/src/iree/compiler/Dialect/Flow/Transforms",
         "//compiler/src/iree/compiler/Dialect/HAL/IR",
+        "//compiler/src/iree/compiler/Dialect/HAL/Transforms",
+        "//compiler/src/iree/compiler/Dialect/LinalgExt/IR",
+        "//compiler/src/iree/compiler/Dialect/LinalgExt/Transforms",
+        "//compiler/src/iree/compiler/Dialect/LinalgExt/Utils",
         "//compiler/src/iree/compiler/Dialect/Util/IR",
         "//compiler/src/iree/compiler/Dialect/Util/Transforms",
-        "//llvm-external-projects/iree-dialects:IREELinalgExtDialect",
-        "//llvm-external-projects/iree-dialects:IREELinalgExtPasses",
-        "//llvm-external-projects/iree-dialects:IREELinalgExtTransforms",
+        "//compiler/src/iree/compiler/Utils",
         "//llvm-external-projects/iree-dialects:IREELinalgTransformDialect",
         "//llvm-external-projects/iree-dialects:IREELinalgTransformDialectPasses",
         "@llvm-project//llvm:Support",
@@ -99,11 +163,14 @@ iree_compiler_cc_library(
         "@llvm-project//mlir:AMDGPUUtils",
         "@llvm-project//mlir:AffineDialect",
         "@llvm-project//mlir:AffineToStandard",
+        "@llvm-project//mlir:AffineTransforms",
         "@llvm-project//mlir:Analysis",
         "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:ArithToAMDGPU",
         "@llvm-project//mlir:ArithToLLVM",
         "@llvm-project//mlir:ArithTransforms",
         "@llvm-project//mlir:BufferizationDialect",
+        "@llvm-project//mlir:BufferizationTransforms",
         "@llvm-project//mlir:ComplexToLLVM",
         "@llvm-project//mlir:ComplexToStandard",
         "@llvm-project//mlir:ControlFlowToLLVM",
@@ -111,6 +178,7 @@ iree_compiler_cc_library(
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:FuncToLLVM",
         "@llvm-project//mlir:FuncTransforms",
+        "@llvm-project//mlir:FunctionInterfaces",
         "@llvm-project//mlir:GPUDialect",
         "@llvm-project//mlir:GPUToNVVMTransforms",
         "@llvm-project//mlir:GPUToROCDLTransforms",
@@ -118,6 +186,7 @@ iree_compiler_cc_library(
         "@llvm-project//mlir:GPUTransforms",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:LLVMCommonConversion",
+        "@llvm-project//mlir:LLVMDialect",
         "@llvm-project//mlir:LinalgDialect",
         "@llvm-project//mlir:LinalgTransforms",
         "@llvm-project//mlir:MathDialect",
@@ -144,6 +213,7 @@ iree_compiler_cc_library(
         "@llvm-project//mlir:Support",
         "@llvm-project//mlir:TensorDialect",
         "@llvm-project//mlir:TransformDialect",
+        "@llvm-project//mlir:TransformUtils",
         "@llvm-project//mlir:Transforms",
         "@llvm-project//mlir:ValueBoundsOpInterface",
         "@llvm-project//mlir:VectorDialect",

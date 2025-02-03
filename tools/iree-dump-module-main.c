@@ -171,7 +171,7 @@ static iree_status_t iree_tooling_print_cconv_fragment(
         IREE_RETURN_IF_ERROR(iree_tooling_print_cconv_fragment(
             iree_string_view_substr(cconv_fragment, i + 1, end_pos - i - 1)));
         fprintf(stdout, ">...");
-        i = end_pos + 1;
+        i = end_pos;  // +1 from the for-loop
       } break;
       default:
         return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
@@ -401,7 +401,7 @@ static iree_status_t iree_tooling_dump_module_metadata(
     fprintf(stdout, "Attributes:\n");
     iree_tooling_print_attr_defs(iree_vm_BytecodeModuleDef_attrs(module_def),
                                  2);
-    fprintf(stdout, "\n\n");
+    fprintf(stdout, "\n");
   }
 
   if (iree_vm_BytecodeModuleDef_types_is_present(module_def)) {
@@ -549,6 +549,8 @@ IREE_FLAG(string, output, "metadata",
           "  'flatbuffer-json': module flatbuffer in JSON format.\n");
 
 int main(int argc, char** argv) {
+  IREE_TRACE_APP_ENTER();
+
   iree_allocator_t host_allocator = iree_allocator_system();
   int exit_code = EXIT_SUCCESS;
 
@@ -560,6 +562,7 @@ int main(int argc, char** argv) {
 
   if (argc < 2) {
     fprintf(stderr, "Syntax: iree-dump-module [--output=...] module.vmfb\n");
+    IREE_TRACE_APP_EXIT(EXIT_FAILURE);
     return EXIT_FAILURE;
   }
 
@@ -610,5 +613,6 @@ int main(int argc, char** argv) {
     exit_code = EXIT_FAILURE;
   }
   fflush(stderr);
+  IREE_TRACE_APP_EXIT(exit_code);
   return exit_code;
 }

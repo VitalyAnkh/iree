@@ -10,7 +10,6 @@
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTraits.h"
-#include "iree/compiler/Dialect/Util/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
@@ -20,6 +19,9 @@
 #define DEBUG_TYPE "iree-util-simplify-global-accesses"
 
 namespace mlir::iree_compiler::IREE::Util {
+
+#define GEN_PASS_DEF_SIMPLIFYGLOBALACCESSESPASS
+#include "iree/compiler/Dialect/Util/Transforms/Passes.h.inc"
 
 // Builds symbol ref set for all immutable globals in |moduleOp|.
 static DenseSet<StringRef> gatherImmutableGlobals(mlir::ModuleOp moduleOp) {
@@ -228,23 +230,23 @@ rearrangeBlockGlobalAccesses(Block &block,
   // op order issues.
   SmallVector<std::map<StringRef, SmallVector<Operation *>>> sequencedBuckets;
   sequencedBuckets.push_back({}); // Start in a sequence.
-  block.walk([&](Operation *op) {
+  for (auto &op : block) {
     auto &buckets = sequencedBuckets.back();
     if (auto loadOp = dyn_cast<IREE::Util::GlobalLoadOpInterface>(op)) {
       if (!immutableGlobals.contains(loadOp.getGlobalName())) {
-        buckets[loadOp.getGlobalName()].push_back(op);
+        buckets[loadOp.getGlobalName()].push_back(&op);
       }
     } else if (auto storeOp =
                    dyn_cast<IREE::Util::GlobalStoreOpInterface>(op)) {
-      buckets[storeOp.getGlobalName()].push_back(op);
-    } else if (doesOpBlockMotion(op)) {
+      buckets[storeOp.getGlobalName()].push_back(&op);
+    } else if (doesOpBlockMotion(&op)) {
       // Split point - all accesses after this point must not assume anything
       // about accesses before it.
       if (!buckets.empty()) {
         sequencedBuckets.push_back({});
       }
     }
-  });
+  }
   bool didRemoveAny = false;
   for (auto &buckets : sequencedBuckets) {
     didRemoveAny = optimizeBuckets(block, buckets) || didRemoveAny;
@@ -255,7 +257,7 @@ rearrangeBlockGlobalAccesses(Block &block,
 namespace {
 
 class SimplifyGlobalAccessesPass
-    : public SimplifyGlobalAccessesBase<SimplifyGlobalAccessesPass> {
+    : public impl::SimplifyGlobalAccessesPassBase<SimplifyGlobalAccessesPass> {
 public:
   void runOnOperation() override {
     auto callableOp = getOperation();
@@ -310,9 +312,5 @@ public:
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<void>> createSimplifyGlobalAccessesPass() {
-  return std::make_unique<SimplifyGlobalAccessesPass>();
-}
 
 } // namespace mlir::iree_compiler::IREE::Util

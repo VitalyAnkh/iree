@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Utils/CPUUtils.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 
 #include <numeric>
 
@@ -61,6 +62,23 @@ FailureOr<Operation *> getRootOperation(ArrayRef<Operation *> computeOps) {
   }
 
   return rootOperation;
+}
+
+static const char kDecompositionAttrName[] = "enable_decomposition";
+StringAttr getEnableDecompositionAttrName(MLIRContext *ctx) {
+  return StringAttr::get(ctx, kDecompositionAttrName);
+}
+std::string getEnableDecompositionStr() { return kDecompositionAttrName; }
+
+static const char kLoopPeelingAttrName[] = "enable_loop_peeling";
+StringAttr getEnableLoopPeelingAttrName(MLIRContext *ctx) {
+  return StringAttr::get(ctx, kLoopPeelingAttrName);
+}
+std::string getEnableLoopPeelingStr() { return kLoopPeelingAttrName; }
+
+bool isOptEnabled(FunctionOpInterface funcOp, StringRef label) {
+  DictionaryAttr config = getTranslationInfo(funcOp).getConfiguration();
+  return config && config.contains(label);
 }
 
 } // namespace mlir::iree_compiler

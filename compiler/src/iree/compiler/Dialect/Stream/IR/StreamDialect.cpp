@@ -80,8 +80,8 @@ struct StripResourceConversionCastPattern
               dyn_cast<IREE::Stream::ResourceSizeOp>(use.getOwner())) {
         rewriter.replaceOp(sizeOp, sizeValue);
       } else {
-        rewriter.updateRootInPlace(use.getOwner(),
-                                   [&]() { use.set(resourceValue); });
+        rewriter.modifyOpInPlace(use.getOwner(),
+                                 [&]() { use.set(resourceValue); });
       }
     }
     rewriter.eraseOp(castOp);
@@ -103,7 +103,9 @@ StreamDialect::StreamDialect(MLIRContext *context)
   addOperations<
 #include "iree/compiler/Dialect/Stream/IR/StreamOps.cpp.inc"
       >();
-  addInterfaces<StreamInlinerInterface, StreamFolderInterface>();
+
+  addInterfaces<StreamInlinerInterface>();
+  addInterfaces<StreamFolderInterface>();
 }
 
 void StreamDialect::getCanonicalizationPatterns(

@@ -37,11 +37,16 @@
 #define IREE_UK_FLAG_MMT4D_TYPE_S16S16S32 0x07
 #define IREE_UK_FLAG_MMT4D_TYPE_S16U4S32 0x08
 #define IREE_UK_FLAG_MMT4D_TYPE_S16S8S32 0x09
-#define IREE_UK_FLAG_MMT4D_TYPE_END 0x0A
+#define IREE_UK_FLAG_MMT4D_TYPE_S8S4S32 0x0A
+#define IREE_UK_FLAG_MMT4D_TYPE_END 0x0B
 
 // bit flags
 #define IREE_UK_FLAG_MMT4D_ACCUMULATE 0x100
+#define IREE_UK_FLAG_MMT4D_ALLOW_GENERIC_FALLBACK_TILE_FUNCTION 0x200
 #define IREE_UK_FLAG_MMT4D_SKIP_INTERMEDIATE_ROUNDINGS 0x400
+
+// output bit flags for iree_uk_mmt4d_info
+#define IREE_UK_FLAG_MMT4D_INFO_HAVE_ARCHITECTURE_SPECIFIC_TILE_FUNCTION 0x1
 
 //===----------------------------------------------------------------------===//
 // pack
@@ -81,7 +86,7 @@
 // query_tile_sizes
 //===----------------------------------------------------------------------===//
 
-// OPERAND_ROLE describes the role that a tensor plays in an
+// OPERAND_INDEX describes the index that a tensor plays in an
 // operation, e.g. "left-hand-size operand" (e.g. in a matmul).
 #define IREE_UK_FLAG_QUERY_TILE_SIZES_OPERAND_ROLE_MASK 0xFF
 #define IREE_UK_FLAG_QUERY_TILE_SIZES_OPERAND_ROLE_NONE 0x00

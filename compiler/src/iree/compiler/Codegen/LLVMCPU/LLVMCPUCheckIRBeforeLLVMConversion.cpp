@@ -4,36 +4,45 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/LLVMCPU/PassDetail.h"
 #include "iree/compiler/Codegen/LLVMCPU/Passes.h"
 #include "llvm/Support/CommandLine.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Vector/IR/ScalableValueBoundsConstraintSet.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_LLVMCPUCHECKIRBEFORELLVMCONVERSIONPASS
+#include "iree/compiler/Codegen/LLVMCPU/Passes.h.inc"
+
 static llvm::cl::opt<int> clMaxAllocationSizeInBytes(
     "iree-llvmcpu-stack-allocation-limit",
     llvm::cl::desc("maximum allowed stack allocation size in bytes"),
     llvm::cl::init(32768));
-static llvm::cl::opt<bool> clFailOnOutOfBoundsStackAllocation(
-    "iree-llvmcpu-fail-on-out-of-bounds-stack-allocation",
-    llvm::cl::desc("fail if the upper bound of dynamic stack allocation cannot "
-                   "be solved"),
-    llvm::cl::init(true));
+
+static llvm::cl::opt<unsigned> clAssumedVscaleValue(
+    "iree-llvmcpu-stack-allocation-assumed-vscale",
+    llvm::cl::desc(
+        "assumed value of vscale when checking (scalable) stack allocations"),
+    llvm::cl::init(1));
 
 namespace {
 struct LLVMCPUCheckIRBeforeLLVMConversionPass
-    : LLVMCPUCheckIRBeforeLLVMConversionBase<
+    : impl::LLVMCPUCheckIRBeforeLLVMConversionPassBase<
           LLVMCPUCheckIRBeforeLLVMConversionPass> {
+  using impl::LLVMCPUCheckIRBeforeLLVMConversionPassBase<
+      LLVMCPUCheckIRBeforeLLVMConversionPass>::
+      LLVMCPUCheckIRBeforeLLVMConversionPassBase;
   void runOnOperation() override;
 };
 } // namespace
 
 /// Returns success if the cummulative stack allocation size is less than the
 /// limit set by clMaxAllocationSizeInBytes.
-static LogicalResult checkStackAllocationSize(func::FuncOp funcOp) {
-  if (funcOp.getBody().empty())
+static LogicalResult
+checkStackAllocationSize(mlir::FunctionOpInterface funcOp) {
+  if (funcOp.getFunctionBody().empty())
     return success();
 
   SmallVector<memref::AllocaOp> allocaOps;
@@ -44,8 +53,9 @@ static LogicalResult checkStackAllocationSize(func::FuncOp funcOp) {
   }
 
   int cumSize = 0;
+  const unsigned assumedVscale = clAssumedVscaleValue;
   for (auto allocaOp : allocaOps) {
-    if (allocaOp->getBlock() != &funcOp.getBody().front()) {
+    if (allocaOp->getBlock() != &funcOp.getFunctionBody().front()) {
       return allocaOp->emitOpError(
           "all stack allocations need to be hoisted to the entry block of the "
           "function");
@@ -58,11 +68,17 @@ static LogicalResult checkStackAllocationSize(func::FuncOp funcOp) {
       allocaSize *= dimSize;
     }
     for (auto operand : allocaOp.getDynamicSizes()) {
-      auto ub = ValueBoundsConstraintSet::computeConstantBound(
-          presburger::BoundType::UB, operand, /*dim=*/std::nullopt,
-          /*stopCondition=*/nullptr, /*closedUB=*/true);
+      // Assume vscale is `clAssumedVscaleValue` for determining if the alloca
+      // is within the stack limit. This should always resolve to a constant
+      // bound. Note: This may be an underestimate if the runtime larger than
+      // `clAssumedVscaleValue`, but should still catch unreasonable allocatons
+      // (which will have large static factors).
+      auto ub = vector::ScalableValueBoundsConstraintSet::computeScalableBound(
+          operand, /*dim=*/std::nullopt,
+          /*vscaleMin=*/assumedVscale,
+          /*vscaleMax=*/assumedVscale, presburger::BoundType::UB);
       if (succeeded(ub)) {
-        allocaSize *= ub.value();
+        allocaSize *= ub->getSize()->baseSize;
         continue;
       }
       return allocaOp.emitOpError("expected no unbounded stack allocations");
@@ -84,19 +100,13 @@ static LogicalResult checkStackAllocationSize(func::FuncOp funcOp) {
 }
 
 void LLVMCPUCheckIRBeforeLLVMConversionPass::runOnOperation() {
-  auto moduleOp = getOperation();
+  if (!failOnOutOfBounds) {
+    return;
+  }
 
-  for (auto funcOp : moduleOp.getOps<func::FuncOp>()) {
-    if (clFailOnOutOfBoundsStackAllocation &&
-        failed(checkStackAllocationSize(funcOp))) {
-      return signalPassFailure();
-    }
+  auto funcOp = getOperation();
+  if (failed(checkStackAllocationSize(funcOp))) {
+    return signalPassFailure();
   }
 }
-
-std::unique_ptr<OperationPass<ModuleOp>>
-createLLVMCPUCheckIRBeforeLLVMConversionPass() {
-  return std::make_unique<LLVMCPUCheckIRBeforeLLVMConversionPass>();
-}
-
 } // namespace mlir::iree_compiler

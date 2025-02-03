@@ -48,10 +48,9 @@ iree_cc_library(
     iree::hal
     iree::experimental::webgpu::platform
     iree::experimental::webgpu::shaders
-    iree::hal::utils::buffer_transfer
     iree::hal::utils::file_transfer
-    iree::hal::utils::memory_file
-    iree::schemas::wgsl_executable_def_c_fbs
+    iree::hal::utils::files
+    iree::schemas::webgpu_executable_def_c_fbs
   PUBLIC
 )
 

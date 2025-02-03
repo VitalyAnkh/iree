@@ -4,14 +4,13 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree/compiler/Dialect/Encoding/IR/EncodingOps.h"
 // TODO(benvanik): have a stream/upstream equivalent of the flow.dispatch.* ops.
 #include "iree/compiler/Dialect/Flow/IR/FlowDialect.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamDialect.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamTypes.h"
-#include "iree/compiler/Dialect/Stream/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Stream/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
@@ -20,7 +19,6 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
@@ -31,6 +29,11 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler::IREE::Stream {
+
+#define GEN_PASS_DEF_ENCODEHOSTTENSORSPASS
+#define GEN_PASS_DEF_ENCODEDEVICETENSORSPASS
+#include "iree/compiler/Dialect/Stream/Transforms/Passes.h.inc"
+
 namespace {
 
 //===----------------------------------------------------------------------===//
@@ -43,7 +46,8 @@ static LogicalResult checkEncoding(Operation *op, RankedTensorType encodingType,
                                    ValueRange encodingDims,
                                    PatternRewriter &rewriter) {
   auto encoding = encodingType.getEncoding();
-  if (encoding && !llvm::isa<IREE::LinalgExt::EncodingAttr>(encoding)) {
+  if (encoding && !llvm::isa<IREE::Encoding::EncodingAttr,
+                             IREE::Encoding::PackedStorageAttr>(encoding)) {
     return rewriter.notifyMatchFailure(op, [=](Diagnostic &d) {
       d << "unsupported tensor encoding: " << encodingType;
     });
@@ -586,30 +590,57 @@ struct EncodeTensorStoreOp
 };
 
 //===----------------------------------------------------------------------===//
-// -iree-stream-encode-host-tensors
+// stream.tensor.dispatch
 //===----------------------------------------------------------------------===//
 
-class EncodeHostTensorsPass
-    : public EncodeHostTensorsBase<EncodeHostTensorsPass> {
-public:
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<mlir::func::FuncDialect>();
-    registry.insert<mlir::arith::ArithDialect>();
-    registry.insert<mlir::complex::ComplexDialect>();
-    registry.insert<IREE::Stream::StreamDialect>();
-    registry.insert<IREE::Util::UtilDialect>();
+struct EncodeTensorDispatchOp
+    : public OpRewritePattern<IREE::Stream::TensorDispatchOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(IREE::Stream::TensorDispatchOp op,
+                                PatternRewriter &rewriter) const override {
+    // Strip off the tensor encoding information - it's not used at all here. If
+    // we changed the tensor dispatch op to accept indices and lengths for
+    // offsetting we would need to account for that here but today we require
+    // that to happen on slices/updates instead.
+    Value zeroOffset = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), 0);
+    SmallVector<Value> operandOffsets;
+    SmallVector<Value> operandEnds;
+    SmallVector<Value> operandLengths;
+    auto operandSizes = op.getOperandSizes();
+    for (auto operand : op.getMixedOperands()) {
+      if (isa<IREE::Stream::ResourceType>(operand.getType())) {
+        operandOffsets.push_back(zeroOffset);
+        operandEnds.push_back(operandSizes.front());
+        operandLengths.push_back(operandSizes.front());
+        operandSizes = operandSizes.drop_front(1);
+      }
+    }
+    rewriter.replaceOpWithNewOp<IREE::Stream::AsyncDispatchOp>(
+        op, op.getResultTypes(), op.getWorkload(), op.getEntryPointsAttr(),
+        op.getMixedOperands(), op.getOperandSizes(), operandOffsets,
+        operandEnds, operandLengths, op.getResultSizes(),
+        op.getTiedOperandsAttr(), op.getAffinityAttr());
+    return success();
   }
+};
 
+//===----------------------------------------------------------------------===//
+// --iree-stream-encode-host-tensors
+//===----------------------------------------------------------------------===//
+
+struct EncodeHostTensorsPass
+    : public IREE::Stream::impl::EncodeHostTensorsPassBase<
+          EncodeHostTensorsPass> {
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
     patterns.insert<
         EncodeTensorImportOp, EncodeTensorExportOp, EncodeTensorSizeOfOp,
         EncodeTensorEmptyOp, EncodeTensorConstantOp, EncodeTensorSplatOp,
         EncodeTensorCloneOp, EncodeTensorSliceOp, EncodeTensorFillOp,
-        EncodeTensorUpdateOp, EncodeTensorLoadOp, EncodeTensorStoreOp>(
-        &getContext());
+        EncodeTensorUpdateOp, EncodeTensorLoadOp, EncodeTensorStoreOp,
+        EncodeTensorDispatchOp>(&getContext());
     FrozenRewritePatternSet frozenPatterns(std::move(patterns));
-    if (failed(applyPatternsAndFoldGreedily(getOperation(), frozenPatterns))) {
+    if (failed(applyPatternsGreedily(getOperation(), frozenPatterns))) {
       return signalPassFailure();
     }
   }
@@ -657,8 +688,8 @@ struct EncodeBindingSubspanOp
 
     // Directly swap the type with the one, changing all uses in the IR.
     // This works because
-    rewriter.updateRootInPlace(op,
-                               [&]() { op.getResult().setType(alignedType); });
+    rewriter.modifyOpInPlace(op,
+                             [&]() { op.getResult().setType(alignedType); });
 
     return success();
   }
@@ -690,7 +721,7 @@ struct EncodeDispatchTensorLoadOp
     rewriter.setInsertionPointAfterValue(loadedValue);
     auto truncOp =
         rewriter.create<arith::TruncIOp>(op.getLoc(), targetType, loadedValue);
-    rewriter.updateRootInPlace(op, [&]() {
+    rewriter.modifyOpInPlace(op, [&]() {
       loadedValue.replaceAllUsesExcept(truncOp, truncOp);
       loadedValue.setType(alignedType);
     });
@@ -722,47 +753,30 @@ struct EncodeDispatchTensorStoreOp
     // Extend the sub-byte -> byte type; e.g. i1 -> i8.
     auto extOp = rewriter.create<arith::ExtUIOp>(op.getLoc(), alignedType,
                                                  op.getValue());
-    rewriter.updateRootInPlace(
+    rewriter.modifyOpInPlace(
         op, [&]() { op.getValueMutable().assign(extOp.getResult()); });
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
-// -iree-stream-encode-device-tensors
+// --iree-stream-encode-device-tensors
 //===----------------------------------------------------------------------===//
 
-class EncodeDeviceTensorsPass
-    : public EncodeDeviceTensorsBase<EncodeDeviceTensorsPass> {
-public:
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<mlir::func::FuncDialect>();
-    registry.insert<mlir::arith::ArithDialect>();
-    registry.insert<mlir::complex::ComplexDialect>();
-    registry.insert<IREE::Flow::FlowDialect>();
-    registry.insert<IREE::Stream::StreamDialect>();
-    registry.insert<IREE::Util::UtilDialect>();
-  }
-
+struct EncodeDeviceTensorsPass
+    : public IREE::Stream::impl::EncodeDeviceTensorsPassBase<
+          EncodeDeviceTensorsPass> {
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
     patterns.insert<EncodeBindingSubspanOp, EncodeDispatchTensorLoadOp,
                     EncodeDispatchTensorStoreOp>(&getContext());
     FrozenRewritePatternSet frozenPatterns(std::move(patterns));
-    if (failed(applyPatternsAndFoldGreedily(getOperation(), frozenPatterns))) {
+    if (failed(applyPatternsGreedily(getOperation(), frozenPatterns))) {
       return signalPassFailure();
     }
   }
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<>> createEncodeHostTensorsPass() {
-  return std::make_unique<EncodeHostTensorsPass>();
-}
-
-std::unique_ptr<OperationPass<>> createEncodeDeviceTensorsPass() {
-  return std::make_unique<EncodeDeviceTensorsPass>();
-}
 
 } // namespace mlir::iree_compiler::IREE::Stream

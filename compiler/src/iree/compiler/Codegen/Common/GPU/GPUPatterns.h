@@ -29,6 +29,17 @@ void populateContractPromotionPatterns(RewritePatternSet &patterns,
 
 void populateDropSharedMemoryDeallocOpPatterns(RewritePatternSet &patterns);
 
+void populateGPUDistributionPatterns(RewritePatternSet &patterns);
+
+void populateGPUDistributeNestedLayoutAttrPatterns(
+    RewritePatternSet &patterns, Value threadId, int64_t subgroupSize,
+    int64_t maxBitsPerShuffle = 32);
+
+// Adds patterns that distributes vector.contract ops with nested layout
+// annotations to amdgpu.mfma ops.
+void populateGPUDistributeNestedLayoutContractAMDGPUPatterns(
+    RewritePatternSet &patterns);
+
 } // namespace mlir::iree_compiler
 
 #endif // IREE_COMPILER_CODEGEN_COMMON_GPUPATTERNS_H_

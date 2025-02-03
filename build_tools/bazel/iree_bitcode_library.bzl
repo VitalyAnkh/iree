@@ -101,6 +101,19 @@ def iree_bitcode_library(
         "-DIREE_DEVICE_STANDALONE=1",
     ]
 
+    if arch == "arm_32":
+        # Silence "warning: unknown platform, assuming -mfloat-abi=soft"
+        base_copts.append("-mfloat-abi=soft")
+    elif arch == "riscv_32":
+        # On RISC-V, linking LLVM modules requires matching target-abi.
+        # https://lists.llvm.org/pipermail/llvm-dev/2020-January/138450.html
+        # The choice of ilp32d is simply what we have in existing riscv_32 tests.
+        # Open question - how do we scale to supporting all RISC-V ABIs?
+        base_copts.append("-mabi=ilp32d")
+    elif arch == "riscv_64":
+        # Same comments as above riscv_32 case.
+        base_copts.append("-mabi=lp64d")
+
     bitcode_files = []
     for src in srcs:
         bitcode_out = "%s_%s.bc" % (name, src)
@@ -242,6 +255,80 @@ def iree_cuda_bitcode_library(
         **kwargs
     )
 
+def iree_amdgpu_bitcode_library(
+        name,
+        gpu_arch,
+        srcs,
+        copts = [],
+        out = None,
+        **kwargs):
+    """Builds an AMDGPU LLVM bitcode library from an input file using clang.
+
+    Args:
+        name: Name of the target.
+        gpu_arch: Target AMDGPU architecture, e.g. gfx942.
+        srcs: Source files to pass to clang. Headers (*.h) are for dependency
+              tracking only. Current limitation: only one non-header source is
+              supported.
+        copts: Additional flags to pass to clang.
+        out: Output file name. Defaults to {source.c}.{gpu_arch}.bc.
+        **kwargs: any additional attributes to pass to the underlying rules.
+    """
+
+    clang_tool = "@llvm-project//clang:clang"
+
+    base_copts = [
+        # Language: C23.
+        "-std=c23",
+
+        # Avoid dependencies.
+        "-nogpulib",
+
+        # Avoid ABI issues.
+        "-fno-short-wchar",  # Shouldn't matter to us, but doesn't hurt.
+
+        # Target architecture/machine.
+        "-target",
+        "amdgcn-amd-amdhsa",
+        "-march=%s" % gpu_arch,
+        "-fgpu-rdc",  # NOTE: may not be required for all targets.
+
+        # Optimized.
+        "-O3",
+        "-fno-ident",
+        "-fvisibility=hidden",
+
+        # Object file only in bitcode format.
+        "-c",
+        "-emit-llvm",
+    ]
+
+    non_header_srcs = [src for src in srcs if not src.endswith(".h")]
+    if len(non_header_srcs) != 1:
+        fail("Expected exactly one non-header file in srcs, got srcs=[" + ", ".join(srcs) + "]")
+    src = non_header_srcs[0]
+
+    if not out:
+        out = "%s.%s.bc" % (src, gpu_arch)
+
+    native.genrule(
+        name = "gen_%s" % (out),
+        srcs = srcs,
+        outs = [out],
+        cmd = " ".join([
+            "$(location %s)" % (clang_tool),
+            "$(location %s)" % (src),
+            "-o $(location %s)" % (out),
+            "-I .",
+        ] + base_copts + copts),
+        tools = [
+            clang_tool,
+        ],
+        message = "Compiling %s to %s..." % (src, out),
+        output_to_bindir = 1,
+        **kwargs
+    )
+
 def iree_link_bitcode(
         name,
         bitcode_files,
@@ -258,7 +345,7 @@ def iree_link_bitcode(
         **kwargs: any additional attributes to pass to the underlying rules.
     """
 
-    bitcode_files_qualified = [(("//" + native.package_name() + "/" + b) if b.count(":") else b) for b in bitcode_files]
+    bitcode_files_qualified = [("//" + native.package_name() + b) if b.startswith(":") else ("//" + native.package_name() + "/" + b) if b.count(":") else b for b in bitcode_files]
 
     if not out:
         out = "%s.bc" % (name)

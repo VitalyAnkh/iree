@@ -18,7 +18,6 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Attributes.h"
@@ -37,6 +36,8 @@ namespace mlir::iree_compiler::IREE::Flow {
 //===----------------------------------------------------------------------===//
 // Folding utilities
 //===----------------------------------------------------------------------===//
+
+namespace {
 
 // Erases an op if it has no uses.
 // This is to support ops that are "pure" but can't be marked as such because
@@ -171,6 +172,8 @@ static SmallVector<Value> refreshDimsOnTypeChange(Operation *op, Type oldType,
   return newDims;
 }
 
+} // namespace
+
 //===----------------------------------------------------------------------===//
 // flow.dispatch.workgroups
 //===----------------------------------------------------------------------===//
@@ -289,7 +292,6 @@ struct ElideRedundantWorkloadValues
 struct ElideRedundantOperandsOfWorkgroupCountFromSliceOp
     : OpRewritePattern<DispatchWorkgroupsOp> {
   using OpRewritePattern::OpRewritePattern;
-
   LogicalResult matchAndRewrite(DispatchWorkgroupsOp op,
                                 PatternRewriter &rewriter) const override {
     Region &count = op.getWorkgroupCount();
@@ -345,7 +347,7 @@ struct ElideRedundantOperandsOfWorkgroupCountFromSliceOp
           rewriter.getIndexAttr(
               oldOrdinalPosToNewOrdinalPos.lookup(oldOrdinalPos)));
     }
-    rewriter.updateRootInPlace(op, []() {});
+    rewriter.modifyOpInPlace(op, []() {});
     return success();
   }
 };
@@ -367,10 +369,11 @@ void DispatchWorkgroupsOp::getCanonicalizationPatterns(
 // flow.dispatch.workload.ordinal
 //===----------------------------------------------------------------------===//
 
+namespace {
+
 // Bubble up the ordinal ops so that all uses go through this operation.
 struct BubbleUpOrdinalOp : public OpRewritePattern<DispatchWorkloadOrdinalOp> {
   using OpRewritePattern::OpRewritePattern;
-
   LogicalResult matchAndRewrite(DispatchWorkloadOrdinalOp ordinalOp,
                                 PatternRewriter &rewriter) const override {
     auto blockArg = llvm::dyn_cast<BlockArgument>(ordinalOp.getOperand());
@@ -401,6 +404,8 @@ struct BubbleUpOrdinalOp : public OpRewritePattern<DispatchWorkloadOrdinalOp> {
     return success();
   }
 };
+
+} // namespace
 
 /// Fold away following sequence of `flow.dispatch.workload.ordinal`.
 ///
@@ -459,7 +464,7 @@ static bool updateTensorOpDims(RewriterBase &rewriter, Operation *op,
   auto oldValues = llvm::to_vector(oldValueRange);
   for (unsigned i = 0; i < dynamicDims.size(); ++i) {
     if (oldValues[i] != dynamicDims[i]) {
-      rewriter.updateRootInPlace(
+      rewriter.modifyOpInPlace(
           op, [&]() { mutableDimValues.slice(i, 1).assign(dynamicDims[i]); });
       anyChanged = true;
     }
@@ -636,8 +641,23 @@ struct FoldCastOpIntoDispatchStoreOp
   LogicalResult matchAndRewrite(DispatchTensorStoreOp storeOp,
                                 PatternRewriter &rewriter) const override {
     auto parentOp = storeOp.getValue().getDefiningOp<tensor::CastOp>();
-    if (!parentOp || !tensor::canFoldIntoConsumerOp(parentOp))
+    if (!parentOp || !tensor::canFoldIntoConsumerOp(parentOp)) {
       return failure();
+    }
+
+    // Only fold a cast when the (rank-reduced) type is consistent with the
+    // static sizes.
+    auto sourceTensorType =
+        dyn_cast<RankedTensorType>(parentOp.getSource().getType());
+    if (!sourceTensorType) {
+      return failure();
+    }
+    auto inferredType = RankedTensorType::get(
+        storeOp.getStaticSizes(), sourceTensorType.getElementType());
+    if (isRankReducedType(inferredType, sourceTensorType) !=
+        SliceVerificationResult::Success) {
+      return failure();
+    }
 
     rewriter.replaceOpWithNewOp<DispatchTensorStoreOp>(
         storeOp, parentOp.getSource(), storeOp.getTarget(),
@@ -697,8 +717,8 @@ struct DeduplicateDispatchEntryRefs final
     auto newAttr = deduplicateArrayElements(originalAttr);
     if (newAttr == originalAttr)
       return failure();
-    rewriter.updateRootInPlace(
-        dispatchOp, [&]() { dispatchOp.setEntryPointsAttr(newAttr); });
+    rewriter.modifyOpInPlace(dispatchOp,
+                             [&]() { dispatchOp.setEntryPointsAttr(newAttr); });
     return success();
   }
 };
@@ -732,15 +752,15 @@ static uint64_t getFlattenedIndex(ShapedType type, ArrayRef<uint64_t> index) {
 
 static bool compareShapesEqual(ShapedType lhsType, ValueRange lhsDynamicDims,
                                ShapedType rhsType, ValueRange rhsDynamicDims) {
-  if (lhsType.hasStaticShape() && rhsType.hasStaticShape() &&
-      lhsType == rhsType) {
+  if (lhsType.hasStaticShape() && rhsType.hasStaticShape()) {
     // Static shape equivalence means we can fast-path the check.
-    return true;
+    return lhsType == rhsType;
   }
   if (lhsType.getRank() != rhsType.getRank()) {
     return false;
   }
   unsigned dynamicDimIndex = 0;
+  unsigned numNonmatchingSSADims = 0;
   for (unsigned i = 0; i < lhsType.getRank(); ++i) {
     if (lhsType.isDynamicDim(i) != rhsType.isDynamicDim(i)) {
       // Static/dynamic dimension mismatch - definitely differ.
@@ -748,8 +768,7 @@ static bool compareShapesEqual(ShapedType lhsType, ValueRange lhsDynamicDims,
     } else if (lhsType.isDynamicDim(i)) {
       unsigned j = dynamicDimIndex++;
       if (lhsDynamicDims[j] != rhsDynamicDims[j]) {
-        // Dynamic dimensions with different SSA values - probably differ.
-        return false;
+        numNonmatchingSSADims++;
       }
     } else {
       if (lhsType.getDimSize(i) != rhsType.getDimSize(i)) {
@@ -758,14 +777,20 @@ static bool compareShapesEqual(ShapedType lhsType, ValueRange lhsDynamicDims,
       }
     }
   }
-  return true;
+  return numNonmatchingSSADims <= 1;
 }
 
 //===----------------------------------------------------------------------===//
 // flow.tensor.constant
 //===----------------------------------------------------------------------===//
 
-OpFoldResult TensorConstantOp::fold(FoldAdaptor operands) {
+OpFoldResult TensorConstantOp::fold(FoldAdaptor operands) { return getValue(); }
+
+//===----------------------------------------------------------------------===//
+// flow.tensor.dynamic_constant
+//===----------------------------------------------------------------------===//
+
+OpFoldResult TensorDynamicConstantOp::fold(FoldAdaptor operands) {
   auto dynamicType = getType();
   if (dynamicType.getNumDynamicDims() == 0) {
     return getValue();
@@ -775,24 +800,27 @@ OpFoldResult TensorConstantOp::fold(FoldAdaptor operands) {
 
 namespace {
 
-struct ExpandDynamicShapeConstant : public OpRewritePattern<TensorConstantOp> {
-  using OpRewritePattern<TensorConstantOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(TensorConstantOp op,
+struct ExpandDynamicShapeConstant
+    : public OpRewritePattern<TensorDynamicConstantOp> {
+  using OpRewritePattern<TensorDynamicConstantOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(TensorDynamicConstantOp op,
                                 PatternRewriter &rewriter) const override {
-    auto constantOp =
-        rewriter.create<arith::ConstantOp>(op.getLoc(), op.getValue());
+    auto constantOp = rewriter.create<IREE::Flow::TensorConstantOp>(
+        op.getLoc(), op.getValue());
     auto dynamicType = op.getType();
-    auto staticType = llvm::cast<ShapedType>(constantOp.getType());
+    auto staticType = cast<ShapedType>(op.getValue().getType());
     SmallVector<Value> dynamicDims;
-    for (int64_t i = 0; i < dynamicType.getNumDynamicDims(); ++i) {
-      auto dimValue = rewriter
-                          .create<arith::ConstantIndexOp>(
-                              op.getLoc(), staticType.getDimSize(i))
-                          .getResult();
-      dynamicDims.push_back(
-          rewriter
-              .create<IREE::Util::OptimizationBarrierOp>(op.getLoc(), dimValue)
-              .getResult(0));
+    for (int64_t i = 0; i < dynamicType.getRank(); ++i) {
+      if (dynamicType.isDynamicDim(i)) {
+        auto dimValue = rewriter
+                            .create<arith::ConstantIndexOp>(
+                                op.getLoc(), staticType.getDimSize(i))
+                            .getResult();
+        dynamicDims.push_back(rewriter
+                                  .create<IREE::Util::OptimizationBarrierOp>(
+                                      op.getLoc(), dimValue)
+                                  .getResult(0));
+      }
     }
     rewriter.replaceOpWithNewOp<IREE::Flow::TensorReshapeOp>(
         op, dynamicType, constantOp.getResult(), dynamicDims);
@@ -802,8 +830,8 @@ struct ExpandDynamicShapeConstant : public OpRewritePattern<TensorConstantOp> {
 
 } // namespace
 
-void TensorConstantOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                                   MLIRContext *context) {
+void TensorDynamicConstantOp::getCanonicalizationPatterns(
+    RewritePatternSet &results, MLIRContext *context) {
   results.insert<ExpandDynamicShapeConstant>(context);
 }
 
@@ -843,25 +871,6 @@ OpFoldResult TensorReshapeOp::fold(FoldAdaptor operands) {
   return {};
 }
 
-//===----------------------------------------------------------------------===//
-// flow.tensor.bitcast
-//===----------------------------------------------------------------------===//
-
-OpFoldResult TensorBitCastOp::fold(FoldAdaptor operands) {
-  auto sourceType = llvm::cast<ShapedType>(getSource().getType());
-  auto resultType = llvm::cast<ShapedType>(getResult().getType());
-  if (sourceType.getElementType() != resultType.getElementType()) {
-    // Element type mismatch, this is a bitcast.
-    return {};
-  }
-  if (compareShapesEqual(sourceType, getSourceDims(), resultType,
-                         getResultDims())) {
-    // Shapes match and this is a no-op so just fold to the source.
-    return getSource();
-  }
-  return {};
-}
-
 namespace {
 
 // Flatten a chain of reshapes or bitcasts (reshape/bitcast feeding into
@@ -871,7 +880,6 @@ namespace {
 template <typename CastOpTy>
 struct FlattenTensorCastLikeChain : public OpRewritePattern<CastOpTy> {
   using OpRewritePattern<CastOpTy>::OpRewritePattern;
-
   LogicalResult matchAndRewrite(CastOpTy reshapeOp,
                                 PatternRewriter &rewriter) const override {
     // We want the same result value/shape but to source from the ancestor. We
@@ -911,46 +919,6 @@ struct FlattenTensorCastLikeChain : public OpRewritePattern<CastOpTy> {
   }
 };
 
-// Replace `flow.tensor.splat`-`flow.tensor.load` op-pairs by the input
-// primitive value for the splat op.
-struct FoldSplatLoadIntoPrimitive : public OpRewritePattern<TensorLoadOp> {
-  using OpRewritePattern<TensorLoadOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(TensorLoadOp loadOp,
-                                PatternRewriter &rewriter) const override {
-    auto sourceOp =
-        dyn_cast_or_null<TensorSplatOp>(loadOp.getSource().getDefiningOp());
-
-    if (!sourceOp)
-      return failure();
-
-    rewriter.replaceOp(loadOp, sourceOp.getValue());
-    return success();
-  }
-};
-
-struct FoldSplatReshapeIntoSplat : public OpRewritePattern<TensorSplatOp> {
-  using OpRewritePattern<TensorSplatOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(TensorSplatOp splatOp,
-                                PatternRewriter &rewriter) const override {
-    if (!splatOp.getResult().hasOneUse())
-      return failure();
-
-    auto reshapeOp = dyn_cast_or_null<TensorReshapeOp>(
-        splatOp.getResult().use_begin()->getOwner());
-    if (!reshapeOp)
-      return failure();
-
-    rewriter.replaceOpWithNewOp<TensorSplatOp>(
-        reshapeOp, reshapeOp.getResult().getType(), splatOp.getValue(),
-        reshapeOp.getResultDims());
-    rewriter.eraseOp(splatOp);
-
-    return success();
-  }
-};
-
 struct ResolveShapedRank : public OpRewritePattern<tensor::RankOp> {
   using OpRewritePattern<tensor::RankOp>::OpRewritePattern;
   LogicalResult matchAndRewrite(tensor::RankOp op,
@@ -972,6 +940,7 @@ struct ResolveShapedDim : public OpRewritePattern<tensor::DimOp> {
     }
     auto idx = op.getConstantIndex().value();
 
+    // Fold static dims from the type.
     auto shapedType = llvm::cast<ShapedType>(op.getSource().getType());
     if (!shapedType.isDynamicDim(idx)) {
       rewriter.replaceOpWithNewOp<arith::ConstantIndexOp>(
@@ -979,19 +948,20 @@ struct ResolveShapedDim : public OpRewritePattern<tensor::DimOp> {
       return success();
     }
 
+    // Find dims captured on shape-aware ops.
     auto dynamicDims = IREE::Util::findDynamicDims(
         op.getSource(), op->getBlock(), Block::iterator(op.getOperation()));
-    if (!dynamicDims.has_value()) {
-      return rewriter.notifyMatchFailure(op, "no dynamic dims found/usable");
+    if (dynamicDims.has_value()) {
+      unsigned dimOffset = 0;
+      for (unsigned i = 0; i < idx; ++i) {
+        if (shapedType.isDynamicDim(i))
+          ++dimOffset;
+      }
+      rewriter.replaceOp(op, dynamicDims.value()[dimOffset]);
+      return success();
     }
-    unsigned dimOffset = 0;
-    for (unsigned i = 0; i < idx; ++i) {
-      if (shapedType.isDynamicDim(i))
-        ++dimOffset;
-    }
-    rewriter.replaceOp(op, dynamicDims.value()[dimOffset]);
 
-    return success();
+    return rewriter.notifyMatchFailure(op, "no dynamic dims found/usable");
   }
 };
 
@@ -1009,6 +979,25 @@ void TensorReshapeOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.insert<ResolveShapedDim>(context);
 }
 
+//===----------------------------------------------------------------------===//
+// flow.tensor.bitcast
+//===----------------------------------------------------------------------===//
+
+OpFoldResult TensorBitCastOp::fold(FoldAdaptor operands) {
+  auto sourceType = llvm::cast<ShapedType>(getSource().getType());
+  auto resultType = llvm::cast<ShapedType>(getResult().getType());
+  if (sourceType.getElementType() != resultType.getElementType()) {
+    // Element type mismatch, this is a bitcast.
+    return {};
+  }
+  if (compareShapesEqual(sourceType, getSourceDims(), resultType,
+                         getResultDims())) {
+    // Shapes match and this is a no-op so just fold to the source.
+    return getSource();
+  }
+  return {};
+}
+
 void TensorBitCastOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                                   MLIRContext *context) {
   results.insert<ReplaceOpIfTensorOperandZeroElements<TensorBitCastOp, 0>>(
@@ -1017,8 +1006,6 @@ void TensorBitCastOp::getCanonicalizationPatterns(RewritePatternSet &results,
       context);
   results.insert<ReplaceOpIfTensorOperandEmpty<TensorBitCastOp, 0, 0>>(context);
   results.insert<FlattenTensorCastLikeChain<TensorBitCastOp>>(context);
-  results.insert<ResolveShapedRank>(context);
-  results.insert<ResolveShapedDim>(context);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1038,6 +1025,25 @@ OpFoldResult TensorLoadOp::fold(FoldAdaptor operands) {
   }
   return {};
 }
+
+namespace {
+
+// Replace `flow.tensor.splat`-`flow.tensor.load` op-pairs by the input
+// primitive value for the splat op.
+struct FoldSplatLoadIntoPrimitive : public OpRewritePattern<TensorLoadOp> {
+  using OpRewritePattern<TensorLoadOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(TensorLoadOp loadOp,
+                                PatternRewriter &rewriter) const override {
+    auto sourceOp =
+        dyn_cast_or_null<TensorSplatOp>(loadOp.getSource().getDefiningOp());
+    if (!sourceOp)
+      return failure();
+    rewriter.replaceOp(loadOp, sourceOp.getValue());
+    return success();
+  }
+};
+
+} // namespace
 
 void TensorLoadOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                                MLIRContext *context) {
@@ -1095,6 +1101,25 @@ void TensorEmptyOp::getCanonicalizationPatterns(RewritePatternSet &results,
 // flow.tensor.splat
 //===----------------------------------------------------------------------===//
 
+namespace {
+
+struct FoldSplatReshapeIntoSplat : public OpRewritePattern<TensorReshapeOp> {
+  using OpRewritePattern<TensorReshapeOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(TensorReshapeOp reshapeOp,
+                                PatternRewriter &rewriter) const override {
+    auto splatOp = dyn_cast_if_present<TensorSplatOp>(
+        reshapeOp.getSource().getDefiningOp());
+    if (!splatOp)
+      return failure();
+    rewriter.replaceOpWithNewOp<TensorSplatOp>(
+        reshapeOp, reshapeOp.getResult().getType(), splatOp.getValue(),
+        reshapeOp.getResultDims());
+    return success();
+  }
+};
+
+} // namespace
+
 void TensorSplatOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                                 MLIRContext *context) {
   // TODO(benvanik): canonicalize splat+slice to smaller splat.
@@ -1134,6 +1159,47 @@ void TensorCloneOp::getCanonicalizationPatterns(RewritePatternSet &results,
 }
 
 //===----------------------------------------------------------------------===//
+// flow.tensor.barrier
+//===----------------------------------------------------------------------===//
+
+void TensorBarrierOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                                  MLIRContext *context) {}
+
+//===----------------------------------------------------------------------===//
+// flow.tensor.transfer
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// Attempts to identify trivial cases where we locally recognize that a tensor
+// is transferred to the same context it's already on. This does not look across
+// control flow edges or globals and is mostly for simplifying IR that may come
+// in with a transfer on every single tensor.
+struct ElideRedundantTransfer : public OpRewritePattern<TensorTransferOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(TensorTransferOp op,
+                                PatternRewriter &rewriter) const override {
+    auto baseValue =
+        IREE::Util::TiedOpInterface::findTiedBaseValue(op.getOperand());
+    if (auto transferOp = dyn_cast_if_present<IREE::Flow::TensorTransferOp>(
+            baseValue.getDefiningOp())) {
+      if (transferOp.getTarget() == op.getTarget()) {
+        rewriter.replaceOp(op, op.getOperand());
+        return success();
+      }
+    }
+    return failure();
+  }
+};
+
+} // namespace
+
+void TensorTransferOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                                   MLIRContext *context) {
+  results.insert<ElideRedundantTransfer>(context);
+}
+
+//===----------------------------------------------------------------------===//
 // flow.tensor.slice
 //===----------------------------------------------------------------------===//
 
@@ -1167,6 +1233,10 @@ static ElementsAttr tensorSlice(ElementsAttr tensor, uint64_t dim,
 
 OpFoldResult TensorSliceOp::fold(FoldAdaptor operands) {
   if (llvm::count(operands.getOperands(), nullptr) == 0) {
+    // Ignore DenseResources for now and do not perfom folding on them.
+    if (isa<DenseResourceElementsAttr>(operands.getSource())) {
+      return {};
+    }
     // Fully constant arguments so we can perform the slice here.
     auto tensor = llvm::cast<ElementsAttr>(operands.getSource());
     int64_t rank = llvm::cast<ShapedType>(getSource().getType()).getRank();
@@ -1271,7 +1341,6 @@ namespace {
 // to be updated to use the source of the cast as the target tensor.
 struct FoldTensorUpdateOpWithCasts : public OpRewritePattern<TensorUpdateOp> {
   using OpRewritePattern<TensorUpdateOp>::OpRewritePattern;
-
   LogicalResult matchAndRewrite(TensorUpdateOp updateOp,
                                 PatternRewriter &rewriter) const override {
     auto targetCastOp = updateOp.getTarget().getDefiningOp<tensor::CastOp>();

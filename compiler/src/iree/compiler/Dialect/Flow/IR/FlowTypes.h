@@ -130,7 +130,7 @@ public:
     if (boundType.isIntOrIndexOrFloat()) {
       return RankedTensorType::get({}, boundType);
     }
-    return boundType.cast<RankedTensorType>();
+    return llvm::cast<RankedTensorType>(boundType);
   }
 };
 
@@ -170,5 +170,33 @@ struct DispatchTensorTypeStorage : public TypeStorage {
 #define GET_TYPEDEF_CLASSES
 #include "iree/compiler/Dialect/Flow/IR/FlowTypes.h.inc" // IWYU pragma: keep
 // clang-format on
+
+namespace mlir::iree_compiler::IREE::Flow {
+
+// Create an attribute corresponding to the underlying numeric element type.
+// If there no such correspondence a null attribute is returned.
+IREE::Flow::CollectiveElementTypeAttr
+getCollectiveElementTypeAttr(RankedTensorType type);
+
+// Convert the numeric type `type` to the corresponding enum value.
+// If there is not correspondence nullopt is returned.
+std::optional<IREE::Flow::CollectiveElementType>
+convertToFlowCollectiveElementType(Type type);
+
+//===----------------------------------------------------------------------===//
+// custom<ParameterReference>($scope, $key)
+//===----------------------------------------------------------------------===//
+
+ParseResult parseParameterReference(AsmParser &parser, StringAttr &scopeAttr,
+                                    StringAttr &keyAttr);
+void printParameterReference(AsmPrinter &p, StringAttr scopeAttr,
+                             StringAttr keyAttr);
+static inline void printParameterReference(AsmPrinter &p, Operation *op,
+                                           StringAttr scopeAttr,
+                                           StringAttr keyAttr) {
+  printParameterReference(p, scopeAttr, keyAttr);
+}
+
+} // namespace mlir::iree_compiler::IREE::Flow
 
 #endif // IREE_COMPILER_DIALECT_FLOW_IR_FLOWTYPES_H_

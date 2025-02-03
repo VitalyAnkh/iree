@@ -65,9 +65,9 @@ trap "deactivate 2> /dev/null" EXIT
 # Skip package installs when you want by commenting this out. Freezing to a
 # specific version when iterating on metrics is useful, and fetching is slow.
 
-python -m pip install --upgrade \
+python -m pip install --upgrade --pre \
   --find-links https://iree.dev/pip-release-links.html \
-  iree-compiler iree-tools-tflite
+  iree-base-compiler iree-tools-tflite
 
 ###############################################################################
 # Download program source files                                               #
@@ -83,9 +83,6 @@ wget -nc https://storage.googleapis.com/iree-model-artifacts/MobileNetV3SmallSta
 ###############################################################################
 # Import programs into MLIR                                                   #
 ###############################################################################
-
-# Note: you can also download imported programs from CI runs:
-# https://iree.dev/developers/performance/benchmark-suites/#fetching-benchmark-artifacts-from-ci
 
 IREE_IMPORT_TFLITE_PATH=iree-import-tflite
 

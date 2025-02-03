@@ -28,9 +28,14 @@ or [Linux](https://rocm.docs.amd.com/en/latest/deploy/linux/quick_start.html).
 
 ### Get the IREE compiler
 
-#### :octicons-package-16: Download the compiler from a release
+#### :octicons-download-16: Download the compiler from a release
 
-!!! note "Currently ROCm is **NOT supported** for the Python interface."
+Python packages are distributed through multiple channels. See the
+[Python Bindings](../../reference/bindings/python.md) page for more details.
+The core [`iree-base-compiler`](https://pypi.org/project/iree-base-compiler/)
+package includes the ROCm compiler:
+
+--8<-- "docs/website/docs/guides/deployment-configurations/snippets/_iree-compiler-from-release.md"
 
 #### :material-hammer-wrench: Build the compiler from source
 
@@ -45,14 +50,37 @@ the IREE compiler, then enable the ROCm compiler target with the
 
 ### Get the IREE runtime
 
-Next you will need to get an IREE runtime that includes the ROCm HAL driver.
+Next you will need to get an IREE runtime that includes the HIP HAL driver.
+
+You can check for HIP support by looking for a matching driver and device:
+
+```console hl_lines="4"
+--8<-- "docs/website/docs/guides/deployment-configurations/snippets/_iree-run-module-driver-list.md"
+```
+
+```console hl_lines="3"
+$ iree-run-module --list_devices
+
+  hip://GPU-00000000-1111-2222-3333-444444444444
+  local-sync://
+  local-task://
+```
+
+#### :octicons-download-16: Download the runtime from a release
+
+Python packages are distributed through multiple channels. See the
+[Python Bindings](../../reference/bindings/python.md) page for more details.
+The core [`iree-base-runtime`](https://pypi.org/project/iree-base-runtime/)
+package includes the HIP HAL driver:
+
+--8<-- "docs/website/docs/guides/deployment-configurations/snippets/_iree-runtime-from-release.md"
 
 #### :material-hammer-wrench: Build the runtime from source
 
 Please make sure you have followed the
 [Getting started](../../building-from-source/getting-started.md) page to build
-IREE from source, then enable the experimental ROCm HAL driver with the
-`IREE_EXTERNAL_HAL_DRIVERS=rocm` option.
+IREE from source, then enable the HIP HAL driver with the `IREE_HAL_DRIVER_HIP`
+option.
 
 ## Compile and run a program model
 
@@ -76,30 +104,59 @@ following commands to compile:
 ```shell hl_lines="2-5"
 iree-compile \
     --iree-hal-target-backends=rocm \
-    --iree-rocm-target-chip=<...> \
-    --iree-rocm-link-bc=true \
-    --iree-rocm-bc-dir=<...> \
+    --iree-hip-target=<...> \
     mobilenet_iree_input.mlir -o mobilenet_rocm.vmfb
 ```
 
-Note ROCm Bitcode Dir (`iree-rocm-bc-dir`) path is required. If the system
-you are compiling IREE in has ROCm installed, then the default value of
-`/opt/rocm/amdgcn/bitcode` will usually suffice. If you intend on building
-ROCm compiler in a non-ROCm capable system, please set `iree-rocm-bc-dir`
-to the absolute path where you might have saved the amdgcn bitcode.
+Note that IREE comes with bundled bitcode files, which are used for linking
+certain intrinsics on AMD GPUs. These will be used automatically or if the
+`--iree-hip-bc-dir` is empty. As additional support may be needed for
+different chips, users can use this flag to point to an explicit directory.
+For example, in ROCm installations on Linux, this is often found under
+`/opt/rocm/amdgcn/bitcode`.
 
-Note that a ROCm target chip (`iree-rocm-target-chip`) of the form
-`gfx<arch_number>` is needed to compile towards each GPU architecture. If
-no architecture is specified then we will default to `gfx908`.
+A HIP target (`iree-hip-target`) matching the LLVM AMDGPU backend is needed to
+compile towards each GPU chip. Here is a table of commonly used architectures:
 
-Here is a table of commonly used architectures:
+| AMD GPU                  | SKU Name    | Target Architecture | Architecture Code Name |
+| ------------------------ | ----------- | ------------------- | ---------------------- |
+| AMD MI100                | `mi100`     | `gfx908`            | `cdna1`                |
+| AMD MI210                | `mi210`     | `gfx90a`            | `cdna2`                |
+| AMD MI250                | `mi250`     | `gfx90a`            | `cdna2`                |
+| AMD MI300X (early units) | N/A         | `gfx940`            | `cdna3`                |
+| AMD MI300A (early units) | N/A         | `gfx941`            | `cdna3`                |
+| AMD MI300A               | `mi300a`    | `gfx942`            | `cdna3`                |
+| AMD MI300X               | `mi300x`    | `gfx942`            | `cdna3`                |
+| AMD MI308X               | `mi308x`    | `gfx942`            | `cdna3`                |
+| AMD MI325X               | `mi325x`    | `gfx942`            | `cdna3`                |
+| AMD RX7900XTX            | `rx7900xtx` | `gfx1100`           | `rdna3`                |
+| AMD RX7900XT             | `rx7900xt`  | `gfx1100`           | `rdna3`                |
+| AMD PRO W7900            | `w7900`     | `gfx1100`           | `rdna3`                |
+| AMD PRO W7800            | `w7800`     | `gfx1100`           | `rdna3`                |
+| AMD RX7800XT             | `rx7800xt`  | `gfx1101`           | `rdna3`                |
+| AMD RX7700XT             | `rx7700xt`  | `gfx1101`           | `rdna3`                |
+| AMD PRO V710             | `v710`      | `gfx1101`           | `rdna3`                |
+| AMD PRO W7700            | `w7700`     | `gfx1101`           | `rdna3`                |
 
-| AMD GPU   | Target Chip |
-| --------- | ----------- |
-| AMD MI25  | `gfx900`    |
-| AMD MI50  | `gfx906`    |
-| AMD MI60  | `gfx906`    |
-| AMD MI100 | `gfx908`    |
+For a more comprehensive list of prior GPU generations, you can refer to the
+[LLVM AMDGPU backend](https://llvm.org/docs/AMDGPUUsage.html#processors).
+
+The `iree-hip-target` option support three schemes:
+
+1. The exact GPU product (SKU), e.g., `--iree-hip-target=mi300x`. This allows
+  the compiler to know about both the target architecture and about additional
+  hardware details like the number of compute units. This extra information
+  guides some compiler heuristics and allows for SKU-specific [tuning
+  specs](../../reference/tuning.md).
+2. The GPU architecture, as defined by LLVM, e.g., `--iree-hip-target=gfx942`.
+  This scheme allows for architecture-specific [tuning
+  specs](../../reference/tuning.md) only.
+3. The architecture code name, e.g., `--iree-hip-target=cdna3`. This scheme gets
+  translated to closes matching GPU architecture under the hood.
+
+We support for common code/SKU names without aiming to be exhaustive. If the
+ones you want are missing, please use the GPU architecture scheme (2.) as it is
+the most general.
 
 ### :octicons-terminal-16: Run a compiled program
 
@@ -107,7 +164,7 @@ Run the following command:
 
 ``` shell hl_lines="2"
 iree-run-module \
-    --device=rocm \
+    --device=hip \
     --module=mobilenet_rocm.vmfb \
     --function=predict \
     --input="1x224x224x3xf32=0"

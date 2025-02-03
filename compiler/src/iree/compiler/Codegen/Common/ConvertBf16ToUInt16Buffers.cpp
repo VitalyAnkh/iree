@@ -11,8 +11,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Utils/ConversionUtils.h"
@@ -23,6 +23,7 @@
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -33,9 +34,12 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
-#define DEBUG_TYPE "iree-spirv-emulate-bf16"
+#define DEBUG_TYPE "iree-codegen-convert-bf16-to-uint16-buffers"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_CONVERTBF16TOUINT16BUFFERSPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 namespace {
 
@@ -84,14 +88,13 @@ struct ConvertHalInterfaceBindingSubspan final
     if (!newResultTy)
       return rewriter.notifyMatchFailure(
           op->getLoc(),
-          llvm::formatv("failed to legalize memref type: {0}", op.getType()));
+          llvm::formatv("failed to legalize memref type: {}", op.getType()));
 
     auto newOp =
         rewriter.replaceOpWithNewOp<IREE::HAL::InterfaceBindingSubspanOp>(
-            op, newResultTy, adaptor.getSet(), adaptor.getBinding(),
-            adaptor.getDescriptorType(), adaptor.getByteOffset(),
-            adaptor.getDynamicDims(), adaptor.getAlignmentAttr(),
-            adaptor.getDescriptorFlagsAttr());
+            op, newResultTy, adaptor.getLayout(), adaptor.getBinding(),
+            adaptor.getByteOffset(), adaptor.getDynamicDims(),
+            adaptor.getAlignmentAttr(), adaptor.getDescriptorFlagsAttr());
     LLVM_DEBUG(llvm::dbgs() << "Bf16Emulation: new op: " << newOp << "\n");
     (void)newOp;
     return success();
@@ -108,7 +111,7 @@ struct ConvertMemRefAlloc final : OpConversionPattern<memref::AllocOp> {
     if (!newTy)
       return rewriter.notifyMatchFailure(
           op->getLoc(),
-          llvm::formatv("failed to convert memref type: {0}", op.getType()));
+          llvm::formatv("failed to convert memref type: {}", op.getType()));
 
     rewriter.replaceOpWithNewOp<memref::AllocOp>(
         op, newTy, adaptor.getDynamicSizes(), adaptor.getSymbolOperands(),
@@ -163,18 +166,22 @@ struct GenericTypeConversionPattern : public ConversionPattern {
     for (Region &r : op->getRegions()) {
       Region *newRegion = state.addRegion();
       rewriter.inlineRegionBefore(r, *newRegion, newRegion->begin());
-      TypeConverter::SignatureConversion result(newRegion->getNumArguments());
+    }
+    Operation *newOp = rewriter.create(state);
+
+    for (Region &newRegion : newOp->getRegions()) {
+      TypeConverter::SignatureConversion result(newRegion.getNumArguments());
 
       if (failed(getTypeConverter()->convertSignatureArgs(
-              newRegion->getArgumentTypes(), result))) {
+              newRegion.getArgumentTypes(), result))) {
         return rewriter.notifyMatchFailure(op,
                                            "argument type conversion failed");
       }
 
-      rewriter.applySignatureConversion(newRegion, result);
+      rewriter.applySignatureConversion(&newRegion.front(), result,
+                                        typeConverter);
     }
 
-    Operation *newOp = rewriter.create(state);
     rewriter.replaceOp(op, newOp->getResults());
     return success();
   }
@@ -189,7 +196,7 @@ struct ConvertMemRefLoad final : OpConversionPattern<memref::LoadOp> {
     Type newResTy = getTypeConverter()->convertType(op.getType());
     if (!newResTy)
       return rewriter.notifyMatchFailure(
-          op->getLoc(), llvm::formatv("failed to convert memref type: {0}",
+          op->getLoc(), llvm::formatv("failed to convert memref type: {}",
                                       op.getMemRefType()));
 
     rewriter.replaceOpWithNewOp<memref::LoadOp>(
@@ -208,7 +215,7 @@ struct ConvertMemRefStore final : OpConversionPattern<memref::StoreOp> {
     Type newTy = getTypeConverter()->convertType(op.getMemRefType());
     if (!newTy)
       return rewriter.notifyMatchFailure(
-          op->getLoc(), llvm::formatv("failed to convert memref type: {0}",
+          op->getLoc(), llvm::formatv("failed to convert memref type: {}",
                                       op.getMemRefType()));
 
     rewriter.replaceOpWithNewOp<memref::StoreOp>(
@@ -222,9 +229,8 @@ struct ConvertMemRefStore final : OpConversionPattern<memref::StoreOp> {
 // Helper functions
 //===----------------------------------------------------------------------===//
 
-std::optional<Value> materializeArithBitcast(OpBuilder &builder, Type resultTy,
-                                             mlir::ValueRange inputs,
-                                             mlir::Location loc) {
+Value materializeArithBitcast(OpBuilder &builder, Type resultTy,
+                              mlir::ValueRange inputs, mlir::Location loc) {
   return builder.create<arith::BitcastOp>(loc, resultTy, inputs);
 }
 
@@ -244,13 +250,13 @@ static void populateIreeBf16EmulationPatterns(RewritePatternSet &patterns,
 //===----------------------------------------------------------------------===//
 
 struct ConvertBf16ToUInt16BuffersPass final
-    : public ConvertBf16ToUInt16BuffersBase<ConvertBf16ToUInt16BuffersPass> {
+    : impl::ConvertBf16ToUInt16BuffersPassBase<ConvertBf16ToUInt16BuffersPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<vector::VectorDialect>();
   }
 
   void runOnOperation() override {
-    ModuleOp op = getOperation();
+    auto op = getOperation();
     MLIRContext *ctx = &getContext();
 
     Bf16EmulationConverter typeConverter;
@@ -265,9 +271,31 @@ struct ConvertBf16ToUInt16BuffersPass final
                                                      Operation *op) {
         return typeConverter.isLegal(cast<func::FuncOp>(op).getFunctionType());
       });
-      target.addDynamicallyLegalDialect<
-          arith::ArithDialect, func::FuncDialect, IREE::HAL::HALDialect,
-          memref::MemRefDialect, scf::SCFDialect, vector::VectorDialect>(
+      target.addLegalOp<arith::TruncFOp, arith::ExtFOp, ModuleOp>();
+      target.addDynamicallyLegalDialect<arith::ArithDialect, func::FuncDialect,
+                                        IREE::HAL::HALDialect,
+                                        memref::MemRefDialect, scf::SCFDialect,
+                                        IREE::Codegen::IREECodegenDialect>(
+          [&typeConverter](Operation *op) {
+            bool legal = typeConverter.isLegal(op);
+            LLVM_DEBUG(if (!legal) llvm::dbgs()
+                       << "Bf16Emulation: illegal op: " << *op << "\n");
+            return legal;
+          });
+
+      // Support the list of all vector operations that do not perform numerical
+      // changes:
+      target.addDynamicallyLegalOp<
+          vector::BroadcastOp, vector::ShuffleOp, vector::ExtractElementOp,
+          vector::ExtractOp, vector::InsertElementOp, vector::InsertOp,
+          vector::ScalableInsertOp, vector::ScalableExtractOp,
+          vector::InsertStridedSliceOp, vector::ExtractStridedSliceOp,
+          vector::TransferReadOp, vector::TransferWriteOp, vector::LoadOp,
+          vector::StoreOp, vector::MaskedLoadOp, vector::MaskedStoreOp,
+          vector::GatherOp, vector::ScatterOp, vector::ExpandLoadOp,
+          vector::CompressStoreOp, vector::ShapeCastOp, vector::ConstantMaskOp,
+          vector::CreateMaskOp, vector::MaskOp, vector::TransposeOp,
+          vector::FlatTransposeOp, vector::SplatOp, vector::YieldOp>(
           [&typeConverter](Operation *op) {
             bool legal = typeConverter.isLegal(op);
             LLVM_DEBUG(if (!legal) llvm::dbgs()
@@ -276,7 +304,6 @@ struct ConvertBf16ToUInt16BuffersPass final
           });
 
       RewritePatternSet patterns(ctx);
-      arith::populateExpandBFloat16Patterns(patterns);
       populateIreeBf16EmulationPatterns(patterns, typeConverter);
 
       if (failed(applyPartialConversion(op, target, std::move(patterns))))
@@ -286,14 +313,4 @@ struct ConvertBf16ToUInt16BuffersPass final
 };
 
 } // namespace
-
-//===----------------------------------------------------------------------===//
-// Public interface
-//===----------------------------------------------------------------------===//
-
-std::unique_ptr<OperationPass<ModuleOp>>
-createConvertBf16ToUInt16BuffersPass() {
-  return std::make_unique<ConvertBf16ToUInt16BuffersPass>();
-}
-
 } // namespace mlir::iree_compiler

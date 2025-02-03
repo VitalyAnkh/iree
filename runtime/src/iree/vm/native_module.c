@@ -204,6 +204,7 @@ static iree_status_t IREE_API_PTR iree_vm_native_module_get_function(
       return iree_vm_native_module_get_import_function(
           module, ordinal, out_function, out_name, out_signature);
     case IREE_VM_FUNCTION_LINKAGE_EXPORT:
+    case IREE_VM_FUNCTION_LINKAGE_EXPORT_OPTIONAL:
       return iree_vm_native_module_get_export_function(
           module, ordinal, out_function, out_name, out_signature);
     default:
@@ -221,7 +222,8 @@ static iree_status_t IREE_API_PTR iree_vm_native_module_get_function_attr(
     return module->user_interface.get_function_attr(module->self, linkage,
                                                     ordinal, index, out_attr);
   }
-  if (linkage != IREE_VM_FUNCTION_LINKAGE_EXPORT) {
+  if (linkage != IREE_VM_FUNCTION_LINKAGE_EXPORT &&
+      linkage != IREE_VM_FUNCTION_LINKAGE_EXPORT_OPTIONAL) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                             "only exported functions can be queried");
   } else if (ordinal >= module->descriptor->export_count) {
@@ -250,7 +252,8 @@ static iree_status_t IREE_API_PTR iree_vm_native_module_lookup_function(
         module->self, linkage, name, expected_signature, out_function);
   }
 
-  if (IREE_UNLIKELY(linkage != IREE_VM_FUNCTION_LINKAGE_EXPORT)) {
+  if (IREE_UNLIKELY(linkage != IREE_VM_FUNCTION_LINKAGE_EXPORT &&
+                    linkage != IREE_VM_FUNCTION_LINKAGE_EXPORT_OPTIONAL)) {
     // NOTE: we could support imports if required.
     return iree_make_status(
         IREE_STATUS_UNIMPLEMENTED,
@@ -274,10 +277,13 @@ static iree_status_t IREE_API_PTR iree_vm_native_module_lookup_function(
       max_ordinal = ordinal - 1;
     }
   }
+  if (linkage == IREE_VM_FUNCTION_LINKAGE_EXPORT_OPTIONAL) {
+    return iree_status_from_code(IREE_STATUS_NOT_FOUND);  // lightweight fail
+  }
   return iree_make_status(
-      IREE_STATUS_NOT_FOUND, "no function %.*s.%.*s exported by module",
-      (int)module->descriptor->name.size, module->descriptor->name.data,
-      (int)name.size, name.data);
+      IREE_STATUS_NOT_FOUND, "no function `%.*s` exported by module `%.*s`",
+      (int)name.size, name.data, (int)module->descriptor->name.size,
+      module->descriptor->name.data);
 }
 
 static iree_status_t IREE_API_PTR
@@ -302,6 +308,24 @@ static void IREE_API_PTR iree_vm_native_module_free_state(
   }
   // No-op in the default implementation.
   IREE_ASSERT_EQ(module_state, NULL);
+}
+
+static iree_status_t IREE_API_PTR iree_vm_native_module_fork_state(
+    void* self, iree_vm_module_state_t* parent_state,
+    iree_allocator_t allocator, iree_vm_module_state_t** out_child_state) {
+  iree_vm_native_module_t* module = (iree_vm_native_module_t*)self;
+  if (module->user_interface.fork_state) {
+    return module->user_interface.fork_state(module->self, parent_state,
+                                             allocator, out_child_state);
+  }
+  // No-op in the default implementation. If any state is allocated the target
+  // must implement the fork_state function.
+  IREE_ASSERT_EQ(parent_state, NULL);
+  return parent_state
+             ? iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                                "native module must implement fork_state if it "
+                                "provides module state")
+             : iree_ok_status();
 }
 
 static iree_status_t IREE_API_PTR iree_vm_native_module_resolve_import(
@@ -369,7 +393,9 @@ static iree_status_t iree_vm_native_module_issue_call(
 static iree_status_t IREE_API_PTR iree_vm_native_module_begin_call(
     void* self, iree_vm_stack_t* stack, iree_vm_function_call_t call) {
   iree_vm_native_module_t* module = (iree_vm_native_module_t*)self;
-  if (IREE_UNLIKELY(call.function.linkage != IREE_VM_FUNCTION_LINKAGE_EXPORT) ||
+  if (IREE_UNLIKELY(call.function.linkage != IREE_VM_FUNCTION_LINKAGE_EXPORT &&
+                    call.function.linkage !=
+                        IREE_VM_FUNCTION_LINKAGE_EXPORT_OPTIONAL) ||
       IREE_UNLIKELY(call.function.ordinal >=
                     module->descriptor->export_count)) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
@@ -519,6 +545,7 @@ IREE_API_EXPORT iree_status_t iree_vm_native_module_initialize(
       iree_vm_native_module_get_function_attr;
   module->base_interface.alloc_state = iree_vm_native_module_alloc_state;
   module->base_interface.free_state = iree_vm_native_module_free_state;
+  module->base_interface.fork_state = iree_vm_native_module_fork_state;
   module->base_interface.resolve_import = iree_vm_native_module_resolve_import;
   module->base_interface.notify = iree_vm_native_module_notify;
   module->base_interface.begin_call = iree_vm_native_module_begin_call;

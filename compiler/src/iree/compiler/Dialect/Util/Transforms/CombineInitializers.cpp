@@ -10,11 +10,9 @@
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTraits.h"
-#include "iree/compiler/Dialect/Util/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
@@ -25,10 +23,14 @@
 #define DEBUG_TYPE "iree-util-combine-initializers"
 
 namespace mlir::iree_compiler::IREE::Util {
+
+#define GEN_PASS_DEF_COMBINEINITIALIZERSPASS
+#include "iree/compiler/Dialect/Util/Transforms/Passes.h.inc"
+
 namespace {
 
 class CombineInitializersPass
-    : public CombineInitializersBase<CombineInitializersPass> {
+    : public impl::CombineInitializersPassBase<CombineInitializersPass> {
 public:
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<IREE::Util::UtilDialect>();
@@ -49,10 +51,10 @@ public:
       return;
     auto fusedLoc = FusedLoc::get(&getContext(), locs);
 
-    // Make the new initializer op in the same location as the last initializer
+    // Make the new initializer op in the same location as the first initializer
     // we are combining - this ensures that module initialization order is
     // preserved.
-    OpBuilder builder(initializerOps.back());
+    OpBuilder builder(initializerOps.front());
     auto newOp = builder.create<IREE::Util::InitializerOp>(fusedLoc);
     builder.setInsertionPointToStart(newOp.addEntryBlock());
     InlinerInterface inlinerInterface(&getContext());
@@ -70,14 +72,10 @@ public:
       builder.setInsertionPointToEnd(&newOp.back());
       initializerOp.erase();
     }
-    builder.create<IREE::Util::InitializerReturnOp>(fusedLoc);
+    builder.create<IREE::Util::ReturnOp>(fusedLoc);
   }
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createCombineInitializersPass() {
-  return std::make_unique<CombineInitializersPass>();
-}
 
 } // namespace mlir::iree_compiler::IREE::Util

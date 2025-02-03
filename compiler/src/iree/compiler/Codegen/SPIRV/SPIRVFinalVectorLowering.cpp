@@ -13,7 +13,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "iree/compiler/Codegen/Common/Passes.h"
-#include "iree/compiler/Codegen/SPIRV/PassDetail.h"
 #include "iree/compiler/Codegen/SPIRV/Passes.h"
 #include "iree/compiler/Codegen/Transforms/Transforms.h"
 #include "llvm/Support/Debug.h"
@@ -30,9 +29,12 @@
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_SPIRVFINALVECTORLOWERINGPASS
+#include "iree/compiler/Codegen/SPIRV/Passes.h.inc"
+
 namespace {
 
-void debugPrint(func::FuncOp funcOp, const char *message) {
+void debugPrint(mlir::FunctionOpInterface funcOp, const char *message) {
   LLVM_DEBUG({
     llvm::dbgs() << "//--- " << message << " ---//\n";
     funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
@@ -40,8 +42,9 @@ void debugPrint(func::FuncOp funcOp, const char *message) {
   });
 }
 
-class SPIRVFinalVectorLoweringPass
-    : public SPIRVFinalVectorLoweringBase<SPIRVFinalVectorLoweringPass> {
+class SPIRVFinalVectorLoweringPass final
+    : public impl::SPIRVFinalVectorLoweringPassBase<
+          SPIRVFinalVectorLoweringPass> {
 public:
   void getDependentDialects(DialectRegistry &registry) const override {
     // vector.gather lowering patterns target scf ops.
@@ -50,7 +53,7 @@ public:
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
-    func::FuncOp funcOp = getOperation();
+    auto funcOp = getOperation();
 
     // Lower vector transfer permutation map.
     {
@@ -58,7 +61,7 @@ public:
       vector::ExtractStridedSliceOp::getCanonicalizationPatterns(patterns,
                                                                  context);
       vector::populateVectorTransferPermutationMapLoweringPatterns(patterns);
-      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
@@ -81,7 +84,7 @@ public:
       vector::populateVectorGatherLoweringPatterns(patterns);
       vector::populateVectorMaskOpLoweringPatterns(patterns);
       vector::CreateMaskOp::getCanonicalizationPatterns(patterns, context);
-      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
@@ -99,7 +102,7 @@ public:
       populateVectorTransferTensorSliceTransforms(patterns);
       vector::ReductionOp::getCanonicalizationPatterns(patterns, context);
       scf::IfOp::getCanonicalizationPatterns(patterns, context);
-      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
@@ -107,10 +110,4 @@ public:
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createSPIRVFinalVectorLoweringPass() {
-  return std::make_unique<SPIRVFinalVectorLoweringPass>();
-}
-
 } // namespace mlir::iree_compiler

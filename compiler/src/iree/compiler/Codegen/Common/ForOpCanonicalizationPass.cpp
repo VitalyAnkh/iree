@@ -4,21 +4,20 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include <numeric>
-
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/Pass/PassRegistry.h"
-#include "mlir/Support/MathExtras.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_FOROPCANONICALIZATIONPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 namespace {
 
@@ -111,7 +110,7 @@ struct CanonicalizeForOpInductionVarShape final
         newResults.push_back(results[index]);
       }
     }
-    rewriter.updateRootInPlace(
+    rewriter.modifyOpInPlace(
         yieldOp, [&]() { yieldOp.getOperation()->setOperands(newResults); });
     return newResults;
   }
@@ -198,7 +197,7 @@ struct PackForOpInductionVarVector final : public OpRewritePattern<scf::ForOp> {
         continue;
       }
       int64_t numElements = ShapedType::getNumElements(iterType.getShape());
-      int64_t bitWidth = iterType.getElementType().getIntOrFloatBitWidth();
+      int64_t bitWidth = IREE::Util::getTypeBitWidth(iterType.getElementType());
       int64_t totalBits = numElements * bitWidth;
       if (numElements > 4 && totalBits <= 128 &&
           llvm::isPowerOf2_64(totalBits)) {
@@ -208,7 +207,7 @@ struct PackForOpInductionVarVector final : public OpRewritePattern<scf::ForOp> {
             VectorType::get({numElements}, iterType.getElementType());
         castTypes.push_back(shapeCastType);
         auto targetType =
-            VectorType::get({mlir::ceilDiv(totalBits, 32)},
+            VectorType::get({llvm::divideCeilSigned(totalBits, 32)},
                             rewriter.getIntegerType(
                                 std::min(static_cast<int64_t>(32), totalBits)));
         targetTypes.push_back(targetType);
@@ -290,34 +289,29 @@ struct PackForOpInductionVarVector final : public OpRewritePattern<scf::ForOp> {
   }
 };
 
-struct ForOpCanonicalizationPass
-    : public ForOpCanonicalizationBase<ForOpCanonicalizationPass> {
+struct ForOpCanonicalizationPass final
+    : impl::ForOpCanonicalizationPassBase<ForOpCanonicalizationPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<scf::SCFDialect, vector::VectorDialect>();
   }
 
   void runOnOperation() override {
-    func::FuncOp fn = getOperation();
+    auto fn = getOperation();
     // These patterns collide so we apply them one after another. The
     // canonicalization pattern will be blocked by the packing pattern
     // so we apply that first.
     RewritePatternSet canonPatterns(&getContext());
     canonPatterns.insert<CanonicalizeForOpInductionVarShape>(fn.getContext());
-    if (failed(applyPatternsAndFoldGreedily(fn, std::move(canonPatterns)))) {
+    if (failed(applyPatternsGreedily(fn, std::move(canonPatterns)))) {
       return signalPassFailure();
     }
     RewritePatternSet packPatterns(&getContext());
     packPatterns.insert<PackForOpInductionVarVector>(fn.getContext());
-    if (failed(applyPatternsAndFoldGreedily(fn, std::move(packPatterns)))) {
+    if (failed(applyPatternsGreedily(fn, std::move(packPatterns)))) {
       return signalPassFailure();
     }
   }
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>> createForOpCanonicalizationPass() {
-  return std::make_unique<ForOpCanonicalizationPass>();
-}
-
 } // namespace mlir::iree_compiler

@@ -9,15 +9,12 @@
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
-#include "mlir/Dialect/Transform/IR/TransformInterfaces.h"
+#include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 
 namespace mlir {
 
 class DialectRegistry;
-
-namespace func {
-class FuncOp;
-} // namespace func
 
 namespace scf {
 class ForallOp;

@@ -18,17 +18,19 @@ iree_cc_library(
   SRCS
     "Passes.cpp"
   DEPS
-    IREELinalgExtPasses
     MLIRPass
     iree::compiler::Codegen::Common
     iree::compiler::Codegen::Common::CPU::CommonCPUPasses
     iree::compiler::Codegen::Common::GPU::CommonGPUPasses
-    iree::compiler::Codegen::Dialect::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::GPU::Transforms::GPUTransforms
+    iree::compiler::Codegen::Dialect::VectorExt::Transforms::VectorExtTransforms
     iree::compiler::Codegen::LLVMCPU
     iree::compiler::Codegen::LLVMGPU
     iree::compiler::Codegen::SPIRV
     iree::compiler::Codegen::VMVX
     iree::compiler::Codegen::WGSL
+    iree::compiler::Dialect::LinalgExt::Transforms
   PUBLIC
 )
 

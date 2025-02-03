@@ -16,8 +16,8 @@
 #   ./build_tools/python_deploy/build_linux_packages.sh
 #
 # Build specific Python versions and packages to custom directory:
-#   override_python_versions="cp39-cp39 cp310-310" \
-#   packages="iree-runtime" \
+#   override_python_versions="cp39-cp39 cp310-cp310" \
+#   packages="iree-base-runtime" \
 #   output_dir="/tmp/wheelhouse" \
 #   ./build_tools/python_deploy/build_linux_packages.sh
 #
@@ -26,8 +26,8 @@
 #   cp39-cp39 cp310-cp310
 #
 # Valid packages:
-#   iree-runtime
-#   iree-compiler
+#   iree-base-runtime
+#   iree-base-compiler
 #
 # Note that this script is meant to be run on CI and it will pollute both the
 # output directory and in-tree build/ directories (under runtime/ and
@@ -64,12 +64,14 @@ function find_git_dir_parent() {
 this_dir="$(cd $(dirname $0) && pwd)"
 script_name="$(basename $0)"
 repo_root=$(cd "${this_dir}" && find_git_dir_parent)
-manylinux_docker_image="${manylinux_docker_image:-$(uname -m | awk '{print ($1 == "aarch64") ? "quay.io/pypa/manylinux_2_28_aarch64" : "ghcr.io/nod-ai/manylinux_x86_64:main" }')}"
-python_versions="${override_python_versions:-cp39-cp39 cp310-cp310 cp311-cp311}"
+manylinux_docker_image="${manylinux_docker_image:-$(uname -m | awk '{print ($1 == "aarch64") ? "quay.io/pypa/manylinux_2_28_aarch64" : "ghcr.io/iree-org/manylinux_x86_64@sha256:2e0246137819cf10ed84240a971f9dd75cc3eb62dc6907dfd2080ee966b3c9f4" }')}"
+python_versions="${override_python_versions:-cp39-cp39 cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp313-cp313t}"
 output_dir="${output_dir:-${this_dir}/wheelhouse}"
-packages="${packages:-iree-runtime iree-compiler}"
+packages="${packages:-iree-base-runtime iree-base-compiler}"
 package_suffix="${package_suffix:-}"
 toolchain_suffix="${toolchain_suffix:-release}"
+# Return ON if we are on a supported platform for CUDA.
+enable_cuda="$(uname -m | awk '{print ($1 == "x86_64" || $1 == "aarch64") ? "ON" : "OFF"}')"
 
 function run_on_host() {
   echo "Running on host"
@@ -128,17 +130,17 @@ function run_in_docker() {
       # replace dashes with underscores
       package_suffix="${package_suffix//-/_}"
       case "${package}" in
-        iree-runtime)
-          clean_wheels "iree_runtime${package_suffix}" "${python_version}"
-          install_deps "iree_runtime${package_suffix}" "${python_version}"
+        iree-base-runtime)
+          clean_wheels "iree_base_runtime${package_suffix}" "${python_version}"
+          install_deps "iree_base_runtime${package_suffix}" "${python_version}"
           build_iree_runtime
-          run_audit_wheel "iree_runtime${package_suffix}" "${python_version}"
+          run_audit_wheel "iree_base_runtime${package_suffix}" "${python_version}"
           ;;
-        iree-compiler)
-          clean_wheels "iree_compiler${package_suffix}" "${python_version}"
-          install_deps "iree_runtime${package_suffix}" "${python_version}"
+        iree-base-compiler)
+          clean_wheels "iree_base_compiler${package_suffix}" "${python_version}"
+          install_deps "iree_base_compiler${package_suffix}" "${python_version}"
           build_iree_compiler
-          run_audit_wheel "iree_compiler${package_suffix}" "${python_version}"
+          run_audit_wheel "iree_base_compiler${package_suffix}" "${python_version}"
           ;;
         *)
           echo "Unrecognized package '${package}'"
@@ -157,10 +159,14 @@ function build_iree_runtime() {
   export IREE_RUNTIME_BUILD_TRACY=ON
   # We install the needed build deps below for the tools.
   export IREE_RUNTIME_BUILD_TRACY_TOOLS=ON
+  export IREE_HAL_DRIVER_CUDA="${enable_cuda}"
+  export IREE_HAL_DRIVER_HIP=ON
   build_wheel runtime/
 }
 
 function build_iree_compiler() {
+  export IREE_TARGET_BACKEND_CUDA="${enable_cuda}"
+  export IREE_TARGET_BACKEND_ROCM=ON
   build_wheel compiler/
 }
 
@@ -200,16 +206,14 @@ function install_deps() {
   # Get the output of uname -m
   uname_m=$(uname -m)
 
-  # Check if the output is aarch64
   if [[ "$uname_m" == "aarch64" ]]; then
     echo "The architecture is aarch64 and we use manylinux 2_28 so install deps"
     yum install -y epel-release
     yum update -y
     # Required for Tracy
-    yum install -y capstone-devel tbb-devel libzstd-devel
+    yum install -y libzstd-devel
     yum install -y clang lld
   elif [[ "$uname_m" == "x86_64" ]]; then
-    # Check if the output is x86_64
     echo "The architecture is x86_64 so assume we are on a managed image with deps"
   else
     echo "The architecture is unknown. Exiting"

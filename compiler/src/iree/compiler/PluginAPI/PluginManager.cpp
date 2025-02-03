@@ -193,6 +193,13 @@ LogicalResult PluginManagerSession::activatePlugins(MLIRContext *context) {
   return success();
 }
 
+void PluginManagerSession::populateHALTargetDevices(
+    IREE::HAL::TargetDeviceList &list) {
+  for (auto *s : initializedSessions) {
+    s->populateHALTargetDevices(list);
+  }
+}
+
 void PluginManagerSession::populateHALTargetBackends(
     IREE::HAL::TargetBackendList &list) {
   for (auto *s : initializedSessions) {

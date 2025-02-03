@@ -5,9 +5,12 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/Passes.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Utils/Utils.h"
 
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/IR/PatternMatch.h"
@@ -116,6 +119,63 @@ public:
   }
 };
 
+/// Returns true if `writeOp` fully overwrites its destination.
+///
+/// Example:
+///
+/// ```
+/// vector.transfer_write %vec, %dest[%c0, %c0] {in_bounds = [true, true]}
+///    : vector<4x5xf32>, tensor<4x5xf32>
+/// ```
+///
+/// This is an easy case, `vector<4x5xf32>` fully-overwrites `tensor<4x5xf32>`
+/// as the vector is the same size as the tensor. This check also supports
+/// dynamic tensors, where it resolves the tensor sizes via value-bounds
+/// analysis, and then checks if the vector type fully overwrites the tensor.
+static bool isDestinationFullyOverwritten(vector::TransferWriteOp writeOp) {
+  if (writeOp.hasOutOfBoundsDim())
+    return false;
+  if (writeOp.getVectorType().getRank() != writeOp.getShapedType().getRank())
+    return false;
+  if (writeOp.getMask())
+    return false;
+
+  std::optional<vector::VscaleRange> vscaleRange;
+  auto vecType = writeOp.getVectorType();
+  if (vecType.isScalable()) {
+    auto targetAttr =
+        iree_compiler::IREE::HAL::ExecutableTargetAttr::lookup(writeOp);
+    vscaleRange = iree_compiler::getDefaultVscaleRange(targetAttr);
+  }
+
+  Value dest = writeOp.getSource();
+  ArrayRef<int64_t> destShape = writeOp.getShapedType().getShape();
+
+  // Attempts to resolve the size of a dim within the destination.
+  auto resolveDestinationDimSize =
+      [&](unsigned dimIndex) -> FailureOr<iree_compiler::DimBoundSize> {
+    auto size = destShape[dimIndex];
+    // Fixed-size dimensions are simply included in the shape.
+    if (size != ShapedType::kDynamic)
+      return iree_compiler::DimBoundSize{size};
+    // (Attempt to) resolve dynamic dimensions via value-bounds analysis.
+    return iree_compiler::computeDimUpperBound(dest, dimIndex, vscaleRange);
+  };
+
+  ArrayRef<int64_t> vecShape = vecType.getShape();
+  ArrayRef<bool> vecScalableFlags = vecType.getScalableDims();
+  for (unsigned d = 0, e = destShape.size(); d < e; ++d) {
+    auto dimSize = resolveDestinationDimSize(d);
+    if (failed(dimSize))
+      return false;
+    if (dimSize->scalable && !vecScalableFlags[d])
+      return false;
+    if (vecShape[d] != dimSize->baseSize)
+      return false;
+  }
+  return true;
+}
+
 /// Fold tensor.insert_slice into vector.transfer_write if the transfer_write
 /// could directly write to the insert_slice's destination. E.g.:
 ///
@@ -149,20 +209,12 @@ public:
     // TODO: support 0-d corner case.
     if (xferOp.getTransferRank() == 0)
       return failure();
-
-    if (xferOp.hasOutOfBoundsDim())
-      return failure();
-    if (xferOp.getVectorType().getRank() != xferOp.getShapedType().getRank())
-      return failure();
-    if (xferOp.getMask())
+    if (!xferOp.getPermutationMap().isIdentity())
       return failure();
     // Fold only if the TransferWriteOp completely overwrites the `source` with
     // a vector. I.e., the result of the TransferWriteOp is a new tensor whose
     // content is the data of the vector.
-    if (!llvm::equal(xferOp.getVectorType().getShape(),
-                     xferOp.getShapedType().getShape()))
-      return failure();
-    if (!xferOp.getPermutationMap().isIdentity())
+    if (!isDestinationFullyOverwritten(xferOp))
       return failure();
 
     // Bail on illegal rank-reduction: we need to check that the rank-reduced
@@ -204,11 +256,97 @@ public:
   }
 };
 
+/// Fold tensor.extract_slice into vector.transfer_write if
+///   1. The vector.transfer_write op has only one use.
+///   2. All the offests of the tensor.extract_slice op are zeros.
+///   3. The vector.transfer_write op does not have masks.
+///   4. The vector.transfer_write op writes to a tensor.empty op.
+///
+/// E.g.:
+///
+/// ```
+/// %0 = vector.transfer_write %v, %t[%a, %b, %c]
+///   {in_bounds = [true, true, true]}
+///   : vector<1x64x128xf16>, tensor<1x64x128xf16>
+/// %extracted_slice = tensor.extract_slice %0[0, 0, 0] [1, %3, 128] [1, 1, 1]
+///   : tensor<1x64x128xf16> to tensor<1x?x128xf16>
+/// ```
+/// is rewritten to:
+/// ```
+/// %1 = vector.transfer_write %v, %t2[%a, %b, %c]
+///   {in_bounds = [true, false, true]}
+///   : vector<1x64x128xf16>, tensor<1x?x128xf16>
+/// ```
+class FoldExtractSliceIntoTransferWrite final
+    : public OpRewritePattern<tensor::ExtractSliceOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::ExtractSliceOp extractSliceOp,
+                                PatternRewriter &rewriter) const override {
+    if (extractSliceOp.getDroppedDims().any()) {
+      return rewriter.notifyMatchFailure(
+          extractSliceOp,
+          "expect it is not a rank-reduced tensor.extract_slice op");
+    }
+    if (!llvm::all_of(extractSliceOp.getMixedOffsets(), isZeroIndex)) {
+      return rewriter.notifyMatchFailure(extractSliceOp,
+                                         "expect all the offsets are zeros");
+    }
+
+    auto xferOp =
+        extractSliceOp.getSource().getDefiningOp<vector::TransferWriteOp>();
+    if (!xferOp) {
+      return rewriter.notifyMatchFailure(
+          extractSliceOp, "expect the source is from transfer.vector_write op");
+    }
+    if (!xferOp->hasOneUse()) {
+      return rewriter.notifyMatchFailure(
+          extractSliceOp,
+          "expect the transfer.vector_write op has only one use");
+    }
+    if (!xferOp.getSource().getDefiningOp<tensor::EmptyOp>()) {
+      return rewriter.notifyMatchFailure(
+          extractSliceOp, "expect the transfer.vector_write op to write into a "
+                          "tensor.empty op");
+    }
+    if (xferOp.getMask()) {
+      return failure();
+    }
+
+    Location loc = extractSliceOp.getLoc();
+    SmallVector<OpFoldResult> mixedSizes = extractSliceOp.getMixedSizes();
+    auto init = rewriter.create<tensor::EmptyOp>(
+        loc, mixedSizes, extractSliceOp.getType().getElementType());
+
+    auto indices = xferOp.getIndices();
+
+    SmallVector<bool> inBounds(mixedSizes.size(), false);
+    for (auto [idx, vecSize, destSize, index] : llvm::zip_equal(
+             llvm::seq<int64_t>(0, inBounds.size()),
+             xferOp.getVectorType().getShape(), mixedSizes, indices)) {
+      auto maybeIndex = getConstantIntValue(index);
+      auto maybeDestSize = getConstantIntValue(destSize);
+      if (!maybeDestSize || !maybeIndex) {
+        continue;
+      }
+      if (vecSize + *maybeIndex <= *maybeDestSize)
+        inBounds[idx] = true;
+    }
+
+    rewriter.replaceOpWithNewOp<vector::TransferWriteOp>(
+        extractSliceOp, xferOp.getVector(), init, indices,
+        xferOp.getPermutationMap(), inBounds);
+
+    return success();
+  }
+};
+
 } // namespace
 
 void mlir::iree_compiler::populateVectorTransferTensorSliceTransforms(
     RewritePatternSet &patterns, PatternBenefit benefit) {
   patterns
-      .add<FoldExtractSliceIntoTransferRead, FoldInsertSliceIntoTransferWrite>(
-          patterns.getContext(), benefit);
+      .add<FoldExtractSliceIntoTransferRead, FoldInsertSliceIntoTransferWrite,
+           FoldExtractSliceIntoTransferWrite>(patterns.getContext(), benefit);
 }

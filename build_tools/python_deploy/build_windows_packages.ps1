@@ -10,7 +10,7 @@
 # Configure settings with script parameters.
 param(
     [array]$python_versions=@("3.11"),
-    [array]$packages=@("iree-runtime", "iree-compiler"),
+    [array]$packages=@("iree-base-runtime", "iree-base-compiler"),
     [System.String]$output_dir
 )
 
@@ -47,12 +47,12 @@ function run() {
 
       Write-Host ":::: Version: $(py -${python_version} --version)"
       switch ($package) {
-          "iree-runtime" {
-            clean_wheels iree_runtime $python_version
+          "iree-base-runtime" {
+            clean_wheels iree_base_runtime $python_version
             build_iree_runtime $python_version
           }
-          "iree-compiler" {
-            clean_wheels iree_compiler $python_version
+          "iree-base-compiler" {
+            clean_wheels iree_base_compiler $python_version
             build_iree_compiler $python_version
           }
           Default {
@@ -67,11 +67,15 @@ function run() {
 function build_iree_runtime() {
   param($python_version)
   $env:IREE_HAL_DRIVER_VULKAN = "ON"
+  $env:IREE_HAL_DRIVER_HIP = "ON"
+  $env:IREE_HAL_DRIVER_CUDA = "ON"
   & py -${python_version} -m pip wheel -v -w $output_dir $repo_root/runtime/
 }
 
 function build_iree_compiler() {
   param($python_version)
+  $env:IREE_TARGET_BACKEND_CUDA = "ON"
+  $env:IREE_TARGET_BACKEND_ROCM = "ON"
   py -${python_version} -m pip wheel -v -w $output_dir $repo_root/compiler/
 }
 

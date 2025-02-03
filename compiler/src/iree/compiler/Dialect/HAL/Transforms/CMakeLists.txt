@@ -16,34 +16,48 @@ iree_cc_library(
   HDRS
     "Passes.h"
   SRCS
+    "AssignLegacyTargetDevices.cpp"
     "AssignTargetDevices.cpp"
-    "BenchmarkBatchDispatches.cpp"
+    "CaptureExecutableSources.cpp"
     "ConfigureExecutables.cpp"
     "ConvertToHAL.cpp"
     "DumpExecutableBenchmarks.cpp"
     "DumpExecutableSources.cpp"
     "ElideRedundantCommands.cpp"
-    "FixupLegacySync.cpp"
+    "HoistExecutableObjects.cpp"
+    "InitializeDevices.cpp"
+    "InlineMemoizeRegions.cpp"
     "LinkExecutables.cpp"
     "MaterializeDispatchInstrumentation.cpp"
     "MaterializeInterfaces.cpp"
     "MaterializeResourceCaches.cpp"
+    "MaterializeTargetDevices.cpp"
     "MemoizeDeviceQueries.cpp"
+    "OutlineMemoizeRegions.cpp"
     "Passes.cpp"
+    "Passes.h.inc"
     "PreprocessExecutables.cpp"
+    "PruneExecutables.cpp"
+    "RepeatDispatches.cpp"
+    "ResolveDeviceAliases.cpp"
+    "ResolveDevicePromises.cpp"
     "ResolveExportOrdinals.cpp"
     "SerializeExecutables.cpp"
     "StripExecutableContents.cpp"
     "SubstituteExecutables.cpp"
     "TranslateExecutables.cpp"
-    "VerifyTargetEnvironment.cpp"
+    "VerifyDevices.cpp"
   DEPS
+    ::PassesIncGen
     LLVMSupport
     MLIRAffineToStandard
+    MLIRAffineTransforms
     MLIRArithDialect
+    MLIRAsmParser
     MLIRBufferizationDialect
     MLIRControlFlowDialect
     MLIRFuncDialect
+    MLIRFunctionInterfaces
     MLIRIR
     MLIRParser
     MLIRPass
@@ -51,9 +65,9 @@ iree_cc_library(
     MLIRSCFToControlFlow
     MLIRSupport
     MLIRTensorDialect
+    MLIRTransformUtils
     MLIRTransforms
-    iree::compiler::Codegen::Common::CPU::CommonCPUPasses
-    iree::compiler::Codegen::Dialect::IREECodegenDialect
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
     iree::compiler::Dialect::Flow::IR
     iree::compiler::Dialect::HAL::Analysis
     iree::compiler::Dialect::HAL::Conversion
@@ -64,6 +78,7 @@ iree_cc_library(
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::HAL::IR::HALDialect
     iree::compiler::Dialect::HAL::Target
+    iree::compiler::Dialect::HAL::Target::Devices
     iree::compiler::Dialect::Stream::IR
     iree::compiler::Dialect::Stream::Transforms
     iree::compiler::Dialect::Util::Conversion
@@ -74,6 +89,15 @@ iree_cc_library(
     iree::schemas::instruments
     iree::schemas::instruments::dispatch_def_c_fbs
   PUBLIC
+)
+
+iree_tablegen_library(
+  NAME
+    PassesIncGen
+  TD_FILE
+    "Passes.td"
+  OUTS
+    --gen-pass-decls Passes.h.inc
 )
 
 ### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###

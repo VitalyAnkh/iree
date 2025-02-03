@@ -8,7 +8,6 @@
 
 #include "iree/compiler/Dialect/Stream/IR/StreamDialect.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
-#include "iree/compiler/Dialect/Stream/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Stream/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Util/Analysis/DFX/Element.h"
 #include "iree/compiler/Dialect/Util/Analysis/DFX/Solver.h"
@@ -34,6 +33,10 @@
 #define DEBUG_TYPE "iree-stream-elide-timepoints"
 
 namespace mlir::iree_compiler::IREE::Stream {
+
+#define GEN_PASS_DEF_ELIDETIMEPOINTSPASS
+#include "iree/compiler/Dialect/Stream/Transforms/Passes.h.inc"
+
 namespace {
 
 //===----------------------------------------------------------------------===//
@@ -471,8 +474,8 @@ private:
         .Case([&](mlir::CallOpInterface callOp) {
           // Step into callees and get a coverage intersection of all return
           // sites.
-          auto callableOp =
-              callOp.resolveCallable(&solver.getExplorer().getSymbolTables());
+          auto callableOp = callOp.resolveCallableInTable(
+              &solver.getExplorer().getSymbolTables());
           unsigned resultIndex = llvm::cast<OpResult>(value).getResultNumber();
           gatherRegionReturns(callableOp, resultIndex);
         })
@@ -512,8 +515,8 @@ public:
   explicit TimepointCoverageAnalysis(Operation *rootOp)
       : explorer(rootOp, TraversalAction::SHALLOW),
         solver(explorer, allocator) {
-    explorer.setOpAction<IREE::Util::InitializerOp>(TraversalAction::RECURSE);
-    explorer.setOpAction<mlir::func::FuncOp>(TraversalAction::RECURSE);
+    explorer.setOpInterfaceAction<mlir::FunctionOpInterface>(
+        TraversalAction::RECURSE);
     explorer.setOpAction<mlir::scf::IfOp>(TraversalAction::RECURSE);
     explorer.setDialectAction<IREE::Stream::StreamDialect>(
         TraversalAction::RECURSE);
@@ -866,7 +869,7 @@ static bool tryElideTimepointsInRegion(Region &region,
         })
         .Case<cf::BranchOp, cf::CondBranchOp>(
             [&](Operation *op) { elideTimepointOperands(op); })
-        .Case<func::ReturnOp, scf::YieldOp>(
+        .Case<IREE::Util::ReturnOp, scf::YieldOp>(
             [&](Operation *op) { elideTimepointOperands(op); });
   });
 
@@ -880,34 +883,11 @@ static bool tryElideTimepointsInRegion(Region &region,
 }
 
 //===----------------------------------------------------------------------===//
-// -iree-stream-elide-timepoints
+// --iree-stream-elide-timepoints
 //===----------------------------------------------------------------------===//
 
-// Elides waits on timepoints that are known to be reached by a dependent
-// timepoint. We err on the side of additional timepoints if we can't guarantee
-// that a particular wait is covered.
-//
-// Example:
-//   %timepoint0 = ...
-//   %timepoint1 = ... await(%timepoint0)
-//   %timepoint2 = stream.timepoint.join max(%timepoint0, %timepoint1)
-// ->
-//   %timepoint0 = ...
-//   %timepoint1 = ... await(%timepoint0)
-//   %timepoint2 = stream.timepoint.join max(%timepoint1)
-// -> (canonicalization) ->
-//   %timepoint0 = ...
-//   %timepoint1 = ... await(%timepoint0)
-//   %timepoint2 = %timepoint1
-class ElideTimepointsPass : public ElideTimepointsBase<ElideTimepointsPass> {
-public:
-  ElideTimepointsPass() = default;
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<IREE::Stream::StreamDialect>();
-    registry.insert<IREE::Util::UtilDialect>();
-  }
-
+struct ElideTimepointsPass
+    : public IREE::Stream::impl::ElideTimepointsPassBase<ElideTimepointsPass> {
   void runOnOperation() override {
     auto moduleOp = getOperation();
     if (moduleOp.getBody()->empty())
@@ -939,9 +919,5 @@ public:
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createElideTimepointsPass() {
-  return std::make_unique<ElideTimepointsPass>();
-}
 
 } // namespace mlir::iree_compiler::IREE::Stream

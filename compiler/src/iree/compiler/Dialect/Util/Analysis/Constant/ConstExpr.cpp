@@ -12,13 +12,9 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/GraphWriter.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #define DEBUG_TYPE "iree-constexpr"
-
-using llvm::dbgs;
-
-using namespace mlir::iree_compiler::IREE::Util;
 
 namespace mlir::iree_compiler::IREE::Util {
 
@@ -26,8 +22,7 @@ namespace mlir::iree_compiler::IREE::Util {
 // ConstExprAnalysis
 //===----------------------------------------------------------------------===//
 
-namespace {
-OpOperand *findOperandFor(Operation *op, Value input) {
+static OpOperand *findOperandFor(Operation *op, Value input) {
   for (OpOperand &operand : op->getOpOperands()) {
     if (operand.get() == input)
       return &operand;
@@ -35,12 +30,20 @@ OpOperand *findOperandFor(Operation *op, Value input) {
   return nullptr;
 }
 
-bool isHoistableToRootOp(Operation *rootOp, Operation *constOp) {
-  Operation *syms = SymbolTable::getNearestSymbolTable(constOp);
-  return syms == rootOp;
+bool ConstExprAnalysis::isConstExprOperation(Operation *queryOp) const {
+  if (queryOp->getNumResults() == 0) {
+    bool hasNoMemoryEffects = false;
+    if (auto effectOp = dyn_cast<MemoryEffectOpInterface>(queryOp))
+      hasNoMemoryEffects = effectOp.hasNoEffect();
+    if (hasNoMemoryEffects && queryOp->hasTrait<OpTrait::ReturnLike>())
+      return true;
+    return false;
+  }
+  // NOTE: this only checks the first result as all results are added to the map
+  // with the same value. If we supported ops with only some results being
+  // constant we'd need to change this and not look at the op at all.
+  return isConstExprValue(queryOp->getResult(0));
 }
-
-} // namespace
 
 bool ConstExprAnalysis::ConstValueInfo::hasNonAnalyzedConsumer() const {
   // The analysis cannot represent zero-result operations, so detect that
@@ -53,34 +56,37 @@ bool ConstExprAnalysis::ConstValueInfo::hasNonAnalyzedConsumer() const {
   return false;
 }
 
-ConstExprAnalysis::ConstExprAnalysis(Operation *rootOp) {
+ConstExprAnalysis::ConstExprAnalysis(Operation *rootOp)
+    : asmState(rootOp,
+               OpPrintingFlags().elideLargeElementsAttrs().skipRegions()) {
   Explorer explorer(rootOp, TraversalAction::SHALLOW);
   explorer.initialize();
 
   // Populate the constant roots for globals.
+  // NOTE: these may be _run-time_ constant and not _compile-time_ constant,
+  // such as if they are initialized based on values only available at runtime.
   explorer.forEachGlobal([&](const Explorer::GlobalInfo *info) {
     // Rely on globals having been canonicalized to immutable correctly.
-    if (info->op.isGlobalMutable())
-      return;
-    if (info->isIndirect)
+    if (info->isIndirect || info->op.isGlobalMutable())
       return;
     if (!isLegalConstExprRootType(info->op.getGlobalType()))
       return;
-    for (auto *use : info->uses) {
-      auto loadOp = llvm::dyn_cast<GlobalLoadOp>(use);
-      if (!loadOp)
-        continue;
-      if (!isHoistableToRootOp(rootOp, loadOp))
-        continue;
-      constantRoots[loadOp.getResult()] = loadOp;
-    }
+    for (auto loadOp : info->getLoads())
+      constantRoots[loadOp.getLoadedGlobalValue()] = loadOp;
   });
 
   // Populate the constant roots for all inline constants in the program.
-  rootOp->walk([&](arith::ConstantOp constOp) {
-    if (isHoistableToRootOp(rootOp, constOp) &&
-        isLegalConstExprRootType(constOp.getResult().getType()))
-      constantRoots[constOp.getResult()] = constOp;
+  explorer.forEachFunctionLikeOp([&](FunctionOpInterface funcOp) {
+    funcOp.walk([&](Operation *op) {
+      if (!op->hasTrait<OpTrait::ConstantLike>())
+        return;
+      for (auto resultType : op->getResultTypes()) {
+        if (!isLegalConstExprRootType(resultType))
+          return;
+      }
+      for (auto result : op->getResults())
+        constantRoots[result] = op;
+    });
   });
 
   // Prime the const value map with known roots. This must be done first
@@ -94,7 +100,11 @@ ConstExprAnalysis::ConstExprAnalysis(Operation *rootOp) {
     rootInfo->isRoot = true;
     rootInfo->state = ConstValueInfo::CONSTANT;
     rootInfo->roots.insert(constValue);
-    LLVM_DEBUG(dbgs() << "CONSTANT ROOT: " << constValue << "\n");
+    LLVM_DEBUG({
+      llvm::dbgs() << "[ConstExprAnalysis] mark constant root: ";
+      constValue.print(llvm::dbgs(), asmState);
+      llvm::dbgs() << "\n";
+    });
   }
 
   // Now go over each constant root again and expand the frontier to include
@@ -104,9 +114,8 @@ ConstExprAnalysis::ConstExprAnalysis(Operation *rootOp) {
     for (auto &use : constOp->getUses()) {
       Operation *useOp = use.getOwner();
       // For now ignore operations that are not in the same scope.
-      if (constOp->getParentOp() != useOp->getParentOp()) {
+      if (constOp->getParentOp() != useOp->getParentOp())
         continue;
-      }
       expandToOp(useOp);
     }
   }
@@ -114,7 +123,7 @@ ConstExprAnalysis::ConstExprAnalysis(Operation *rootOp) {
   // Process worklist until all resolved.
   ConstValueWorklist iterWorklist;
   while (!worklist.empty()) {
-    LLVM_DEBUG(dbgs() << "PROCESS WORKLIST:\n");
+    LLVM_DEBUG(llvm::dbgs() << "[ConstExprAnalysis] process worklist:\n");
     iterWorklist.clear();
     iterWorklist.swap(worklist);
     for (ConstValueInfo *info : iterWorklist) {
@@ -122,6 +131,9 @@ ConstExprAnalysis::ConstExprAnalysis(Operation *rootOp) {
         continue;
       bool allConstants = true;
       for (ConstValueInfo *producerInfo : info->producers) {
+        assert(producerInfo->state != ConstValueInfo::UNANALYZED &&
+               "Producers of unknown value must be all analyzed.");
+
         if (producerInfo->state == ConstValueInfo::UNKNOWN) {
           // Producers unknown. No further progress until next iteration.
           worklist.push_back(info);
@@ -132,8 +144,11 @@ ConstExprAnalysis::ConstExprAnalysis(Operation *rootOp) {
         if (producerInfo->state == ConstValueInfo::NON_CONSTANT) {
           // We have to be non constant too.
           info->state = ConstValueInfo::NON_CONSTANT;
-          LLVM_DEBUG(dbgs() << "  RESOLVED AS NON_CONSTANT: "
-                            << info->constValue << "\n");
+          LLVM_DEBUG({
+            llvm::dbgs() << "[ConstExprAnalysis]   - resolved NON_CONSTANT: ";
+            info->constValue.print(llvm::dbgs(), asmState);
+            llvm::dbgs() << "\n";
+          });
           allConstants = false;
           break;
         }
@@ -143,8 +158,11 @@ ConstExprAnalysis::ConstExprAnalysis(Operation *rootOp) {
       if (allConstants) {
         // Finalize it.
         info->state = ConstValueInfo::CONSTANT;
-        LLVM_DEBUG(dbgs() << "  RESOLVED AS CONSTANT: " << info->constValue
-                          << "\n");
+        LLVM_DEBUG({
+          llvm::dbgs() << "[ConstExprAnalysis]   + resolved CONSTANT: ";
+          info->constValue.print(llvm::dbgs(), asmState);
+          llvm::dbgs() << "\n";
+        });
 
         // Now that all of its producers are known, record its roots.
         for (ConstValueInfo *producerInfo : info->producers) {
@@ -159,6 +177,12 @@ ConstExprAnalysis::ConstExprAnalysis(Operation *rootOp) {
           Operation *useOp = use.getOwner();
           // Skip expanding of ops within dispatch or nested regions.
           if (definingOp->getParentOp() != useOp->getParentOp()) {
+            // check if we can expand to the parent op instead
+            if (auto parentOp = useOp->getParentOp()) {
+              if (definingOp->getParentOp() == parentOp->getParentOp()) {
+                expandToOp(parentOp);
+              }
+            }
             continue;
           }
           expandToOp(useOp);
@@ -174,6 +198,8 @@ ConstExprAnalysis::ConstExprAnalysis(Operation *rootOp) {
       producer->consumers.insert(consumer);
     }
   }
+
+  LLVM_DEBUG(print(llvm::dbgs()));
 }
 
 ConstExprAnalysis::ConstValueInfo *
@@ -185,23 +211,55 @@ ConstExprAnalysis::addInfo(Value constValue) {
 }
 
 void ConstExprAnalysis::expandToOp(Operation *op) {
+  SmallVector<Operation *> expandWorklist;
+  expandWorklist.push_back(op);
+  do {
+    expandToOpStep(expandWorklist.pop_back_val(), expandWorklist);
+  } while (!expandWorklist.empty());
+}
+
+void ConstExprAnalysis::expandToOpStep(
+    Operation *op, SmallVectorImpl<Operation *> &expandWorklist) {
   ConstExprOpInfo opInfo = ConstExprOpInfo::getForOp(op);
   for (auto result : op->getResults()) {
-    auto foundIt = constInfoMap.find(result);
-    if (foundIt != constInfoMap.end())
+    auto *valueInfo = constInfoMap.lookup(result);
+    if (valueInfo && valueInfo->state != ConstValueInfo::UNANALYZED)
       continue;
 
     // Generate new info record.
-    auto *valueInfo = addInfo(result);
+    if (!valueInfo)
+      valueInfo = addInfo(result);
+
+    // Update the producers first as we might early-return below.
+    for (auto producer : opInfo.producers) {
+      ConstValueInfo *producerInfo = constInfoMap.lookup(producer);
+      if (!producerInfo) {
+        // Create an unanalyzed value info as a placeholder. The info might be
+        // analyzed later if we are interested in it.
+        producerInfo = addInfo(producer);
+      }
+      valueInfo->producers.insert(producerInfo);
+    }
+
     if (!opInfo.isEligible) {
       // Put it in a NON_CONSTANT state and bail. This is terminal.
       valueInfo->state = ConstValueInfo::NON_CONSTANT;
-      LLVM_DEBUG(dbgs() << "  EXPAND TO INELIGIBLE: " << result << "\n");
+      LLVM_DEBUG({
+        llvm::dbgs()
+            << "[ConstExprAnalysis]   - expand to NON_CONSTANT (ineligible): ";
+        result.print(llvm::dbgs(), asmState);
+        llvm::dbgs() << "\n";
+      });
       continue;
     }
 
     // If here, then an unknown state.
-    LLVM_DEBUG(dbgs() << "  EXPAND TO UNKNOWN: " << result << "\n");
+    valueInfo->state = ConstValueInfo::UNKNOWN;
+    LLVM_DEBUG({
+      llvm::dbgs() << "[ConstExprAnalysis]   ? expand to UNKNOWN: ";
+      result.print(llvm::dbgs(), asmState);
+      llvm::dbgs() << "\n";
+    });
     worklist.push_back(valueInfo);
 
     // Process producers.
@@ -212,35 +270,37 @@ void ConstExprAnalysis::expandToOp(Operation *op) {
         valueInfo->state = ConstValueInfo::NON_CONSTANT;
         break;
       }
-      expandToOp(definingOp);
-
-      ConstValueInfo *producerInfo = constInfoMap.lookup(producer);
-      assert(producerInfo && "should have producer info in map");
-      valueInfo->producers.insert(producerInfo);
+      expandWorklist.push_back(definingOp);
     }
   }
 }
 
 void ConstExprAnalysis::print(raw_ostream &os) const {
-  os << "\nFOUND CONSTANTS:\n----------------\n";
+  os << "[ConstExprAnalysis] found constants:\n";
   for (auto &info : allocedConstInfos) {
     if (info->state != ConstValueInfo::CONSTANT || info->isRoot)
       continue;
     if (!info->roots.empty()) {
-      os << "\n::" << info->constValue << "\n";
-      os << "    WITH ROOTS:\n";
+      os << "\n[ConstExprAnalysis] constexpr ";
+      info->constValue.print(os, asmState);
+      os << "\n";
+      os << "   + roots:\n";
       for (Value root : info->roots) {
-        os << "      " << root << "\n";
+        os << "      ";
+        root.print(os, asmState);
+        os << "\n";
       }
-      os << "    WITH PRODUCERS:\n";
+      os << "   + producers:\n";
       for (ConstValueInfo *producerInfo : info->producers) {
-        os << "      " << producerInfo->constValue << "\n";
+        os << "      ";
+        producerInfo->constValue.print(os, asmState);
+        os << "\n";
       }
     }
   }
 }
 
-void ConstExprAnalysis::dump() const { print(llvm::errs()); }
+void ConstExprAnalysis::dump() const { print(llvm::dbgs()); }
 
 //===----------------------------------------------------------------------===//
 // ConstExprHoistingPolicy
@@ -262,7 +322,11 @@ void ConstExprHoistingPolicy::initialize() {
   Worklist worklist;
   worklist.reserve(analysis.allocedConstInfos.size());
   for (auto &it : analysis.allocedConstInfos) {
-    worklist.push_back(it.get());
+    auto *info = it.get();
+    // Skip unanalyzed values.
+    if (info->state == ConstExprAnalysis::ConstValueInfo::UNANALYZED)
+      continue;
+    worklist.push_back(info);
   }
 
   // Since just initializing invariants, which are local, iteration order
@@ -270,16 +334,20 @@ void ConstExprHoistingPolicy::initialize() {
   for (auto *info : worklist) {
     Decision *decision = getDecision(info);
     makeInvariantDecision(info, decision);
-    Outcome postDecisionOutcome = decision->getOutcome();
-    if (postDecisionOutcome != UNDECIDED) {
-      LLVM_DEBUG(dbgs() << "ConstExprHoistPolicy(INVARIANT, ");
-      if (postDecisionOutcome == ENABLE_HOIST) {
-        LLVM_DEBUG(dbgs() << "ENABLE_HOIST");
-      } else if (postDecisionOutcome == DISABLE_HOIST) {
-        LLVM_DEBUG(dbgs() << "DISABLE_HOIST");
+    LLVM_DEBUG({
+      Outcome postDecisionOutcome = decision->getOutcome();
+      if (postDecisionOutcome != UNDECIDED) {
+        llvm::dbgs() << "[ConstExprHoistPolicy] invariant ";
+        if (postDecisionOutcome == ENABLE_HOIST) {
+          llvm::dbgs() << "ENABLE_HOIST";
+        } else if (postDecisionOutcome == DISABLE_HOIST) {
+          llvm::dbgs() << "DISABLE_HOIST";
+        }
+        llvm::dbgs() << ": ";
+        info->constValue.print(llvm::dbgs(), analysis.getAsmState());
+        llvm::dbgs() << "\n";
       }
-      LLVM_DEBUG(dbgs() << "): " << info->constValue << "\n");
-    }
+    });
   }
 
   // Work iteratively until converged.
@@ -294,18 +362,24 @@ void ConstExprHoistingPolicy::initialize() {
 
       if (decision->getOutcome() != UNDECIDED) {
         madeChange = true;
-        LLVM_DEBUG(dbgs() << "ConstExprHoistPolicy(" << i << ", ");
-        if (decision->getOutcome() == ENABLE_HOIST) {
-          LLVM_DEBUG(dbgs() << "ENABLE_HOIST");
-        } else if (decision->getOutcome() == DISABLE_HOIST) {
-          LLVM_DEBUG(dbgs() << "DISABLE_HOIST");
-        }
-        LLVM_DEBUG(dbgs() << "): " << info->constValue << "\n");
+        LLVM_DEBUG({
+          llvm::dbgs() << "[ConstExprHoistPolicy(" << i << ")] ";
+          if (decision->getOutcome() == ENABLE_HOIST) {
+            llvm::dbgs() << "ENABLE_HOIST";
+          } else if (decision->getOutcome() == DISABLE_HOIST) {
+            llvm::dbgs() << "DISABLE_HOIST";
+          }
+          llvm::dbgs() << ": ";
+          info->constValue.print(llvm::dbgs(), analysis.getAsmState());
+          llvm::dbgs() << "\n";
+        });
       }
     }
 
     if (!madeChange) {
-      LLVM_DEBUG(dbgs() << "ConstExprHoistPolicy(" << i << ", CONVERGED)\n");
+      LLVM_DEBUG({
+        llvm::dbgs() << "[ConstExprHoistPolicy(" << i << ")] converged!\n";
+      });
       break;
     }
   }
@@ -313,15 +387,17 @@ void ConstExprHoistingPolicy::initialize() {
   for (auto *info : worklist) {
     Decision *decision = getDecision(info);
     if (decision->getOutcome() == UNDECIDED) {
-      LLVM_DEBUG(dbgs() << "ConstExprHoistPolicy: Value did not converge: "
-                        << info->constValue << "\n");
+      LLVM_DEBUG({
+        llvm::dbgs() << "[ConstExprHoistPolicy] value did not converge: ";
+        info->constValue.print(llvm::dbgs(), analysis.getAsmState());
+        llvm::dbgs() << "\n";
+      });
     }
   }
 }
 
 static bool doesHoistingIncreaseSizeSignificantly(
     const ConstExprAnalysis::ConstValueInfo *info, int64_t threshold) {
-
   int64_t inSize = 0;
   for (Value root : info->roots) {
     // TODO: Are there any other types we care about here?
@@ -386,7 +462,7 @@ void ConstExprHoistingPolicy::makeDecision(
     const ConstExprAnalysis::ConstValueInfo *info, Decision *decision) {
   // A const-expr value has a legal escape if:
   //   - Has a non analyzed consumer
-  //   - It has an anlyzed consumer that:
+  //   - It has an analyzed consumer that:
   //     - Has been marked as DISABLE_HOIST (must feed into something that is
   //       not being hoisted).
   //     - Is consumed by a hoistable operand or no operand (signals implicit
@@ -432,6 +508,8 @@ void ConstExprHoistingPolicy::dumpDotGraph() const {
 } // namespace mlir::iree_compiler::IREE::Util
 
 namespace llvm {
+using mlir::iree_compiler::IREE::Util::ConstExprAnalysis;
+using mlir::iree_compiler::IREE::Util::ConstExprHoistingPolicy;
 template <>
 struct DOTGraphTraits<const ConstExprHoistingPolicy *>
     : public DefaultDOTGraphTraits {

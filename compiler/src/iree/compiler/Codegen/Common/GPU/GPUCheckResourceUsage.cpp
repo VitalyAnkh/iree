@@ -4,43 +4,29 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/Common/GPU/PassDetail.h"
 #include "iree/compiler/Codegen/Common/GPU/Passes.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "llvm/Support/CommandLine.h"
 #include "mlir/Conversion/LLVMCommon/LoweringOptions.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_GPUCHECKRESOURCEUSAGEPASS
+#include "iree/compiler/Codegen/Common/GPU/Passes.h.inc"
+
 namespace {
-class GPUCheckResourceUsagePass final
-    : public GPUCheckResourceUsageBase<GPUCheckResourceUsagePass> {
-public:
-  explicit GPUCheckResourceUsagePass(
-      std::function<unsigned(func::FuncOp)> getSharedMemoryLimit,
-      std::function<unsigned(func::FuncOp)> getIndexBitwidth)
-      : getSharedMemoryLimit(getSharedMemoryLimit),
-        getIndexBitwidth(getIndexBitwidth) {}
-
-  void runOnOperation() override;
-
-private:
-  std::function<unsigned(func::FuncOp)> getSharedMemoryLimit;
-  std::function<unsigned(func::FuncOp)> getIndexBitwidth;
-};
-} // namespace
-
-static unsigned getDatalayoutIndexBitwidth(func::FuncOp func) {
+static unsigned getDatalayoutIndexBitwidth(mlir::FunctionOpInterface func) {
   auto mod = func->getParentOfType<ModuleOp>();
   LowerToLLVMOptions options(mod.getContext(), DataLayout(mod));
   return options.getIndexBitwidth();
 }
 
-static int
-shapedTypeStaticSize(memref::AllocOp allocOp, ShapedType shapedType,
-                     std::function<unsigned(func::FuncOp)> getIndexBitwidth) {
+static int shapedTypeStaticSize(
+    memref::AllocOp allocOp, ShapedType shapedType,
+    std::function<unsigned(mlir::FunctionOpInterface)> getIndexBitwidth) {
   int allocSize = 1;
   for (auto dimSize : shapedType.getShape()) {
     if (ShapedType::isDynamic(dimSize))
@@ -53,22 +39,22 @@ shapedTypeStaticSize(memref::AllocOp allocOp, ShapedType shapedType,
   } else {
     auto eltTy = shapedType.getElementType();
     if (eltTy.isIndex()) {
-      auto func = allocOp->getParentOfType<func::FuncOp>();
+      auto func = allocOp->getParentOfType<mlir::FunctionOpInterface>();
       assert(getIndexBitwidth &&
              "getIndexBitwidth should have been set earlier");
       allocSize *= getIndexBitwidth(func);
     } else
-      allocSize *= shapedType.getElementType().getIntOrFloatBitWidth();
+      allocSize *= IREE::Util::getTypeBitWidth(shapedType.getElementType());
   }
   return allocSize;
 }
 
 /// Returns success if the total shared memory allocation size is less than the
-/// limit set by limit.
-static LogicalResult
-checkGPUAllocationSize(func::FuncOp funcOp, unsigned limit,
-                       std::function<unsigned(func::FuncOp)> getIndexBitwidth) {
-  if (funcOp.getBody().empty())
+/// limit.
+static LogicalResult checkGPUAllocationSize(
+    mlir::FunctionOpInterface funcOp, unsigned limit,
+    std::function<unsigned(mlir::FunctionOpInterface)> getIndexBitwidth) {
+  if (funcOp.getFunctionBody().empty())
     return success();
 
   SmallVector<memref::AllocOp> allocOps;
@@ -103,26 +89,36 @@ checkGPUAllocationSize(func::FuncOp funcOp, unsigned limit,
   return success();
 }
 
-void GPUCheckResourceUsagePass::runOnOperation() {
-  auto moduleOp = getOperation();
-  for (auto funcOp : moduleOp.getOps<func::FuncOp>()) {
-    unsigned limit = this->getSharedMemoryLimit
-                         ? this->getSharedMemoryLimit(funcOp)
-                         : 64 * 1024;
+class GPUCheckResourceUsagePass final
+    : public impl::GPUCheckResourceUsagePassBase<GPUCheckResourceUsagePass> {
+public:
+  explicit GPUCheckResourceUsagePass(
+      std::function<unsigned(mlir::FunctionOpInterface)> getIndexBitwidth)
+      : getIndexBitwidth(getIndexBitwidth) {}
+
+  void runOnOperation() override {
+    FunctionOpInterface funcOp = getOperation();
+    IREE::GPU::TargetAttr target = getGPUTargetAttr(funcOp);
+    unsigned limit =
+        target ? target.getWgp().getMaxWorkgroupMemoryBytes() : 64 * 1024;
     if (failed(checkGPUAllocationSize(funcOp, limit,
-                                      this->getIndexBitwidth
-                                          ? this->getIndexBitwidth
+                                      getIndexBitwidth
+                                          ? getIndexBitwidth
                                           : getDatalayoutIndexBitwidth))) {
       return signalPassFailure();
     }
   }
-}
 
-std::unique_ptr<OperationPass<ModuleOp>> createGPUCheckResourceUsagePass(
-    std::function<unsigned(func::FuncOp)> getSharedMemoryLimit,
-    std::function<unsigned(func::FuncOp)> getIndexBitwidth) {
-  return std::make_unique<GPUCheckResourceUsagePass>(getSharedMemoryLimit,
-                                                     getIndexBitwidth);
+private:
+  std::function<unsigned(mlir::FunctionOpInterface)> getIndexBitwidth;
+};
+
+} // namespace
+
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createGPUCheckResourceUsagePass(
+    std::function<unsigned(mlir::FunctionOpInterface)> getIndexBitwidth) {
+  return std::make_unique<GPUCheckResourceUsagePass>(getIndexBitwidth);
 }
 
 } // namespace mlir::iree_compiler

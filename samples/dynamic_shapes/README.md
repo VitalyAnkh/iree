@@ -15,8 +15,8 @@ Steps 1-2 are performed in Python via the
 
 | Framework | Notebook |
 | --------- | -------- |
-PyTorch | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openxla/iree/blob/main/samples/dynamic_shapes/pytorch_dynamic_shapes.ipynb)
-TensorFlow | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openxla/iree/blob/main/samples/dynamic_shapes/tensorflow_dynamic_shapes.ipynb)
+PyTorch | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree/blob/main/samples/dynamic_shapes/pytorch_dynamic_shapes.ipynb)
+TensorFlow | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree/blob/main/samples/dynamic_shapes/tensorflow_dynamic_shapes.ipynb)
 
 Step 3 should be performed on your development host machine
 
@@ -27,38 +27,67 @@ dynamic shapes:
 
 ```python
 import torch
-import shark_turbine.aot as aot
+import iree.turbine.aot as aot
 
-class DynamicShapesModule(aot.CompiledModule, export_name="module"):
+class DynamicShapesModule(torch.nn.Module):
   # reduce_sum_1d (dynamic input size, static output size)
   #   tensor<?xi32> -> tensor<i32>
   #   e.g. [1, 2, 3] -> 6
-  def reduce_sum_1d(self, values=aot.AbstractTensor(None, dtype=torch.int32)):
-    return self.compute_reduce_sum_1d(values)
-
-  @aot.jittable
-  def compute_reduce_sum_1d(values):
-    return torch.sum(values, dtype=torch.int32)
+  def reduce_sum_1d(self, values):
+    return torch.sum(values)
 
   # reduce_sum_2d (partially dynamic input size, static output size)
   #   tensor<?x3xi32> -> tensor<3xi32>
   #   e.g. [[1, 2, 3], [10, 20, 30]] -> [11, 22, 33]
-  def reduce_sum_2d(self, values=aot.AbstractTensor(None, 3, dtype=torch.int32)):
-    return self.compute_reduce_sum_2d(values)
-
-  @aot.jittable
-  def compute_reduce_sum_2d(values):
-    return torch.sum(values, 0, dtype=torch.int32)
+  def reduce_sum_2d(self, values):
+    return torch.sum(values, 0)
 
   # add_one (dynamic input size, dynamic output size)
   #   tensor<?xi32>) -> tensor<?xi32>
   #   e.g. [1, 2, 3] -> [2, 3, 4]
-  def add_one(self, values=aot.AbstractTensor(None, dtype=torch.int32)):
-    return self.compute_add_one(values)
-
-  @aot.jittable
-  def compute_add_one(values):
+  def add_one(self, values):
     return values + 1
+
+    fxb = aot.FxProgramsBuilder(DynamicShapesModule())
+```
+
+Each function is exported using the `FxProgramsBuilder` class with explicit
+dynamic dimensions:
+
+```python
+fxb = aot.FxProgramsBuilder(DynamicShapesModule())
+
+# Create a single dynamic export dimension.
+dynamic_x = torch.export.Dim("x")
+# Example inputs with a mix of placeholder (dynamic) and static dimensions.
+example_1d = torch.empty(16, dtype=torch.int32)
+example_2d = torch.empty((16, 3), dtype=torch.int32)
+
+# Export reduce_sum_1d with a dynamic dimension.
+@fxb.export_program(
+    args=(example_1d,),
+    dynamic_shapes={"values": {0: dynamic_x}},
+)
+def reduce_sum_1d(module, values):
+    return module.reduce_sum_1d(values)
+
+# Export reduce_sum_2d with one dynamic dimension.
+@fxb.export_program(
+    args=(example_2d,),
+    dynamic_shapes={"values": {0: dynamic_x}},
+)
+def reduce_sum_2d(module, values):
+    return module.reduce_sum_2d(values)
+
+# Export add_one with a dynamic dimension.
+@fxb.export_program(
+    args=(example_1d,),
+    dynamic_shapes={"values": {0: dynamic_x}},
+)
+def add_one(module, values):
+    return module.add_one(values)
+
+export_output = aot.export(fxb)
 ```
 
 ## Background
@@ -88,13 +117,13 @@ them.
 1. Run either Colab notebook and download the `dynamic_shapes.mlir` file it
     generates
 
-2. Build the `iree-compile` tool (see
-    [here](https://iree.dev/building-from-source/getting-started/)
-    for general instructions on building using CMake)
+2. Get `iree-compile` either by
+    [building from source](https://iree.dev/building-from-source/getting-started/)
+    or by
+    [installing from pip](https://iree.dev/reference/bindings/python/#installing-iree-packages).
 
     ```
-    cmake -B ../iree-build/ -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo .
-    cmake --build ../iree-build/ --target iree-compile
+    python -m pip install iree-base-compiler
     ```
 
 3. Compile the `dynamic_shapes.mlir` file using `iree-compile`. The
@@ -102,7 +131,7 @@ them.
     has the best support for dynamic shapes:
 
     ```
-    ../iree-build/tools/iree-compile \
+    iree-compile \
         --iree-hal-target-backends=llvm-cpu \
         dynamic_shapes.mlir -o dynamic_shapes_cpu.vmfb
     ```
@@ -110,6 +139,7 @@ them.
 4. Build the `iree_samples_dynamic_shapes` CMake target
 
     ```
+    cmake -B ../iree-build/ -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DIREE_BUILD_COMPILER=OFF .
     cmake --build ../iree-build/ --target iree_samples_dynamic_shapes
     ```
 

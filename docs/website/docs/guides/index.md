@@ -8,10 +8,11 @@
 
 Guides for specific frameworks:
 
+* [:simple-python: JAX](./ml-frameworks/jax.md)
+* [:simple-onnx: ONNX](./ml-frameworks/onnx.md)
+* [:simple-pytorch: PyTorch](./ml-frameworks/pytorch.md)
 * [:simple-tensorflow: TensorFlow](./ml-frameworks/tensorflow.md) and
   [:simple-tensorflow: TensorFlow Lite](./ml-frameworks/tflite.md)
-* [:simple-python: JAX](./ml-frameworks/jax.md)
-* [:simple-pytorch: PyTorch](./ml-frameworks/pytorch.md)
 
 ## Deployment configurations
 
@@ -33,3 +34,8 @@ Guides for specific configurations:
   for AMD-specific solutions
 * [:simple-apple: GPU - Metal](./deployment-configurations/gpu-metal.md)
   for running on Apple hardware
+
+## General topics
+
+* [:octicons-file-symlink-file-16: Parameters](./parameters.md) for managing
+  large chunks of program data

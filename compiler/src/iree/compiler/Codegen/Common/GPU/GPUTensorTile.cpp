@@ -4,19 +4,14 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include <numeric>
-
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtOps.h"
-#include "iree-dialects/Dialect/LinalgExt/Transforms/Transforms.h"
-#include "iree/compiler/Codegen/Common/GPU/PassDetail.h"
 #include "iree/compiler/Codegen/Common/GPU/Passes.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Interfaces/PartitionableLoopsInterface.h"
 #include "iree/compiler/Codegen/Transforms/Transforms.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/MarkerUtils.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/Patterns.h"
@@ -25,22 +20,28 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-
-using mlir::iree_compiler::IREE::LinalgExt::TilingPatterns;
 
 #define DEBUG_TYPE "iree-codegen-gpu-tensor-tile"
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_GPUTENSORTILEPASS
+#include "iree/compiler/Codegen/Common/GPU/Passes.h.inc"
+
+namespace {
+
 class TileConsumerAndFuseInputProducer final
     : public OpInterfaceRewritePattern<TilingInterface> {
 public:
-  TileConsumerAndFuseInputProducer(
-      MLIRContext *context, IREE::LinalgExt::LinalgTransformationFilter filter,
-      bool fuseInputProducer, PatternBenefit benefit = 1)
+  TileConsumerAndFuseInputProducer(MLIRContext *context,
+                                   LinalgTransformationFilter filter,
+                                   bool fuseInputProducer, bool coalesceLoops,
+                                   PatternBenefit benefit = 1)
       : OpInterfaceRewritePattern<TilingInterface>(context, benefit),
-        filter(std::move(filter)), fuseInputProducer(fuseInputProducer) {}
+        filter(std::move(filter)), fuseInputProducer(fuseInputProducer),
+        coalesceLoops(coalesceLoops) {}
 
   LogicalResult matchAndRewrite(TilingInterface op,
                                 PatternRewriter &rewriter) const override {
@@ -50,12 +51,16 @@ public:
     // Make sure we have a PartitionableLoopInterface op here and query the tile
     // sizes from the partitionable loops.
     auto plOp = dyn_cast<PartitionableLoopsInterface>(*op);
-    if (!plOp)
-      return failure();
+    if (!plOp) {
+      return rewriter.notifyMatchFailure(
+          op, "Op does not implement PartitionableLoopsInterface");
+    }
     auto partitionedLoops = plOp.getPartitionableLoops(kNumMaxParallelDims);
     SmallVector<int64_t> tileSizes = getTileSizes(op, 0);
-    if (tileSizes.empty())
-      return failure();
+    if (tileSizes.empty()) {
+      return rewriter.notifyMatchFailure(
+          op, "Op does not have configuration to get tile_sizes from");
+    }
     // Mask out non reduction dimensions.
     for (unsigned depth : partitionedLoops) {
       if (depth < tileSizes.size())
@@ -69,10 +74,10 @@ public:
     // producer linalg.fill op. It implicitly assumes that the leading
     // dimensions of different linalg ops match, which is the current status;
     // but may not hold true in the long term.
-    tileSizes.resize(op.getLoopIteratorTypes().size());
+    tileSizes.resize(op.getLoopIteratorTypes().size(), 0);
 
     if (llvm::all_of(tileSizes, [](int64_t s) { return s == 0; })) {
-      return failure();
+      return rewriter.notifyMatchFailure(op, "No dimensions are tiled");
     }
 
     // Tile the current op and fuse its immediate input operands.
@@ -85,9 +90,20 @@ public:
     }
 
     // Replace the tiled op with replacements.
-    rewriter.replaceOp(op, tilingResult->replacements);
+    rewriter.replaceOp(op, tilingResult->mergeResult.replacements);
     filter.replaceLinalgTransformationFilter(rewriter,
                                              tilingResult->tiledOps.front());
+
+    if (coalesceLoops && tilingResult->loops.size() > 1) {
+      SmallVector<scf::ForOp> loops = llvm::map_to_vector(
+          tilingResult->loops, [](LoopLikeOpInterface loop) {
+            return cast<scf::ForOp>(loop.getOperation());
+          });
+      if (failed(mlir::coalesceLoops(rewriter, loops))) {
+        return failure();
+      }
+    }
+
     return success();
   }
 
@@ -99,7 +115,7 @@ private:
     // First tile the current op as the consumer op.
     auto tilingOptions = scf::SCFTilingOptions().setTileSizes(tileSizes);
     FailureOr<scf::SCFTilingResult> tilingResult =
-        tileUsingSCFForOp(rewriter, consumer, tilingOptions);
+        tileUsingSCF(rewriter, consumer, tilingOptions);
     if (failed(tilingResult)) {
       return rewriter.notifyMatchFailure(consumer, "failed to tile consumer");
     }
@@ -125,76 +141,77 @@ private:
       auto sliceOp = operand->get().getDefiningOp<tensor::ExtractSliceOp>();
       if (!sliceOp)
         continue;
-      auto linalgOp = sliceOp.getSource().getDefiningOp<linalg::LinalgOp>();
-      if (!linalgOp)
+      auto tilingOp = sliceOp.getSource().getDefiningOp<TilingInterface>();
+      if (!tilingOp)
         continue;
-      // Restrict to fully parallel linalg ops for now for simplicity.
+      if (isa<tensor::PadOp>(sliceOp.getSource().getDefiningOp())) {
+        continue;
+      }
+      // Restrict to fully parallel ops for now for simplicity.
       auto isParallel = [](utils::IteratorType it) {
         return linalg::isParallelIterator(it);
       };
-      if (llvm::all_of(linalgOp.getIteratorTypesArray(), isParallel)) {
+      if (llvm::all_of(tilingOp.getLoopIteratorTypes(), isParallel)) {
         candidates.push_back(sliceOp);
       }
     }
 
     // Fuse the candidate immeidate operands into the tiled loop.
     OpBuilder::InsertionGuard guard(rewriter);
-    auto forLoops =
-        llvm::to_vector(llvm::map_range(tilingResult->loops, [](Operation *op) {
-          return cast<scf::ForOp>(op);
-        }));
     while (!candidates.empty()) {
       tensor::ExtractSliceOp sliceOp = candidates.back();
       candidates.pop_back();
       std::optional<scf::SCFFuseProducerOfSliceResult> result =
-          tileAndFuseProducerOfSlice(rewriter, sliceOp, forLoops);
+          scf::tileAndFuseProducerOfSlice(rewriter, sliceOp,
+                                          tilingResult->loops);
       if (result) {
         // Mark the fused input producer for distribution when writing to shared
         // memory. We cannot use the current matmul op's tiling scheme here
         // given dimensions are different.
-        IREE::LinalgExt::LinalgTransformationFilter f(
+        LinalgTransformationFilter f(
             ArrayRef<StringAttr>(),
             rewriter.getStringAttr(getCopyToWorkgroupMemoryMarker()));
         f.replaceLinalgTransformationFilter(
             rewriter, result->tiledAndFusedProducer.getDefiningOp());
       }
     }
-    tilingResult->loops = llvm::to_vector(
-        llvm::map_range(forLoops, [](auto op) -> Operation * { return op; }));
     return tilingResult;
   }
 
-  IREE::LinalgExt::LinalgTransformationFilter filter;
+  LinalgTransformationFilter filter;
   bool fuseInputProducer;
+  bool coalesceLoops;
 };
 
 /// Patterns for workgroup level tiling. Workgroup tiling is done at the flow
 /// level but we may have extra tiling for the reduction dimension. Therefore we
 /// tile again without distributing.
 static void populateTilingPatterns(RewritePatternSet &patterns,
-                                   bool fuseInputProducer) {
+                                   bool fuseInputProducer, bool coalesceLoops) {
   MLIRContext *context = patterns.getContext();
 
-  IREE::LinalgExt::LinalgTransformationFilter filter(
+  LinalgTransformationFilter filter(
       ArrayRef<StringAttr>{
           StringAttr::get(context, getWorkgroupMemoryMarker())},
       StringAttr::get(context, getWorkgroupKTiledMarker()));
   filter.setMatchByDefault();
 
-  patterns.add<TileConsumerAndFuseInputProducer>(context, filter,
-                                                 fuseInputProducer);
+  patterns.add<TileConsumerAndFuseInputProducer>(
+      context, filter, fuseInputProducer, coalesceLoops);
 }
 
-LogicalResult tileReductionToSerialLoops(func::FuncOp funcOp,
-                                         bool fuseInputProducer) {
+} // namespace
+
+LogicalResult tileReductionToSerialLoops(mlir::FunctionOpInterface funcOp,
+                                         bool fuseInputProducer,
+                                         bool coalesceLoops) {
   {
     // Tile again at the workgroup level since redution dimension were
     // ignored. Dimensions already tiled will be ignore since we tile to the
     // same size.
     RewritePatternSet wgTilingPatterns(funcOp.getContext());
-    populateTilingPatterns(wgTilingPatterns, fuseInputProducer);
-    if (failed(applyPatternsAndFoldGreedily(funcOp,
-                                            std::move(wgTilingPatterns)))) {
+    populateTilingPatterns(wgTilingPatterns, fuseInputProducer, coalesceLoops);
+    if (failed(applyPatternsGreedily(funcOp, std::move(wgTilingPatterns)))) {
       return failure();
     }
   }
@@ -206,7 +223,7 @@ LogicalResult tileReductionToSerialLoops(func::FuncOp funcOp,
         wgTilingCanonicalizationPatterns);
     scf::populateSCFForLoopCanonicalizationPatterns(
         wgTilingCanonicalizationPatterns);
-    if (failed(applyPatternsAndFoldGreedily(
+    if (failed(applyPatternsGreedily(
             funcOp, std::move(wgTilingCanonicalizationPatterns)))) {
       return failure();
     }
@@ -214,9 +231,10 @@ LogicalResult tileReductionToSerialLoops(func::FuncOp funcOp,
   }
 }
 
+namespace {
 /// Tile parallel dimensions according to the attribute tile sizes attached to
 /// each op.
-static LogicalResult tileParallelDims(func::FuncOp funcOp,
+static LogicalResult tileParallelDims(mlir::FunctionOpInterface funcOp,
                                       SmallVectorImpl<int64_t> &workgroupSize,
                                       bool distributeToWarp) {
   std::array<int64_t, 3> elementPerWorkgroup = {
@@ -229,8 +247,7 @@ static LogicalResult tileParallelDims(func::FuncOp funcOp,
       StringAttr::get(funcOp.getContext(), getCopyToWorkgroupMemoryMarker());
 
   for (TilingInterface tilingOp : computeOps) {
-    auto attr = tilingOp->getAttr(
-        IREE::LinalgExt::LinalgTransforms::kLinalgTransformMarker);
+    auto attr = tilingOp->getAttr(LinalgTransforms::kLinalgTransformMarker);
     if (attr == marker)
       continue;
 
@@ -265,16 +282,22 @@ static LogicalResult tileParallelDims(func::FuncOp funcOp,
       }
     }
     std::reverse(idDims.begin(), idDims.end());
-    ArrayAttr mapping = rewriter.getArrayAttr(idDims);
-    auto tilingResult =
-        linalg::tileToForallOp(rewriter, tilingOp, numThreads, mapping);
-    rewriter.replaceOp(tilingOp, tilingResult->tileOp->getResults());
+    scf::SCFTilingOptions options;
+    options.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
+    options.setMapping(idDims);
+    options.setNumThreads(numThreads);
+    FailureOr<scf::SCFTilingResult> tilingResult =
+        scf::tileUsingSCF(rewriter, tilingOp, options);
+    if (failed(tilingResult)) {
+      return tilingOp->emitOpError("failed to tile to scf.forall");
+    }
+    rewriter.replaceOp(tilingOp, tilingResult->mergeResult.replacements);
   }
   return success();
 }
 
 // Tile convolution output window dimension by 1 to prepare downsizing.
-static LogicalResult tileAndUnrollConv(func::FuncOp funcOp) {
+static LogicalResult tileAndUnrollConv(mlir::FunctionOpInterface funcOp) {
   SmallVector<linalg::ConvolutionOpInterface, 1> convOps;
   funcOp.walk([&convOps](linalg::ConvolutionOpInterface convOp) {
     convOps.push_back(convOp);
@@ -288,7 +311,7 @@ static LogicalResult tileAndUnrollConv(func::FuncOp funcOp) {
       return success();
 
     FailureOr<scf::SCFTileAndFuseResult> tileAndFuseResult =
-        scf::tileConsumerAndFuseProducerGreedilyUsingSCFForOp(
+        scf::tileConsumerAndFuseProducersUsingSCF(
             rewriter, cast<TilingInterface>(consumerOp.getOperation()),
             scf::SCFTileAndFuseOptions().setTilingOptions(
                 scf::SCFTilingOptions().setTileSizes(tileSizes)));
@@ -309,7 +332,7 @@ static LogicalResult tileAndUnrollConv(func::FuncOp funcOp) {
     // Fully unroll the generated loop. This allows us to remove the loop
     // for parallel output window dimension, so it helps future vector
     // transformations.
-    ArrayRef<Operation *> loops = tileAndFuseResult.value().loops;
+    ArrayRef<LoopLikeOpInterface> loops = tileAndFuseResult.value().loops;
     if (!loops.empty()) {
       assert(loops.size() == 1);
       scf::ForOp loopOp = cast<scf::ForOp>(loops.front());
@@ -327,27 +350,20 @@ static LogicalResult tileAndUnrollConv(func::FuncOp funcOp) {
   return success();
 }
 
-namespace {
-struct GPUTensorTilePass : public GPUTensorTileBase<GPUTensorTilePass> {
-private:
-  // Distribute the workloads to warp if true otherwise distribute to threads.
-  bool distributeToWarp = false;
+struct GPUTensorTilePass final
+    : impl::GPUTensorTilePassBase<GPUTensorTilePass> {
+  using GPUTensorTilePassBase::GPUTensorTilePassBase;
 
-public:
-  GPUTensorTilePass(bool distributeToWarp)
-      : distributeToWarp(distributeToWarp) {}
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<affine::AffineDialect, gpu::GPUDialect, scf::SCFDialect>();
-  }
   void runOnOperation() override {
-    auto funcOp = getOperation();
-    if (!isEntryPoint(funcOp))
-      return;
+    FunctionOpInterface funcOp = getOperation();
 
-    auto workgroupSize = llvm::map_to_vector(
-        getEntryPoint(funcOp)->getWorkgroupSize().value(),
-        [&](Attribute attr) { return llvm::cast<IntegerAttr>(attr).getInt(); });
-    if (failed(tileParallelDims(funcOp, workgroupSize, distributeToWarp))) {
+    std::optional<SmallVector<int64_t>> workgroupSize =
+        getWorkgroupSize(funcOp);
+    if (!workgroupSize) {
+      return;
+    }
+    if (failed(tileParallelDims(funcOp, workgroupSize.value(),
+                                distributeToSubgroup))) {
       return signalPassFailure();
     }
 
@@ -358,7 +374,8 @@ public:
 
     // Tile to serial loops to the wg tile size to handle reductions and other
     // dimension that have not been distributed.
-    if (failed(tileReductionToSerialLoops(funcOp)))
+    if (failed(tileReductionToSerialLoops(funcOp, /*fuseInputProducer=*/false,
+                                          /*coalesceLoops=*/false)))
       return signalPassFailure();
 
     LLVM_DEBUG({
@@ -376,11 +393,6 @@ public:
     });
   }
 };
+
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createGPUTensorTile(bool distributeToWarp) {
-  return std::make_unique<GPUTensorTilePass>(distributeToWarp);
-}
-
 } // namespace mlir::iree_compiler

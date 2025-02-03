@@ -7,6 +7,7 @@
 #ifndef IREE_DIALECT_MODULES_VMVX_OPS
 #define IREE_DIALECT_MODULES_VMVX_OPS
 
+include "iree/compiler/Dialect/HAL/IR/HALAttrs.td"
 include "iree/compiler/Dialect/VMVX/IR/VMVXBase.td"
 include "iree/compiler/Dialect/VMVX/IR/VMVXInterfaces.td"
 include "mlir/IR/OpAsmInterface.td"
@@ -71,14 +72,16 @@ def VMVX_GetRawInterfaceBindingBufferOp : VMVX_PureOp<
     buffer as passed to the interface.
   }];
   let arguments = (ins
-    IndexAttr:$set,
+    HAL_PipelineLayoutAttr:$layout,
     IndexAttr:$binding
   );
   let results = (outs
     Util_BufferType:$buffer
   );
   let assemblyFormat = [{
-    `set` `(` $set `)` `binding` `(` $binding `)` attr-dict
+    `layout` `(` $layout `)`
+    `binding` `(` $binding `)`
+    attr-dict
   }];
 }
 

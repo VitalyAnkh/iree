@@ -14,25 +14,16 @@ iree_lit_test_suite(
   NAME
     lit
   SRCS
-    "attention.mlir"
-    "contraction-packing-and-dispatch.mlir"
-    "contraction-packing.mlir"
-    "eltwise_reduction_eltwise.mlir"
-    "fold_tensor_slice_into_transfer.mlir"
-    "matmul.mlir"
     "matmul_library_call.mlir"
   TOOLS
     ${IREE_LLD_TARGET}
     FileCheck
-    iree-benchmark-module
     iree-compile
-    iree-opt
     iree-run-module
   DATA
-    attention_codegen_spec.mlir
-    matmul_codegen_default_spec.mlir
     transform_library.mlir
   LABELS
+    "hostonly"
     "noasan"
     "nomsan"
     "notsan"

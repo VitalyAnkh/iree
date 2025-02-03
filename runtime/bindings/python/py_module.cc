@@ -40,6 +40,7 @@ class PyModuleInterface {
     interface_.lookup_function = &PyModuleInterface::ModuleLookupFunction;
     interface_.alloc_state = &PyModuleInterface::ModuleAllocState;
     interface_.free_state = &PyModuleInterface::ModuleFreeState;
+    interface_.fork_state = &PyModuleInterface::ModuleForkState;
     interface_.resolve_import = &PyModuleInterface::ModuleResolveImport;
     interface_.notify = &PyModuleInterface::ModuleNotify;
     interface_.begin_call = &PyModuleInterface::ModuleBeginCall;
@@ -86,7 +87,8 @@ class PyModuleInterface {
       iree_vm_function_t* out_function, iree_string_view_t* out_name,
       iree_vm_function_signature_t* out_signature) {
     auto self = AsSelf(vself);
-    if (IREE_LIKELY(linkage == IREE_VM_FUNCTION_LINKAGE_EXPORT)) {
+    if (IREE_LIKELY(linkage == IREE_VM_FUNCTION_LINKAGE_EXPORT ||
+                    linkage == IREE_VM_FUNCTION_LINKAGE_EXPORT_OPTIONAL)) {
       if (IREE_LIKELY(ordinal < self->export_functions_.size())) {
         std::unique_ptr<PyFunction>& f = self->export_functions_[ordinal];
         if (IREE_LIKELY(out_function)) {
@@ -114,7 +116,8 @@ class PyModuleInterface {
       iree_vm_function_t* out_function) {
     auto self = AsSelf(vself);
     std::string_view name_cpp(name.data, name.size);
-    if (linkage == IREE_VM_FUNCTION_LINKAGE_EXPORT) {
+    if (linkage == IREE_VM_FUNCTION_LINKAGE_EXPORT ||
+        linkage == IREE_VM_FUNCTION_LINKAGE_EXPORT_OPTIONAL) {
       auto found_it = self->export_name_to_ordinals_.find(name_cpp);
       if (found_it != self->export_name_to_ordinals_.end()) {
         out_function->linkage = linkage;
@@ -154,6 +157,15 @@ class PyModuleInterface {
     auto retained_handle =
         py::handle(reinterpret_cast<PyObject*>(module_state));
     retained_handle.dec_ref();
+  }
+
+  static iree_status_t ModuleForkState(
+      void* self, iree_vm_module_state_t* parent_state,
+      iree_allocator_t allocator, iree_vm_module_state_t** out_child_state) {
+    // TODO: call into python to clone the state (mostly what ctor_ is doing
+    // but each module will want to handle things differently).
+    return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                            "python module fork not supported");
   }
 
   static iree_status_t ModuleResolveImport(

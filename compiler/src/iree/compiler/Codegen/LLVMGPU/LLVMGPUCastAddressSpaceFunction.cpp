@@ -4,32 +4,26 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/LLVMGPU/KernelConfig.h"
-#include "iree/compiler/Codegen/LLVMGPU/PassDetail.h"
 #include "iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.h"
-#include "iree/compiler/Codegen/Transforms/Transforms.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
-#include "llvm/Support/raw_ostream.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/TransformOps/GPUTransformOps.h"
-#include "mlir/Dialect/GPU/Transforms/Passes.h"
-#include "mlir/IR/Matchers.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "mlir/Support/MathExtras.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Transforms/Passes.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Pass/Pass.h"
 
 #define DEBUG_TYPE "iree-llvmgpu-cast-address-space-function"
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_LLVMGPUCASTADDRESSSPACEFUNCTIONPASS
+#include "iree/compiler/Codegen/LLVMGPU/Passes.h.inc"
+
 namespace {
 
-struct LLVMGPUCastAddressSpaceFunctionPass
-    : public LLVMGPUCastAddressSpaceFunctionBase<
+struct LLVMGPUCastAddressSpaceFunctionPass final
+    : impl::LLVMGPUCastAddressSpaceFunctionPassBase<
           LLVMGPUCastAddressSpaceFunctionPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<affine::AffineDialect, gpu::GPUDialect>();
@@ -43,11 +37,11 @@ struct LLVMGPUCastAddressSpaceFunctionPass
     ModuleOp moduleOp = getOperation();
 
     auto castOperands = [&](mlir::Operation::operand_range operands,
-                            SmallVector<Value> &new_operands) {
+                            SmallVector<Value> &newOperands) {
       bool anyCasted = false;
       for (auto operand : operands) {
         if (auto memrefType = dyn_cast<mlir::MemRefType>(operand.getType())) {
-          if (hasSharedMemoryAddressSpace(memrefType)) {
+          if (memrefType.getMemorySpace()) {
             mlir::MemRefType new_memrefType = mlir::MemRefType::get(
                 memrefType.getShape(), memrefType.getElementType(),
                 memrefType.getLayout());
@@ -56,26 +50,27 @@ struct LLVMGPUCastAddressSpaceFunctionPass
             anyCasted = true;
           }
         }
-        new_operands.push_back(operand);
+        newOperands.push_back(operand);
       }
       return anyCasted;
     };
 
-    moduleOp->walk([&](func::CallOp callOp) {
-      SmallVector<Value> new_operands;
+    moduleOp->walk([&](mlir::CallOpInterface callOp) {
+      auto callee = dyn_cast<SymbolRefAttr>(callOp.getCallableForCallee());
+      SmallVector<Value> newOperands;
       OpBuilder::InsertionGuard g(rewriter);
       rewriter.setInsertionPoint(callOp);
-      if (castOperands(callOp->getOperands(), new_operands)) {
-        callOp.getOperandsMutable().assign(new_operands);
-        auto fnDecl = dyn_cast_or_null<func::FuncOp>(
-            SymbolTable::lookupSymbolIn(moduleOp, callOp.getCallee()));
+      if (castOperands(callOp->getOperands(), newOperands)) {
+        callOp.getArgOperandsMutable().assign(newOperands);
+        auto fnDecl = dyn_cast_or_null<mlir::FunctionOpInterface>(
+            SymbolTable::lookupSymbolIn(moduleOp, callee));
         if (fnDecl) {
           SmallVector<Type> callArgumentTypes;
-          for (auto op : new_operands)
+          for (auto op : newOperands)
             callArgumentTypes.push_back(op.getType());
           FunctionType functionType = rewriter.getFunctionType(
               callArgumentTypes, fnDecl->getResultTypes());
-          fnDecl.setFunctionType(functionType);
+          fnDecl.setType(functionType);
         }
       }
     });
@@ -83,10 +78,4 @@ struct LLVMGPUCastAddressSpaceFunctionPass
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<ModuleOp>>
-createLLVMGPUCastAddressSpaceFunction() {
-  return std::make_unique<LLVMGPUCastAddressSpaceFunctionPass>();
-}
-
 } // namespace mlir::iree_compiler

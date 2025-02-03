@@ -4,8 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#ifndef IREE_COMPILER_UTILS_FUNCTIONUTILS_H_
-#define IREE_COMPILER_UTILS_FUNCTIONUTILS_H_
+#ifndef IREE_COMPILER_UTILS_PASSUTILS_H_
+#define IREE_COMPILER_UTILS_PASSUTILS_H_
 
 #include <array>
 
@@ -17,8 +17,8 @@ namespace mlir::iree_compiler {
 /// Constructs a pipeline of passes across multiple nested op types.
 ///
 /// Usage:
-///   using FunctionLikeNest = MultiOpNest<func::FuncOp,
-///                                        IREE::Util::InitializerOp>;
+///   using FunctionLikeNest = MultiOpNest<IREE::Util::InitializerOp,
+///                                        IREE::Util::FuncOp>;
 ///
 ///   FunctionLikeNest(passManager)
 ///     .addPass(createMyPass)
@@ -84,4 +84,4 @@ void signalFixedPointModified(Operation *rootOp);
 
 } // namespace mlir::iree_compiler
 
-#endif // IREE_COMPILER_UTILS_FUNCTIONUTILS_H_
+#endif // IREE_COMPILER_UTILS_PASSUTILS_H_

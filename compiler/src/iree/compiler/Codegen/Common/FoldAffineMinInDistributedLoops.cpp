@@ -14,7 +14,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
@@ -34,6 +33,9 @@
 #define DEBUG_TYPE "iree-codegen-fold-affinemin-in-distributed-loops"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_FOLDAFFINEMININDISTRIBUTEDLOOPSPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 #ifndef NDEBUG
 inline raw_ostream &operator<<(raw_ostream &os,
@@ -139,6 +141,8 @@ struct FoldAffineMinOverWorkgroupIDs final
       unsigned index = idOp.getDimension().getZExtValue();
       if (index >= numWorkgroup.size())
         return failure();
+      if (numWorkgroup[index] == ShapedType::kDynamic)
+        continue;
       constraints.appendDimVar({idOp});
       constraints.addBound(presburger::BoundType::LB, idOp, 0);
       constraints.addBound(presburger::BoundType::UB, idOp,
@@ -152,14 +156,13 @@ private:
 };
 
 struct FoldAffineMinInDistributedLoopsPass final
-    : public FoldAffineMinInDistributedLoopsBase<
+    : impl::FoldAffineMinInDistributedLoopsPassBase<
           FoldAffineMinInDistributedLoopsPass> {
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
     SmallVector<int64_t> numWorkgroups = getStaticNumWorkgroups(getOperation());
     populateFoldAffineMinInDistributedLoopsPatterns(patterns, numWorkgroups);
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       // TODO(#4759): This does not converge after the max number of iterations.
       // It indicates that some pattern upstream is generating ops even when the
       // pattern failed to match. Not related to correctness, but would be good
@@ -179,10 +182,4 @@ void populateFoldAffineMinInDistributedLoopsPatterns(
                                                 numWorkgroups);
   }
 }
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createFoldAffineMinInDistributedLoopsPass() {
-  return std::make_unique<FoldAffineMinInDistributedLoopsPass>();
-}
-
 } // namespace mlir::iree_compiler

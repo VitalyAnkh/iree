@@ -39,8 +39,6 @@ endfunction()
 #       "driver=${DRIVER}" are added automatically.
 #   MODULE_FILE_NAME: Optional, specifies the absolute path to the filename
 #       to use for the generated IREE module (.vmfb).
-#   TARGET_CPU_FEATURES: If specified, a string passed as argument to
-#       --iree-llvmcpu-target-cpu-features.
 #   DEPENDS: Optional. Additional dependencies beyond SRC and the tools.
 #   INPUT_TYPE: The value for the --iree-input-type= flag. Also disables tests
 #       if no compiled support for that configuration.
@@ -49,113 +47,173 @@ function(iree_check_test)
     return()
   endif()
 
-  # Check tests require (by way of iree_bytecode_module) some tools.
-  #
-  # These can either be built from source, if IREE_BUILD_COMPILER is set, or
-  # be located under IREE_HOST_BIN_DIR (required if cross-compiling).
-  if(NOT IREE_BUILD_COMPILER AND NOT IREE_HOST_BIN_DIR)
-    return()
-  endif()
-
   cmake_parse_arguments(
     _RULE
     ""
     "NAME;SRC;TARGET_BACKEND;DRIVER;MODULE_FILE_NAME;INPUT_TYPE"
-    "COMPILER_FLAGS;RUNNER_ARGS;LABELS;TARGET_CPU_FEATURES;DEPENDS;TIMEOUT"
+    "COMPILER_FLAGS;RUNNER_ARGS;LABELS;DEPENDS;TIMEOUT"
     ${ARGN}
   )
 
-  iree_is_bytecode_module_test_excluded_by_labels(_EXCLUDED_BY_LABELS "${_RULE_LABELS}")
-  if(_EXCLUDED_BY_LABELS)
-    return()
+  # Normalize some variables before using them.
+  string(TOUPPER ${_RULE_TARGET_BACKEND} _UPPERCASE_TARGET_BACKEND)
+  string(REPLACE "-" "_" _NORMALIZED_TARGET_BACKEND ${_UPPERCASE_TARGET_BACKEND})
+
+  # ---------------------------------------------------------------------------
+  # Bytecode module builds require
+  #   1. the compiler, either in the same build or provided in IREE_HOST_BIN_DIR
+  #   2. compiler support for _RULE_INPUT_TYPE
+  #   3. compiler support for _RULE_TARGET_BACKEND
+  set(_BYTECODE_MODULE_BUILD_ENABLED TRUE)
+
+  # 1. Check for the compiler.
+  if(NOT IREE_BUILD_COMPILER AND NOT IREE_HOST_BIN_DIR)
+    set(_BYTECODE_MODULE_BUILD_ENABLED FALSE)
   endif()
 
-  # Exclude based on input type availability.
-  # Note: we can only reliably check for this when builting the compiler host
+  # 2. Check input type availability.
+  # Note: we can only reliably check for this when building the compiler host
   # tools from source. If the tools are already built, we assume that all input
   # dialects are enabled. We could query the tools in the binary directory for
   # support dynamically if optionality would be useful.
-  if(NOT IREE_HOST_BIN_DIR)
+  if(DEFINED _RULE_INPUT_TYPE AND NOT IREE_HOST_BIN_DIR)
     if("${_RULE_INPUT_TYPE}" STREQUAL "stablehlo" AND NOT IREE_INPUT_STABLEHLO)
-      return()
+      set(_BYTECODE_MODULE_BUILD_ENABLED FALSE)
     endif()
     if("${_RULE_INPUT_TYPE}" STREQUAL "tosa" AND NOT IREE_INPUT_TOSA)
-      return()
+      set(_BYTECODE_MODULE_BUILD_ENABLED FALSE)
     endif()
     if("${_RULE_INPUT_TYPE}" STREQUAL "torch" AND NOT IREE_INPUT_TORCH)
-      return()
+      set(_BYTECODE_MODULE_BUILD_ENABLED FALSE)
     endif()
   endif()
 
+  # 3. Check target backend availability.
+  # Note: we can only reliably check for this when building the compiler host
+  # tools from source. If the tools are already built, we assume that all target
+  # backends are enabled. We could query the tools in the binary directory for
+  # support dynamically if optionality would be useful.
+  if(NOT IREE_HOST_BIN_DIR)
+    # TODO(scotttodd): allow plugins to provide external backends here
+    if(NOT DEFINED IREE_TARGET_BACKEND_${_NORMALIZED_TARGET_BACKEND})
+      message(SEND_ERROR "Unknown backend '${_RULE_TARGET_BACKEND}'. Check IREE_TARGET_BACKEND_* options.")
+    endif()
+    if(NOT IREE_TARGET_BACKEND_${_NORMALIZED_TARGET_BACKEND})
+      set(_BYTECODE_MODULE_BUILD_ENABLED FALSE)
+    endif()
+    # rocm/hip require a target chip to be specified at compile time that matches the runtime device
+    if(_NORMALIZED_TARGET_BACKEND STREQUAL "ROCM" AND NOT IREE_HIP_TEST_TARGET_CHIP)
+      set(_BYTECODE_MODULE_BUILD_ENABLED FALSE)
+    endif()
+  endif()
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Tests are defined if _RULE_DRIVER is defined.
+  set(_TEST_DEFINED TRUE)
+  if(NOT DEFINED _RULE_DRIVER)
+    set(_TEST_DEFINED FALSE)
+  endif()
+
+  # Test execution requires
+  #   1. the bytecode module build to be enabled
+  #   2. _RULE_DRIVER is defined and runtime support is enabled
+  #   3. no other label exclusions (e.g. 'optonly' test with 'debug' config)
+  set(_TEST_DISABLED FALSE)
+
+  # 1. Check bytecode module build.
+  if(NOT _BYTECODE_MODULE_BUILD_ENABLED)
+    set(_TEST_DISABLED TRUE)
+  endif()
+
+  # 2. Check driver availability.
+  if(DEFINED _RULE_DRIVER)
+    string(TOUPPER ${_RULE_DRIVER} _UPPERCASE_DRIVER)
+    string(REPLACE "-" "_" _NORMALIZED_DRIVER ${_UPPERCASE_DRIVER})
+    if((NOT IREE_HAL_DRIVER_${_NORMALIZED_DRIVER}) AND
+       (NOT IREE_EXTERNAL_${_NORMALIZED_DRIVER}_HAL_DRIVER_FOUND))
+      set(_TEST_DISABLED TRUE)
+    endif()
+  endif()
+
+  # 3. Check label exclusions.
+  iree_is_bytecode_module_test_excluded_by_labels(_EXCLUDED_BY_LABELS "${_RULE_LABELS}")
+  if(_EXCLUDED_BY_LABELS)
+    set(_TEST_DISABLED TRUE)
+  endif()
+
+  if((_TEST_DISABLED OR NOT _TEST_DEFINED) AND NOT IREE_BUILD_ALL_CHECK_TEST_MODULES)
+    set(_BYTECODE_MODULE_BUILD_ENABLED FALSE)
+  endif()
+  # ---------------------------------------------------------------------------
+
   iree_package_name(_PACKAGE_NAME)
-  set(_NAME "${_PACKAGE_NAME}_${_RULE_NAME}")
 
   set(_MODULE_NAME "${_RULE_NAME}_module")
-
   if(DEFINED _RULE_MODULE_FILE_NAME)
     set(_MODULE_FILE_NAME "${_RULE_MODULE_FILE_NAME}")
-  else(DEFINED _RULE_MODULE_FILE_NAME)
+  else()
     set(_MODULE_FILE_NAME "${_MODULE_NAME}.vmfb")
   endif(DEFINED _RULE_MODULE_FILE_NAME)
 
-  set(_BASE_COMPILER_FLAGS
-    "--iree-hal-target-backends=${_RULE_TARGET_BACKEND}"
-  )
-
+  set(_BASE_COMPILER_FLAGS "--iree-hal-target-backends=${_RULE_TARGET_BACKEND}")
   if(_RULE_INPUT_TYPE)
     list(APPEND _BASE_COMPILER_FLAGS "--iree-input-type=${_RULE_INPUT_TYPE}")
   endif()
-
-  if (_RULE_TARGET_CPU_FEATURES)
-    list(APPEND _BASE_COMPILER_FLAGS "--iree-llvmcpu-target-cpu-features=${_RULE_TARGET_CPU_FEATURES}")
+  if(_NORMALIZED_TARGET_BACKEND STREQUAL "ROCM")
+    list(APPEND _BASE_COMPILER_FLAGS "--iree-hip-target=${IREE_HIP_TEST_TARGET_CHIP}")
   endif()
 
-  iree_bytecode_module(
-    NAME
-      "${_MODULE_NAME}"
-    MODULE_FILE_NAME
-      "${_MODULE_FILE_NAME}"
-    SRC
-      "${_RULE_SRC}"
-    FLAGS
-      "${_BASE_COMPILER_FLAGS}"
-      "${_RULE_COMPILER_FLAGS}"
-    DEPENDS
-      "${_RULE_DEPENDS}"
-  )
+  if(_BYTECODE_MODULE_BUILD_ENABLED)
+    iree_bytecode_module(
+      NAME
+        "${_MODULE_NAME}"
+      MODULE_FILE_NAME
+        "${_MODULE_FILE_NAME}"
+      SRC
+        "${_RULE_SRC}"
+      FLAGS
+        "${_BASE_COMPILER_FLAGS}"
+        "${_RULE_COMPILER_FLAGS}"
+      DEPENDS
+        "${_RULE_DEPENDS}"
+    )
+  endif()
 
   set(_RUNNER_TARGET "iree-check-module")
 
-  # A target specifically for the test. We could combine this with the above,
-  # but we want that one to get pulled into iree_bytecode_module.
+  # Add a custom build target specifically for the test and its deps.
+  set(_NAME "${_PACKAGE_NAME}_${_RULE_NAME}")
   add_custom_target("${_NAME}" ALL)
-  add_dependencies(
-    "${_NAME}"
-    "${_NAME}_module"
-    "${_RUNNER_TARGET}"
-  )
-
+  if(_BYTECODE_MODULE_BUILD_ENABLED)
+    add_dependencies(
+      "${_NAME}"
+      "${_NAME}_module"
+      "${_RUNNER_TARGET}"
+    )
+  endif()
   add_dependencies(iree-test-deps "${_NAME}")
 
-  if(NOT DEFINED _RULE_DRIVER)
-    return()
+  if(_TEST_DEFINED)
+    iree_native_test(
+      NAME
+        "${_RULE_NAME}"
+      DRIVER
+        "${_RULE_DRIVER}"
+      SRC
+        "${_RUNNER_TARGET}"
+      ARGS
+        "--module={{${_MODULE_FILE_NAME}}}"
+        ${_RULE_RUNNER_ARGS}
+      LABELS
+        "test-type=check-test"
+        ${_RULE_LABELS}
+      TIMEOUT
+        ${_RULE_TIMEOUT}
+      DISABLED
+        ${_TEST_DISABLED}
+    )
   endif()
-
-  iree_native_test(
-    NAME
-      "${_RULE_NAME}"
-    DRIVER
-      "${_RULE_DRIVER}"
-    SRC
-      "${_RUNNER_TARGET}"
-    ARGS
-      "--module={{${_MODULE_FILE_NAME}}}"
-      ${_RULE_RUNNER_ARGS}
-    LABELS
-      ${_RULE_LABELS}
-    TIMEOUT
-      ${_RULE_TIMEOUT}
-  )
 endfunction()
 
 # iree_check_single_backend_test_suite()
@@ -179,8 +237,6 @@ endfunction()
 #       different args per test, create a separate suite or iree_check_test.
 #   LABELS: Additional labels to apply to the generated tests. The package path
 #       is added automatically.
-#   TARGET_CPU_FEATURES: If specified, a string passed as argument to
-#       --iree-llvmcpu-target-cpu-features.
 #   DEPENDS: Optional. Additional dependencies beyond SRC and the tools.
 #   INPUT_TYPE: The value for the --iree-input-type= flag. Also disables tests
 #       if no compiled support for that configuration.
@@ -189,93 +245,85 @@ function(iree_check_single_backend_test_suite)
     return()
   endif()
 
-  # Note: we could check IREE_BUILD_COMPILER here, but cross compilation makes
-  # that a little tricky. Instead, we let iree_check_test handle the checks,
-  # meaning this function may run some configuration but generate no targets.
-
   cmake_parse_arguments(
     _RULE
     ""
     "NAME;TARGET_BACKEND;DRIVER;INPUT_TYPE"
-    "SRCS;COMPILER_FLAGS;RUNNER_ARGS;LABELS;TARGET_CPU_FEATURES;DEPENDS;TIMEOUT"
+    "SRCS;COMPILER_FLAGS;RUNNER_ARGS;LABELS;DEPENDS;TIMEOUT"
     ${ARGN}
   )
-
-  iree_is_bytecode_module_test_excluded_by_labels(_EXCLUDED_BY_LABELS "${_RULE_LABELS}")
-  if(_EXCLUDED_BY_LABELS)
-    return()
-  endif()
-
-  string(TOUPPER "${IREE_EXTERNAL_HAL_DRIVERS}" _UPPERCASE_EXTERNAL_DRIVERS)
-  string(REPLACE "-" "_" _NORMALIZED_EXTERNAL_DRIVERS "${_UPPERCASE_EXTERNAL_DRIVERS}")
-
-  # Omit tests for which the specified driver or target backend is not enabled.
-  # This overlaps with directory exclusions and other filtering mechanisms.
-  #
-  # Note: omitting the DRIVER arg is allowed (though it is a hack). If it is
-  # omitted, we don't need to test for a driver being enabled.
-  if(DEFINED _RULE_DRIVER)
-    string(TOUPPER ${_RULE_DRIVER} _UPPERCASE_DRIVER)
-    string(REPLACE "-" "_" _NORMALIZED_DRIVER ${_UPPERCASE_DRIVER})
-    if((NOT DEFINED IREE_HAL_DRIVER_${_NORMALIZED_DRIVER}) AND (NOT ${_NORMALIZED_DRIVER} IN_LIST _NORMALIZED_EXTERNAL_DRIVERS))
-      message(SEND_ERROR "Unknown driver '${_RULE_DRIVER}'. Check IREE_HAL_DRIVER_*/IREE_EXTERNAL_HAL_DRIVERS options.")
-    endif()
-    if((NOT IREE_HAL_DRIVER_${_NORMALIZED_DRIVER}) AND (NOT IREE_EXTERNAL_${_NORMALIZED_DRIVER}_HAL_DRIVER_FOUND))
-      return()
-    endif()
-  endif()
-  string(TOUPPER ${_RULE_TARGET_BACKEND} _UPPERCASE_TARGET_BACKEND)
-  string(REPLACE "-" "_" _NORMALIZED_TARGET_BACKEND ${_UPPERCASE_TARGET_BACKEND})
-  if(NOT DEFINED IREE_TARGET_BACKEND_${_NORMALIZED_TARGET_BACKEND})
-    message(SEND_ERROR "Unknown backend '${_RULE_TARGET_BACKEND}'. Check IREE_TARGET_BACKEND_* options.")
-  endif()
-  if(IREE_HOST_BIN_DIR)
-    # If we're not building the host tools from source under this configuration,
-    # such as when cross compiling, then we can't easily check for which
-    # compiler target backends are enabled. Just assume all are enabled and only
-    # rely on the runtime HAL driver check above for filtering.
-
-    # No driver, so this is a special configuration. The assumption above
-    # might not be true, so skip (these tests are _probably_ already being
-    # built on the host anyway, so no need to build when cross compiling).
-    # TODO(#11354): Use a different test function / move compile to test-time
-    if(NOT DEFINED _RULE_DRIVER)
-      return()
-    endif()
-  else()
-    # We are building the host tools, so check enabled compiler target backends.
-    if(NOT IREE_TARGET_BACKEND_${_NORMALIZED_TARGET_BACKEND})
-      return()
-    endif()
-  endif()
 
   foreach(_SRC IN LISTS _RULE_SRCS)
     get_filename_component(_BASE_NAME ${_SRC} NAME)
     set(_TEST_NAME "${_RULE_NAME}_${_BASE_NAME}")
-    iree_check_test(
-      NAME
-        ${_TEST_NAME}
-      SRC
-        ${_SRC}
-      TARGET_BACKEND
-        ${_RULE_TARGET_BACKEND}
-      DRIVER
-        ${_RULE_DRIVER}
-      COMPILER_FLAGS
-        ${_RULE_COMPILER_FLAGS}
-      INPUT_TYPE
-        ${_RULE_INPUT_TYPE}
-      RUNNER_ARGS
-        ${_RULE_RUNNER_ARGS}
-      LABELS
-        ${_RULE_LABELS}
-      TARGET_CPU_FEATURES
-        ${_RULE_TARGET_CPU_FEATURES}
-      DEPENDS
-        ${_RULE_DEPENDS}
-      TIMEOUT
-        ${_RULE_TIMEOUT}
-    )
+
+    # When using the llvm-cpu backend, the runtime build config may need to
+    # match the compiled executable config using (`--iree-llvmcpu-sanitize=`):
+    #
+    # | Runtime type         | Compatible with these executable types |
+    # | -------------------- | -------------------------------------- |
+    # | Base (no sanitizers) | Base, ASan                             |
+    # | ASan                 | Base, ASan                             |
+    # | TSan                 | TSan (ABI break)                       |
+
+    # Define the regular test suite, unless the config is llvm-cpu + TSan.
+    if(NOT _RULE_TARGET_BACKEND STREQUAL "llvm-cpu" OR NOT IREE_ENABLE_TSAN)
+      iree_check_test(
+        NAME ${_TEST_NAME}
+        SRC ${_SRC}
+        TARGET_BACKEND ${_RULE_TARGET_BACKEND}
+        DRIVER ${_RULE_DRIVER}
+        COMPILER_FLAGS ${_RULE_COMPILER_FLAGS}
+        INPUT_TYPE ${_RULE_INPUT_TYPE}
+        RUNNER_ARGS ${_RULE_RUNNER_ARGS}
+        LABELS ${_RULE_LABELS}
+        DEPENDS ${_RULE_DEPENDS}
+        TIMEOUT ${_RULE_TIMEOUT}
+      )
+    endif()
+
+    # Define tests for AddressSanitizer (ASan) and ThreadSanitizer (TSan).
+    # Normally test suites should do this sort of branching at the leaves rather
+    # than modify the base CMake function directly, but sanitizers are applied
+    # at the build system uniformly, so until we decouple the test suites from
+    # source builds further this felt like a reasonable compromise.
+    if(_RULE_TARGET_BACKEND STREQUAL "llvm-cpu")
+      if(IREE_ENABLE_ASAN)
+        set(_ASAN_COMPILER_FLAGS ${_RULE_COMPILER_FLAGS})
+        list(APPEND _ASAN_COMPILER_FLAGS "--iree-llvmcpu-link-embedded=false")
+        list(APPEND _ASAN_COMPILER_FLAGS "--iree-llvmcpu-sanitize=address")
+        iree_check_test(
+          NAME "${_TEST_NAME}_asan"
+          SRC ${_SRC}
+          TARGET_BACKEND ${_RULE_TARGET_BACKEND}
+          DRIVER ${_RULE_DRIVER}
+          COMPILER_FLAGS ${_ASAN_COMPILER_FLAGS}
+          INPUT_TYPE ${_RULE_INPUT_TYPE}
+          RUNNER_ARGS ${_RULE_RUNNER_ARGS}
+          LABELS ${_RULE_LABELS}
+          DEPENDS ${_RULE_DEPENDS}
+          TIMEOUT ${_RULE_TIMEOUT}
+        )
+      endif()
+
+      if(IREE_ENABLE_TSAN)
+        set(_TSAN_COMPILER_FLAGS ${_RULE_COMPILER_FLAGS})
+        list(APPEND _TSAN_COMPILER_FLAGS "--iree-llvmcpu-link-embedded=false")
+        list(APPEND _TSAN_COMPILER_FLAGS "--iree-llvmcpu-sanitize=thread")
+        iree_check_test(
+          NAME "${_TEST_NAME}_tsan"
+          SRC ${_SRC}
+          TARGET_BACKEND ${_RULE_TARGET_BACKEND}
+          DRIVER ${_RULE_DRIVER}
+          COMPILER_FLAGS ${_TSAN_COMPILER_FLAGS}
+          INPUT_TYPE ${_RULE_INPUT_TYPE}
+          RUNNER_ARGS ${_RULE_RUNNER_ARGS}
+          LABELS ${_RULE_LABELS}
+          DEPENDS ${_RULE_DEPENDS}
+          TIMEOUT ${_RULE_TIMEOUT}
+        )
+      endif()
+    endif()
   endforeach()
 endfunction()
 
@@ -284,9 +332,7 @@ endfunction()
 # This function has 3 output-params: variables that it sets with PARENT_SCOPE:
 # _ENABLED, _FEATURES_NAME, _FEATURES.
 #
-# "default" is handled specially. _ENABLED is always set to "TRUE" and
-# _FEATURES_NAME and _FEATURES are set to
-# the empty string.
+# "generic" and "host" are handled specially, as CPU names.
 #
 # Other values are parsed as "arch:features_name:features". The `arch`
 # component is  matched with `IREE_ARCH`, `_ENABLED` is set to "TRUE" if and
@@ -296,23 +342,28 @@ endfunction()
 #
 # Examples:
 #
-# default:
-#    _ENABLED="TRUE" unconditionally,
-#        other output strings are "".
+# generic:
+#    _ENABLED="TRUE" unconditionally, _FEATURES_NAME="generic", _FEATURES="".
+#
+# host:
+#    _ENABLED="TRUE" unconditionally, _FEATURES_NAME="host", _FEATURES="".
 #
 # aarch64:dotprod:+dotprod:
 #    _ENABLED="TRUE" if the target architecture is aarch64, and in that case:
 #        _FEATURES_NAME="dotprod".
 #        _FEATURES="+dotprod".
 function(parse_target_cpu_features_variant _VARIANT_STRING _ENABLED_VAR
-             _FEATURES_NAME_VAR _FEATURES_VAR)
+             _FEATURES_NAME_VAR _COMPILER_FLAGS_VAR)
   set("${_ENABLED_VAR}" FALSE PARENT_SCOPE)
   set("${_FEATURES_NAME_VAR}" "" PARENT_SCOPE)
-  set("${_FEATURES_VAR}" "" PARENT_SCOPE)
-  if("${_VARIANT_STRING}" STREQUAL "default")
+  set("${_COMPILER_FLAGS_VAR}" "" PARENT_SCOPE)
+  if("${_VARIANT_STRING}" STREQUAL "generic" OR "${_VARIANT_STRING}" STREQUAL "host")
     set("${_ENABLED_VAR}" TRUE PARENT_SCOPE)
+    set("${_FEATURES_NAME_VAR}" "${_VARIANT_STRING}" PARENT_SCOPE)
+    set("${_COMPILER_FLAGS_VAR}" "--iree-llvmcpu-target-cpu=${_VARIANT_STRING}" PARENT_SCOPE)
     return()
   endif()
+
   # Interpret _VARIANT_STRING as a CMake list (;-separated).
   string(REPLACE ":" ";" _COMPONENTS "${_VARIANT_STRING}")
   list(LENGTH _COMPONENTS _NUM_COMPONENTS)
@@ -327,7 +378,7 @@ function(parse_target_cpu_features_variant _VARIANT_STRING _ENABLED_VAR
   if(_FILTER_ARCH STREQUAL IREE_ARCH)
     set("${_ENABLED_VAR}" TRUE PARENT_SCOPE)
     set("${_FEATURES_NAME_VAR}" "${_FEATURES_NAME}" PARENT_SCOPE)
-    set("${_FEATURES_VAR}" "${_FEATURES}" PARENT_SCOPE)
+    set("${_COMPILER_FLAGS_VAR}" "--iree-llvmcpu-target-cpu-features=${_FEATURES}" PARENT_SCOPE)
   endif()
 endfunction()
 
@@ -355,13 +406,15 @@ endfunction()
 #   LABELS: Additional labels to apply to the generated tests. The package path is
 #       added automatically.
 #   TARGET_CPU_FEATURES_VARIANTS: list of target cpu features variants. Each
-#       entry is either "default" for the architecture defaults, or a colon-
-#       separated triple "arch:name:cpu_features" where "arch" filters
+#       entry is either "generic" for the architecture defaults, or "host" for
+#       the host CPU, or a colon-separated triple "arch:name:cpu_features" where "arch" filters
 #       for a target CPU architecture (in IREE_ARCH format), "name" is a
 #       short name for the CPU features set (used to generate target names)
 #       and cpu_features is a comma-separated list of LLVM target attributes
 #       to enable. Example:
 #         x86_64:avx2_fma:+avx,+avx2,+fma
+#   INPUT_TYPE: The value for the --iree-input-type= flag. Also disables tests
+#       if no compiled support for that configuration.
 function(iree_check_test_suite)
   if(NOT IREE_BUILD_TESTS)
     return()
@@ -370,7 +423,7 @@ function(iree_check_test_suite)
   cmake_parse_arguments(
     _RULE
     ""
-    "NAME"
+    "NAME;INPUT_TYPE"
     "SRCS;TARGET_BACKENDS;DRIVERS;RUNNER_ARGS;LABELS;TARGET_CPU_FEATURES_VARIANTS;TIMEOUT"
     ${ARGN}
   )
@@ -383,10 +436,11 @@ function(iree_check_test_suite)
   if(_RULE_TARGET_CPU_FEATURES_VARIANTS)
     set(_TARGET_CPU_FEATURES_VARIANTS "${_RULE_TARGET_CPU_FEATURES_VARIANTS}")
   else()
-    set(_TARGET_CPU_FEATURES_VARIANTS "default")
+    set(_TARGET_CPU_FEATURES_VARIANTS "generic")
   endif()
 
   if(NOT DEFINED _RULE_TARGET_BACKENDS AND NOT DEFINED _RULE_DRIVERS)
+    # Default backends/drivers.
     set(_RULE_TARGET_BACKENDS "vmvx" "vulkan-spirv" "llvm-cpu")
     set(_RULE_DRIVERS "local-task" "vulkan" "local-task")
   endif()
@@ -404,15 +458,17 @@ function(iree_check_test_suite)
     list(GET _RULE_TARGET_BACKENDS ${_INDEX} _TARGET_BACKEND)
     list(GET _RULE_DRIVERS ${_INDEX} _DRIVER)
     foreach(_VARIANT_STRING IN LISTS _TARGET_CPU_FEATURES_VARIANTS)
-      parse_target_cpu_features_variant("${_VARIANT_STRING}"
-        _ENABLED _TARGET_CPU_FEATURES_NAME _TARGET_CPU_FEATURES)
-      if(NOT _ENABLED)
-        # The current entry is disabled on the target CPU architecture.
-        continue()
+      if(_TARGET_BACKEND STREQUAL "llvm-cpu")
+        parse_target_cpu_features_variant("${_VARIANT_STRING}"
+          _ENABLED _TARGET_CPU_FEATURES_NAME _VARIANT_COMPILER_FLAGS)
+        if(NOT _ENABLED)
+          # The current entry is disabled on the target CPU architecture.
+          continue()
+        endif()
       endif()
       set(_TARGET_CPU_FEATURES_SUFFIX "")
       set(_LABELS "${_RULE_LABELS}")
-      if (_TARGET_CPU_FEATURES_NAME)
+      if(_TARGET_CPU_FEATURES_NAME)
         set(_TARGET_CPU_FEATURES_SUFFIX "_${_TARGET_CPU_FEATURES_NAME}")
         list(APPEND _LABELS "cpu_features=${_TARGET_CPU_FEATURES_NAME}")
       endif()
@@ -427,14 +483,15 @@ function(iree_check_test_suite)
           ${_DRIVER}
         COMPILER_FLAGS
           ${_RULE_COMPILER_FLAGS}
+          ${_VARIANT_COMPILER_FLAGS}
         RUNNER_ARGS
           ${_RULE_RUNNER_ARGS}
         LABELS
           ${_LABELS}
-        TARGET_CPU_FEATURES
-          ${_TARGET_CPU_FEATURES}
         TIMEOUT
           ${_RULE_TIMEOUT}
+        INPUT_TYPE
+          ${_RULE_INPUT_TYPE}
       )
     endforeach()
   endforeach()

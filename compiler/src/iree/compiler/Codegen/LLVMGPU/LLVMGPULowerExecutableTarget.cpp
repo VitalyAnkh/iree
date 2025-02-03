@@ -4,14 +4,22 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtDialect.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenAttrs.h"
-#include "iree/compiler/Codegen/Dialect/IREECodegenDialect.h"
+#include "iree/compiler/Codegen/Common/PassUtils.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUDialect.h"
+#include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/ConfigUtils.h"
+#include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "iree/compiler/Codegen/LLVMGPU/KernelConfig.h"
-#include "iree/compiler/Codegen/LLVMGPU/PassDetail.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
+#include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/PDL/IR/PDL.h"
@@ -20,12 +28,19 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/Passes.h"
 
+#define DEBUG_TYPE "iree-llvmgpu-lower-executable-target"
+
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_LLVMGPULOWEREXECUTABLETARGETPASS
+#include "iree/compiler/Codegen/LLVMGPU/Passes.h.inc"
 
 namespace {
 /// Lowers an hal.executable.variant operation to scalar/native-vector
@@ -34,15 +49,20 @@ namespace {
 /// - then convert to NVVM/ROCDL dialect.
 /// This should be merged with the equivalent pass in LinalgToLLVM. Fo
 /// simplicity it is currently a separate pass.
-class LLVMGPULowerExecutableTargetPass
-    : public LLVMGPULowerExecutableTargetBase<
+class LLVMGPULowerExecutableTargetPass final
+    : public impl::LLVMGPULowerExecutableTargetPassBase<
           LLVMGPULowerExecutableTargetPass> {
 public:
+  using impl::LLVMGPULowerExecutableTargetPassBase<
+      LLVMGPULowerExecutableTargetPass>::LLVMGPULowerExecutableTargetPassBase;
+
   void getDependentDialects(DialectRegistry &registry) const override {
     // clang-format off
     registry
         .insert<IREE::HAL::HALDialect,
+                IREE::GPU::IREEGPUDialect,
                 IREE::LinalgExt::IREELinalgExtDialect,
+                IREE::VectorExt::IREEVectorExtDialect,
                 linalg::LinalgDialect,
                 gpu::GPUDialect,
                 nvgpu::NVGPUDialect,
@@ -55,30 +75,35 @@ public:
     // clang-format on
   }
 
-  LLVMGPULowerExecutableTargetPass() = default;
-  LLVMGPULowerExecutableTargetPass(
-      const LLVMGPULowerExecutableTargetPass &pass){};
-
   void runOnOperation() override;
 };
 } // namespace
 
 void LLVMGPULowerExecutableTargetPass::runOnOperation() {
-  IREE::HAL::ExecutableVariantOp variantOp = getOperation();
+  FunctionOpInterface funcOp = getOperation();
+  IREE::Codegen::TranslationInfoAttr translationInfo =
+      getTranslationInfo(funcOp);
+  if (!translationInfo)
+    return;
 
-  std::optional<IREE::Codegen::TranslationInfoAttr> translationInfo =
-      getIdenticalTranslationInfo(variantOp);
-  if (!translationInfo) {
-    variantOp.emitOpError(
-        "unhandled compilation of entry point functions with different "
-        "translation info");
+  std::optional<OpPassManager> maybePipeline =
+      getFunctionOpInterfacePassManager(funcOp);
+  if (!maybePipeline) {
+    funcOp.emitOpError(
+        "unhandled function-like container during executable lowering");
     return signalPassFailure();
   }
+  OpPassManager &pipeline = maybePipeline.value();
 
-  OpPassManager pipeline(IREE::HAL::ExecutableVariantOp::getOperationName());
-  switch (translationInfo.value().getDispatchLoweringPassPipeline()) {
+  IREE::GPU::GPUPipelineOptions pipelineOptions =
+      IREE::GPU::getPipelineOptions(funcOp, translationInfo);
+
+  switch (translationInfo.getDispatchLoweringPassPipeline()) {
   case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUDefault:
-    addGPUDefaultPassPipeline(pipeline);
+    addGPUDefaultPassPipeline(pipeline, pipelineOptions);
+    break;
+  case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUBaseLowering:
+    addGPUBaseLoweringPassPipeline(pipeline);
     break;
   case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUDistribute:
     addGPUSimpleDistributePassPipeline(pipeline);
@@ -86,20 +111,44 @@ void LLVMGPULowerExecutableTargetPass::runOnOperation() {
   case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUVectorize:
     addGPUVectorizationPassPipeline(pipeline);
     break;
-  case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUMatmulSimt:
-    addGPUMatmulSimtPassPipeline(pipeline);
+  case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUWinogradVectorize:
+    addGPUWinogradVectorizePassPipeline(pipeline);
     break;
-  case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUMatmulTensorCore:
-    addGPUMatmulTensorCorePassPipeline(
-        pipeline, translationInfo.value().getSoftwarePipelineDepth());
+  case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUMatmulTensorCore: {
+    FailureOr<int64_t> maybeDepth =
+        getSoftwarePipelineDepth(translationInfo.getConfiguration());
+    if (failed(maybeDepth)) {
+      funcOp.emitOpError(
+          "invalid matmul configuration without software pipelining config");
+      return signalPassFailure();
+    }
+    addGPUMatmulTensorCorePassPipeline(pipeline, pipelineOptions, *maybeDepth);
+    break;
+  }
+  case IREE::Codegen::DispatchLoweringPassPipeline::
+      LLVMGPUMatmulTensorCoreMmaSync: {
+    FailureOr<int64_t> maybeDepth =
+        getSoftwarePipelineDepth(translationInfo.getConfiguration());
+    if (failed(maybeDepth)) {
+      funcOp.emitOpError(
+          "invalid matmul configuration without software pipelining config");
+      return signalPassFailure();
+    }
+    addGPUMatmulTensorCoreMmaSyncPassPipeline(pipeline, pipelineOptions,
+                                              *maybeDepth);
+    break;
+  }
+  case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUTransposeSharedMem:
+    addGPUTransposePassPipeline(pipeline, pipelineOptions);
+    break;
+  case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUVectorDistribute:
+    addGPUVectorDistributePassPipeline(pipeline, pipelineOptions,
+                                       /*usePadToModelSharedMemcpy=*/false);
     break;
   case IREE::Codegen::DispatchLoweringPassPipeline::
-      LLVMGPUMatmulTensorCoreMmaSync:
-    addGPUMatmulTensorCoreMmaSyncPassPipeline(
-        pipeline, translationInfo.value().getSoftwarePipelineDepth());
-    break;
-  case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUTransposeSharedMem:
-    addGPUTransposePassPipeline(pipeline);
+      LLVMGPUPadAndVectorDistribute:
+    addGPUVectorDistributePassPipeline(pipeline, pipelineOptions,
+                                       /*usePadToModelSharedMemcpy=*/true);
     break;
   case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUWarpReduction:
     addGPUWarpReductionPassPipeline(pipeline);
@@ -107,26 +156,20 @@ void LLVMGPULowerExecutableTargetPass::runOnOperation() {
   case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUPackUnPack:
     addGPUPackUnPackPasses(pipeline);
     break;
-  // Transform-dialect pipelines.
-  case IREE::Codegen::DispatchLoweringPassPipeline::TransformDialectCodegen:
-    addGPUTransformDialectPasses(pipeline);
+  case IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUTileAndFuse:
+    addGPUTileAndFusePassPipeline(pipeline, pipelineOptions);
     break;
   // no pipeline specified, nothing to do.
   case IREE::Codegen::DispatchLoweringPassPipeline::None:
     return;
   default:
-    variantOp.emitOpError("Unsupported pipeline on GPU target.");
+    funcOp.emitOpError("unsupported pipeline on GPU target.");
     return signalPassFailure();
   }
 
-  if (failed(runPipeline(pipeline, variantOp))) {
+  if (failed(runPipeline(pipeline, funcOp))) {
     return signalPassFailure();
   }
-}
-
-std::unique_ptr<OperationPass<IREE::HAL::ExecutableVariantOp>>
-createLLVMGPULowerExecutableTargetPass() {
-  return std::make_unique<LLVMGPULowerExecutableTargetPass>();
 }
 
 } // namespace mlir::iree_compiler

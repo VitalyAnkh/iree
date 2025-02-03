@@ -7,15 +7,17 @@
 #include "iree/compiler/Dialect/Flow/IR/FlowDialect.h"
 #include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
+#include "iree/compiler/DispatchCreation/Passes.h"
+#include "iree/compiler/Modules/IO/Parameters/Transforms/Passes.h"
 #include "iree/compiler/Utils/PassUtils.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Transforms/Passes.h"
 
 namespace mlir::iree_compiler::GlobalOptimization {
 
-using FunctionLikeNest = MultiOpNest<func::FuncOp, IREE::Util::InitializerOp>;
+using FunctionLikeNest =
+    MultiOpNest<IREE::Util::InitializerOp, IREE::Util::FuncOp>;
 
 static llvm::cl::opt<bool> clEnableQuantizedMatmulReassociation(
     "iree-global-opt-enable-quantized-matmul-reassociation",
@@ -27,11 +29,39 @@ static llvm::cl::opt<bool> clEnableFuseSiluHorizontalMatmul(
     llvm::cl::desc(
         "Enables fusing specifically structured matmuls (experimental)."),
     llvm::cl::init(false));
+static llvm::cl::opt<bool> clEnableTransposePropagation(
+    "iree-global-opt-propagate-transposes",
+    llvm::cl::desc(
+        "Enables propagation of transpose ops to improve fusion chances."),
+    llvm::cl::init(true));
 
-static llvm::cl::opt<bool> clEnableExpandVectors(
-    "iree-global-opt-enable-expand-vectors",
-    llvm::cl::desc("Enables vector expansion in vector/matrix operations."),
-    llvm::cl::init(false));
+// TODO(hanchung): Remove the flag. We don't want to do early materialization by
+// default. Because it won't work for heterogeneous computing. This is not the
+// right layer for handling such information.
+static llvm::cl::opt<bool> clEnableEarlyMaterialization(
+    "iree-global-opt-enable-early-materialization",
+    llvm::cl::desc(
+        "Enables early materialization on encodings. Note, this flag should be "
+        "false eventually. This does not work for heterogeneous computing."),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<DemotionOption> clDemoteContractionInputsToBF16Strategy(
+    "iree-global-opt-enable-demote-contraction-inputs-to-bf16",
+    llvm::cl::desc("Demotes inputs (LHS, RHS) of contraction ops to BF16. "
+                   "Selects types of contraction ops to demote."),
+    llvm::cl::values(
+        clEnumValN(DemotionOption::All, "all", "Demote all contraction ops."),
+        clEnumValN(DemotionOption::Conv, "conv",
+                   "Only demote convolution ops."),
+        clEnumValN(DemotionOption::Matmul, "matmul", "Only demote matmul ops."),
+        clEnumValN(DemotionOption::None, "none", "Demote no contraction ops.")),
+    llvm::cl::init(DemotionOption::None));
+
+static llvm::cl::opt<int> clPadFactor(
+    "iree-global-opt-pad-factor",
+    llvm::cl::desc("provides padding size hints that will be attached to "
+                   "encodings."),
+    llvm::cl::init(32));
 
 void buildGlobalOptExprHoistingPassPipeline(
     OpPassManager &passManager, const TransformOptions &transformOptions) {
@@ -46,35 +76,34 @@ void buildGlobalOptExprHoistingPassPipeline(
 
 void buildGlobalOptimizationPassPipeline(
     OpPassManager &mainPassManager, const TransformOptions &transformOptions) {
-  // ML frontends have very uneven support for user-controlled types _and_ users
-  // tend to use types not well suited for the work they are doing. These
-  // demotions/promotions allow users to change the types after lowering out of
-  // the frontends. It'll always be better to do this higher up in the stack
-  // as these kind of blanket conversions have corner cases and potential
-  // accuracy/precision losses beyond what the user may expect.
-  if (transformOptions.options.demoteF64ToF32) {
-    mainPassManager.addPass(IREE::Util::createDemoteF64ToF32Pass());
-  }
-  if (transformOptions.options.demoteF32ToF16) {
-    mainPassManager.addPass(IREE::Util::createDemoteF32ToF16Pass());
-  }
-  if (transformOptions.options.promoteF16ToF32) {
-    mainPassManager.addPass(IREE::Util::createPromoteF16ToF32Pass());
-  }
-  if (transformOptions.options.promoteBF16ToF32) {
-    mainPassManager.addPass(IREE::Util::createPromoteBF16ToF32Pass());
-  }
-  if (transformOptions.options.demoteI64ToI32) {
-    mainPassManager.addPass(IREE::Util::createDemoteI64ToI32Pass());
+  // Import parameters before any global optimization passes so that the inlined
+  // parameters are available for folding.
+  if (!transformOptions.options.parameterImportPaths.empty()) {
+    IREE::IO::Parameters::ImportParametersPassOptions importParametersOptions;
+    importParametersOptions.scopePaths.assign(
+        transformOptions.options.parameterImportPaths.begin(),
+        transformOptions.options.parameterImportPaths.end());
+    importParametersOptions.keys.assign(
+        transformOptions.options.parameterImportKeys.begin(),
+        transformOptions.options.parameterImportKeys.end());
+    importParametersOptions.maximumSize =
+        transformOptions.options.parameterImportMaximumSize;
+    mainPassManager.addPass(IREE::IO::Parameters::createImportParametersPass(
+        importParametersOptions));
   }
 
   // Preprocessing passes to get the program into a canonical state.
   FunctionLikeNest(mainPassManager)
+      .addPredicatedPass(transformOptions.options.stripAssertions,
+                         IREE::Util::createStripDebugOpsPass)
+      .addPass(IREE::Util::createOptimizeIntArithmeticPass)
+      .addPass(createLinalgQuantizedConvToConvPass)
+      .addPass(createLinalgQuantizedMatmulToMatmulPass)
+      .addPass(IREE::Flow::createCanonicalizerPass)
       .addPass(createRemoveZeroExtentTensorsPass)
       .addPass(createDetachElementwiseFromNamedOpsPass)
-      .addPass(mlir::createLinalgNamedOpConversionPass)
-      .addPass(createConvert1X1FilterConv2DToMatmulPass);
-  mainPassManager.addPass(createEraseUnusedLinalgOperands());
+      .addPass(mlir::createLinalgNamedOpConversionPass);
+  mainPassManager.addPass(createEraseUnusedLinalgOperandsPass());
 
   // Expand tensor shapes into SSA values and optimize the whole program.
   // The more we are able to equate shape dimensions at this level the
@@ -86,77 +115,143 @@ void buildGlobalOptimizationPassPipeline(
       // - Convert all elementwise ops to Linalg
       // - Remove unit-extent dimensions.
       .addPass(mlir::createConvertElementwiseToLinalgPass)
-      .addPass(createGeneralizeLinalgNamedOpsPass)
       // RaiseSpecialOps, by virtue of implementing various peephole
       // optimizations, is sensitive to surrounding IR structure. Thus we run
       // this pass both before unit dim folding + consteval, as well as after.
-      .addPass(IREE::Flow::createRaiseSpecialOps)
-      .addPass(IREE::Flow::createFoldUnitExtentDimsPass)
+      .addPass(createRaiseSpecialOpsPass)
+      // We decompose and transpose concatenations immediately before folding
+      // unit extent dims because this allows decoupling unit dims in the
+      // concatenation from the transposes that are introduced.
+      .addPass([&]() {
+        return createDecomposeConcatPass(
+            transformOptions.options.outerDimConcat);
+      })
+      // We generalize certain named ops immediately before folding unit extent
+      // dims as the unit dim folding pass updates indexing maps and is better
+      // at working with generics. By this point we have already done any
+      // specialized raising and the op names are no longer useful.
+      .addPass([&]() {
+        GeneralizeLinalgNamedOpsPassOptions opt;
+        opt.enableGeneralizeMatmul = transformOptions.options.generalizeMatmul;
+        return createGeneralizeLinalgNamedOpsPass(opt);
+      });
+
+  mainPassManager.addPass(DispatchCreation::createFoldUnitExtentDimsPass());
+  FunctionLikeNest(mainPassManager)
       .addPredicatedPass(clEnableFuseSiluHorizontalMatmul,
                          createFuseSiluHorizontalMatmulPass)
       .addPass([&]() {
-        return createFuseDequantizationMatmulPass(
-            clEnableQuantizedMatmulReassociation);
+        return createDemoteContractionInputsToBF16Pass(
+            clDemoteContractionInputsToBF16Strategy);
       })
-      .addPass(mlir::createCanonicalizerPass)
+      .addPredicatedPass(clEnableQuantizedMatmulReassociation,
+                         createFuseDequantizationMatmulPass)
+      .addPass(IREE::Flow::createCanonicalizerPass)
+      .addPass(mlir::createCSEPass)
+      // Propagate transposes immediately before set encoding/data tiling
+      // because transpose propagation cannot take an opinion on the preferred
+      // layout of various operations. This simplifies local propagation
+      // decisions as SetEncoding is expected to pick the ideal layout for
+      // that operation anyway, and this way we only need to make such a
+      // decision once.
+      .addPredicatedPass(
+          clEnableTransposePropagation,
+          [&]() {
+            return createPropagateLinalgTransposePass(
+                transformOptions.options.aggressiveTransposePropagation);
+          })
+      .addPass(IREE::Flow::createCanonicalizerPass)
       .addPass(mlir::createCSEPass);
 
   // Enable data tiling after they are in a canonical form.
   if (transformOptions.options.dataTiling) {
-    mainPassManager.addPass(createLiftGenericToTransposeBatchMatmulPass());
-    // Expand all vectors in vecmat/matvec ops into matrices for tiling.
-    if (clEnableExpandVectors) {
-      mainPassManager.addPass(createExpandVectorsPass());
+    FunctionLikeNest(mainPassManager).addPass([&]() {
+      return DispatchCreation::createSetEncodingPass(
+          DispatchCreation::SetEncodingPassOptions{clPadFactor});
+    });
+    // TODO(hanchung): Make data-tiling passes be FunctionOpInterface pass, so
+    // we can use `FunctionLikNest` here.
+    if (clEnableEarlyMaterialization) {
+      mainPassManager.addPass(createMaterializeHomogeneousEncodingsPass());
     }
-    mainPassManager.addPass(createSetEncodingPass());
-    mainPassManager.addPass(createMaterializeHomogeneousEncodingsPass());
-    mainPassManager.addPass(createCanonicalizerPass());
+    mainPassManager.addPass(IREE::Flow::createCanonicalizerPass());
     mainPassManager.addPass(createCSEPass());
-    FunctionLikeNest(mainPassManager)
-        .addPass(createGeneralizeLinalgNamedOpsPass);
+    mainPassManager.addPass(createSimplifyPackUnpackPass());
+    FunctionLikeNest(mainPassManager).addPass(createDataLayoutPropagationPass);
   }
+  // Generalize transposes and any other remaining named linalg ops that can
+  // now be represented as generics.
+  FunctionLikeNest(mainPassManager).addPass(createGeneralizeLinalgNamedOpsPass);
 
-  OpPassManager pipeline(ModuleOp::getOperationName());
-  FunctionLikeNest(pipeline)
+  // Hoist loop invariants (e.g. from scf loops) with zero-trip-check.
+  FunctionLikeNest(mainPassManager)
+      .addPass(createGlobalLoopInvariantCodeMotionPass)
+      .addPass(IREE::Flow::createCanonicalizerPass)
+      .addPass(mlir::createCSEPass)
+
       // Simplify util.global accesses early on; this can help with dispatch
       // region formation as redundant store-loads are removed.
-      .addPass(IREE::Util::createSimplifyGlobalAccessesPass);
+      .addPass(IREE::Util::createSimplifyGlobalAccessesPass)
+
+      // Aggressive cleanup.
+      .addPass(IREE::Util::createApplyPatternsPass);
 
   // Module level cleanup and canonicalization of util.global (and other
   // util ops).
-  pipeline.addPass(IREE::Util::createApplyPatternsPass());
-  pipeline.addPass(IREE::Util::createFoldGlobalsPass());
-  pipeline.addPass(IREE::Util::createIPOPass());
-  pipeline.addPass(createCanonicalizerPass());
-  pipeline.addPass(createCSEPass());
+  mainPassManager.addPass(IREE::Util::createFoldGlobalsPass());
+  mainPassManager.addPass(IREE::Util::createIPOPass());
+
+  FunctionLikeNest(mainPassManager)
+      .addPass(IREE::Util::createOptimizeIntArithmeticPass)
+      .addPass(IREE::Flow::createCanonicalizerPass)
+      .addPass(createCSEPass);
 
   if (transformOptions.options.constExprHoisting) {
-    buildGlobalOptExprHoistingPassPipeline(pipeline, transformOptions);
+    buildGlobalOptExprHoistingPassPipeline(mainPassManager, transformOptions);
   }
 
   if (transformOptions.buildConstEvalPassPipeline) {
-    transformOptions.buildConstEvalPassPipeline(pipeline);
+    transformOptions.buildConstEvalPassPipeline(mainPassManager);
   }
 
   if (transformOptions.options.numericPrecisionReduction) {
-    pipeline.addPass(createInferNumericNarrowingPass());
-    pipeline.addPass(createOptimizeNumericsPass());
-    pipeline.addPass(createCleanupNumericNarrowingPass());
+    mainPassManager.addPass(createInferNumericNarrowingPass());
+    mainPassManager.addPass(createOptimizeNumericsPass());
+    mainPassManager.addPass(createCleanupNumericNarrowingPass());
   }
 
-  FunctionLikeNest(pipeline)
-      .addPass(mlir::createCanonicalizerPass)
-      .addPass(mlir::createCSEPass);
+  FunctionLikeNest(mainPassManager)
+      .addPass(IREE::Flow::createCanonicalizerPass)
+      .addPass(mlir::createCSEPass)
+      // After running const-eval to a fixed point and folding unit extent dims,
+      // try any new raising opportunities.
+      .addPass(createRaiseSpecialOpsPass);
 
-  // Add the whole fixed point iterator.
-  mainPassManager.addPass(
-      IREE::Util::createFixedPointIteratorPass(std::move(pipeline)));
+  // Export after const-eval. If the user wants to keep the input constants
+  // as is in the final parameter archive, they will probably want to disable
+  // const-eval, or could run this pass as preprocessing. There might be a
+  // configuration in the future where users want to limit const-eval to smaller
+  // constants that aren't exported and skip it for larger parameters, but this
+  // is a sensible place for the common case of wanting const-eval in the final
+  // artifact + archive.
+  if (!transformOptions.options.parameterExportPath.empty()) {
+    IREE::IO::Parameters::ExportParametersPassOptions exportParametersOptions;
+    exportParametersOptions.scopePath =
+        transformOptions.options.parameterExportPath;
+    exportParametersOptions.minimumSize =
+        transformOptions.options.parameterExportMinimumSize;
+    mainPassManager.addPass(IREE::IO::Parameters::createExportParametersPass(
+        exportParametersOptions));
+  }
 
-  // Strip std.assert & co after we perform optimizations; prior to this we
-  // may use the assertions to derive information during analysis.
-  if (transformOptions.options.stripAssertions) {
-    FunctionLikeNest(mainPassManager)
-        .addPass(IREE::Util::createStripDebugOpsPass);
+  if (!transformOptions.options.parameterSplatExportFile.empty()) {
+    IREE::IO::Parameters::GenerateSplatParameterArchivePassOptions
+        generateSplatOptions;
+    generateSplatOptions.filePath =
+        transformOptions.options.parameterSplatExportFile;
+    mainPassManager.addPass(
+        IREE::IO::Parameters::createGenerateSplatParameterArchivePass(
+            generateSplatOptions));
   }
 }
 

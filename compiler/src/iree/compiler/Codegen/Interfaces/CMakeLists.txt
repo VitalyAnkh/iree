@@ -22,12 +22,13 @@ iree_cc_library(
     ::PartitionableLoopsInterface
     ::ProcessorOpInterfaces
     ::UKernelOpInterface
-    IREELinalgExtTransformOps
     IREELinalgTransformDialect
+    MLIRAMDGPUDialect
     MLIRAffineDialect
     MLIRAffineTransformOps
     MLIRArithValueBoundsOpInterfaceImpl
     MLIRBufferizationTransformOps
+    MLIRGPUDialect
     MLIRGPUTransformOps
     MLIRIR
     MLIRLinalgDialect
@@ -41,12 +42,16 @@ iree_cc_library(
     MLIRTensorTransformOps
     MLIRTensorTransforms
     MLIRTransformLoopExtension
+    MLIRVectorDialect
     MLIRVectorTransformOps
     MLIRVectorTransforms
     iree::compiler::Codegen::Common::TransformExtensions::CommonExtensions
+    iree::compiler::Codegen::Dialect::GPU::TransformExtensions::IREEGPUExtensions
+    iree::compiler::Codegen::ExternalInterfaces::ExternalModels
     iree::compiler::Codegen::LLVMCPU::TransformExtensions::LLVMCPUExtensions
     iree::compiler::Codegen::LLVMGPU::TransformExtensions::LLVMGPUExtensions
     iree::compiler::Dialect::Flow::TransformExtensions::FlowExtensions
+    iree::compiler::Dialect::LinalgExt::TransformExtensions::LinalgExtExtensions
   PUBLIC
 )
 
@@ -58,7 +63,6 @@ iree_cc_library(
   SRCS
     "BufferizationInterfaces.cpp"
   DEPS
-    IREELinalgExtDialect
     MLIRArithTransforms
     MLIRBufferizationDialect
     MLIRBufferizationTransforms
@@ -72,9 +76,11 @@ iree_cc_library(
     MLIRTensorDialect
     MLIRTensorTransforms
     MLIRVectorTransforms
+    iree::compiler::Codegen::Dialect::GPU::Transforms::BufferizationInterfaces
     iree::compiler::Codegen::Utils
     iree::compiler::Dialect::Flow::IR
     iree::compiler::Dialect::HAL::IR
+    iree::compiler::Dialect::LinalgExt::IR
   PUBLIC
 )
 
@@ -90,7 +96,7 @@ iree_cc_library(
     "UKernelOpInterface.cpp"
   DEPS
     ::UKernelOpInterfaceGen
-    MLIRFuncDialect
+    MLIRFunctionInterfaces
     MLIRIR
   PUBLIC
 )
@@ -117,13 +123,14 @@ iree_cc_library(
     "PartitionableLoopsInterface.cpp"
   DEPS
     ::PartitionableLoopsInterfaceGen
-    IREELinalgExtDialect
     LLVMSupport
     MLIRIR
     MLIRLinalgDialect
     MLIRLinalgStructuredOpsIncGenLib
     MLIRSupport
     MLIRTensorDialect
+    iree::compiler::Codegen::Dialect::GPU::IR::IREEGPUDialect
+    iree::compiler::Dialect::LinalgExt::IR
   PUBLIC
 )
 

@@ -21,16 +21,15 @@ iree_cc_library(
     "AnnotateOpOrdinals.cpp"
     "ApplyPatterns.cpp"
     "CombineInitializers.cpp"
-    "ConvertPrimitiveType.cpp"
     "DropCompilerHints.cpp"
+    "DumpModule.cpp"
     "FixedPointIterator.cpp"
     "FoldGlobals.cpp"
     "FuseGlobals.cpp"
     "HoistIntoGlobals.cpp"
     "IPO.cpp"
     "ImportResources.cpp"
-    "OutlineConstants.cpp"
-    "PassDetail.h"
+    "OptimizeIntArithmetic.cpp"
     "Passes.cpp"
     "Patterns.cpp"
     "PropagateSubranges.cpp"
@@ -43,11 +42,15 @@ iree_cc_library(
     ::PassesIncGen
     LLVMSupport
     MLIRAffineDialect
+    MLIRAffineTransforms
+    MLIRAffineUtils
     MLIRAnalysis
     MLIRArithDialect
     MLIRArithTransforms
+    MLIRBytecodeWriter
     MLIRControlFlowDialect
     MLIRFuncDialect
+    MLIRFunctionInterfaces
     MLIRIR
     MLIRLinalgDialect
     MLIRMathDialect
@@ -55,6 +58,7 @@ iree_cc_library(
     MLIRPass
     MLIRSCFDialect
     MLIRSupport
+    MLIRTransformUtils
     MLIRTransforms
     MLIRVectorDialect
     iree::compiler::Dialect::Util::Analysis

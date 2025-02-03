@@ -5,7 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/TileSizeSelection.h"
-#include "iree/compiler/Codegen/LLVMCPU/PassDetail.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/LLVMCPU/Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -22,6 +22,9 @@
 #define DEBUG_TYPE "iree-llvmcpu-split-reduction"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_LLVMCPUSPLITREDUCTIONPASS
+#include "iree/compiler/Codegen/LLVMCPU/Passes.h.inc"
 
 namespace {
 
@@ -42,7 +45,7 @@ LogicalResult splitReductionPrecondition(Operation *op,
                                          bool fpReductionReordering) {
   linalg::LinalgOp linalgOp = cast<linalg::LinalgOp>(op);
 
-  if (!linalgOp.hasTensorSemantics()) {
+  if (!linalgOp.hasPureTensorSemantics()) {
     LLVM_DEBUG(llvm::dbgs() << "doesn't have tensor semantics\n");
     return failure();
   }
@@ -68,7 +71,7 @@ LogicalResult splitReductionPrecondition(Operation *op,
     return failure();
   }
   // The `linalg::splitReduction` method does not work for ops with indexing
-  // semantics. See https://github.com/openxla/iree/pull/14979
+  // semantics. See https://github.com/iree-org/iree/pull/14979
   if (linalgOp.hasIndexSemantics()) {
     LLVM_DEBUG(llvm::dbgs() << "the split method used currently doesnt support "
                                "indexing semantics\n");
@@ -123,13 +126,13 @@ LogicalResult splitReductionImpl(Operation *op, int64_t size,
                                              rewriter.getIndexAttr(1));
   tileSizesSVFirst[numLoops - 1] = rewriter.getIndexAttr(0);
   auto options = scf::SCFTilingOptions().setTileSizes(tileSizesSVFirst);
-  FailureOr<scf::SCFTilingResult> tileResFirst = scf::tileUsingSCFForOp(
+  FailureOr<scf::SCFTilingResult> tileResFirst = scf::tileUsingSCF(
       rewriter, cast<TilingInterface>(linalgOp.getOperation()), options);
   if (failed(tileResFirst)) {
     LLVM_DEBUG(llvm::dbgs() << "failed on step 1 (SCFTiling)\n");
     return failure();
   }
-  rewriter.replaceOp(linalgOp, tileResFirst->replacements);
+  rewriter.replaceOp(linalgOp, tileResFirst->mergeResult.replacements);
 
   // 2) Apply splitReduction on the single vector-length array.
   // splitReduction already replaces the op.
@@ -149,25 +152,27 @@ LogicalResult splitReductionImpl(Operation *op, int64_t size,
   // tile.
   tileSizesSV[numLoops - 1] = rewriter.getIndexAttr(1);
   options = scf::SCFTilingOptions().setTileSizes(tileSizesSV);
-  FailureOr<scf::SCFTilingResult> tileRes = scf::tileUsingSCFForOp(
+  FailureOr<scf::SCFTilingResult> tileRes = scf::tileUsingSCF(
       rewriter, cast<TilingInterface>(splitRes->splitLinalgOp.getOperation()),
       options);
   if (failed(tileRes)) {
     LLVM_DEBUG(llvm::dbgs() << "failed on step 3 (SCFTiling)\n");
     return failure();
   }
-  rewriter.replaceOp(splitRes->splitLinalgOp, tileRes->replacements);
+  rewriter.replaceOp(splitRes->splitLinalgOp,
+                     tileRes->mergeResult.replacements);
   return success();
 }
 
 /// Pass to splitReduce linalg operations.
 class LLVMCPUSplitReductionPass
-    : public LLVMCPUSplitReductionBase<LLVMCPUSplitReductionPass> {
+    : public impl::LLVMCPUSplitReductionPassBase<LLVMCPUSplitReductionPass> {
 public:
-  LLVMCPUSplitReductionPass(bool fpReductionReordering) {
+  using impl::LLVMCPUSplitReductionPassBase<
+      LLVMCPUSplitReductionPass>::LLVMCPUSplitReductionPassBase;
+  explicit LLVMCPUSplitReductionPass(bool fpReductionReordering) {
     this->enableFpReductionReordering = fpReductionReordering;
   }
-
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<linalg::LinalgDialect, scf::SCFDialect>();
   }
@@ -188,14 +193,14 @@ void LLVMCPUSplitReductionPass::runOnOperation() {
       continue;
     }
 
-    FailureOr<IREE::Codegen::LoweringConfigAttr> maybeLoweringConfig =
-        getLoweringConfig(genericOp);
-    if (failed(maybeLoweringConfig)) {
+    auto maybeLoweringConfig =
+        getLoweringConfig<IREE::Codegen::LoweringConfigAttr>(genericOp);
+    if (!maybeLoweringConfig) {
       LLVM_DEBUG(llvm::dbgs()
                  << "can't find lowering_config, skip SplitReduction");
       continue;
     }
-    TilingConfig tilingConfig(maybeLoweringConfig.value());
+    TilingConfig tilingConfig(maybeLoweringConfig);
     auto [reductionSizes, scalableDims] =
         tilingConfig.getVectorReductionSizes();
     if (scalableDims.back()) {
@@ -214,13 +219,10 @@ void LLVMCPUSplitReductionPass::runOnOperation() {
     }
   }
 }
-
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>>
+std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 createLLVMCPUSplitReductionPass(const bool enableFpReductionReordering) {
   return std::make_unique<LLVMCPUSplitReductionPass>(
       enableFpReductionReordering);
 }
-
 } // namespace mlir::iree_compiler

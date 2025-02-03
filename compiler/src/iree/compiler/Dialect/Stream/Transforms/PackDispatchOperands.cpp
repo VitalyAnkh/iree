@@ -7,23 +7,26 @@
 #include "iree/compiler/Dialect/Stream/IR/StreamDialect.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamTypes.h"
-#include "iree/compiler/Dialect/Stream/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Stream/Transforms/Passes.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #define DEBUG_TYPE "iree-stream-pack-dispatch-operands"
 
 namespace mlir::iree_compiler::IREE::Stream {
+
+#define GEN_PASS_DEF_PACKDISPATCHOPERANDSPASS
+#include "iree/compiler/Dialect/Stream/Transforms/Passes.h.inc"
+
 namespace {
 
 //===----------------------------------------------------------------------===//
@@ -264,7 +267,7 @@ static Value recomposeFromI32sAndConvert(
 // that was applied to dispatch ops above.
 //
 // This is a mirror of updateDispatchOp; see that for more information.
-static void updateExportFuncOp(mlir::func::FuncOp funcOp) {
+static void updateExportFuncOp(mlir::FunctionOpInterface funcOp) {
   assert(!funcOp.empty() && "can't have empty exported functions");
   auto &entryBlock = funcOp.getFunctionBody().front();
   auto builder = OpBuilder::atBlockBegin(&entryBlock);
@@ -288,24 +291,17 @@ static void updateExportFuncOp(mlir::func::FuncOp funcOp) {
   entryBlock.eraseArguments(0, oldArgs.size());
 
   // Update the function signature and arg attrs that may have changed.
-  funcOp.setType(builder.getFunctionType(
-      newArgTypes, funcOp.getFunctionType().getResults()));
+  funcOp.setType(builder.getFunctionType(newArgTypes, funcOp.getResultTypes()));
   funcOp.setAllArgAttrs(newArgAttrs);
 }
 
 //===----------------------------------------------------------------------===//
-// -iree-hal-pack-dispatch-operands
+// --iree-hal-pack-dispatch-operands
 //===----------------------------------------------------------------------===//
 
-class PackDispatchOperandsPass
-    : public PackDispatchOperandsBase<PackDispatchOperandsPass> {
-public:
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<mlir::arith::ArithDialect>();
-    registry.insert<mlir::complex::ComplexDialect>();
-    registry.insert<IREE::Stream::StreamDialect>();
-  }
-
+struct PackDispatchOperandsPass
+    : public IREE::Stream::impl::PackDispatchOperandsPassBase<
+          PackDispatchOperandsPass> {
   void runOnOperation() override {
     SymbolTable symbolTable(getOperation());
 
@@ -315,7 +311,7 @@ public:
       auto innerModuleOp = executableOp.getInnerModule();
       if (!innerModuleOp)
         continue;
-      for (auto funcOp : innerModuleOp.getOps<mlir::func::FuncOp>()) {
+      for (auto funcOp : innerModuleOp.getOps<mlir::FunctionOpInterface>()) {
         if (funcOp.isPublic()) {
           updateExportFuncOp(funcOp);
         }
@@ -339,9 +335,5 @@ public:
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<ModuleOp>> createPackDispatchOperandsPass() {
-  return std::make_unique<PackDispatchOperandsPass>();
-}
 
 } // namespace mlir::iree_compiler::IREE::Stream

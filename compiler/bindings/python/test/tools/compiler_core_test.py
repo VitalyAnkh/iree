@@ -32,12 +32,6 @@ class CompilerTest(unittest.TestCase):
         # The VMVX target is always enabled.
         self.assertIn("vmvx", target_names)
 
-    def testNoTargetBackends(self):
-        with self.assertRaisesRegex(
-            ValueError, "Expected a non-empty list for 'target_backends'"
-        ):
-            binary = iree.compiler.tools.compile_str(SIMPLE_MUL_ASM)
-
     def testCompileStr(self):
         binary = iree.compiler.tools.compile_str(
             SIMPLE_MUL_ASM, target_backends=iree.compiler.tools.DEFAULT_TESTING_BACKENDS
@@ -47,7 +41,7 @@ class CompilerTest(unittest.TestCase):
 
     # Compiling the string form means that the compiler does not have a valid
     # source file name, which can cause issues. Verify specifically.
-    # See: https://github.com/openxla/iree/issues/4439
+    # See: https://github.com/iree-org/iree/issues/4439
     def testCompileStrLLVMCPU(self):
         binary = iree.compiler.tools.compile_str(
             SIMPLE_MUL_ASM, target_backends=["llvm-cpu"]
@@ -57,10 +51,10 @@ class CompilerTest(unittest.TestCase):
 
     # Verifies that multiple target_backends are accepted. Which two are not
     # load bearing.
-    # See: https://github.com/openxla/iree/issues/4436
+    # See: https://github.com/iree-org/iree/issues/4436
     def testCompileMultipleBackends(self):
         binary = iree.compiler.tools.compile_str(
-            SIMPLE_MUL_ASM, target_backends=["llvm-cpu", "vulkan-spirv"]
+            SIMPLE_MUL_ASM, target_backends=["llvm-cpu", "vmvx"]
         )
         logging.info("Flatbuffer size = %d", len(binary))
         self.assertTrue(binary)

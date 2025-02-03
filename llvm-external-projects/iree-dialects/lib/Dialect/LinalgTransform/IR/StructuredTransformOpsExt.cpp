@@ -6,8 +6,6 @@
 
 #include "iree-dialects/Dialect/LinalgTransform/StructuredTransformOpsExt.h"
 
-#include "iree-dialects/Dialect/LinalgExt/Passes/Passes.h"
-#include "iree-dialects/Transforms/ListenerCSE.h"
 #include "iree-dialects/Transforms/TransformMatchers.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/AsyncToLLVM/AsyncToLLVM.h"
@@ -25,7 +23,6 @@
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Async/Passes.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Linalg/Transforms/Hoisting.h"
@@ -34,8 +31,9 @@
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
-#include "mlir/Dialect/Transform/IR/TransformInterfaces.h"
+#include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Dialect/Transform/PDLExtension/PDLExtensionOps.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
@@ -58,15 +56,16 @@ using namespace mlir;
 /// (`pdlValues[1]`).
 /// TODO: PDL needs user-defined "questions".
 static LogicalResult nestedInFunc(PatternRewriter &rewriter,
+                                  PDLResultList &pdlResults,
                                   ArrayRef<PDLValue> pdlValues) {
   assert(pdlValues.size() == 2 && "expected 2 PDL values");
   Operation *operation = pdlValues[0].cast<Operation *>();
   Attribute attr = pdlValues[1].cast<Attribute>();
 
-  auto func = operation->getParentOfType<func::FuncOp>();
+  auto func = operation->getParentOfType<mlir::FunctionOpInterface>();
   if (!func)
     return rewriter.notifyMatchFailure(operation, "not nested in a function");
-  auto functionSymbol = attr.dyn_cast<SymbolRefAttr>();
+  auto functionSymbol = dyn_cast<SymbolRefAttr>(attr);
   if (!functionSymbol)
     return rewriter.notifyMatchFailure(operation, "not a function identifier");
   return success(functionSymbol.getLeafReference() == func.getName());
@@ -169,12 +168,13 @@ static LogicalResult isEquivalentToOpImpl(PatternRewriter &rewriter,
 ///           then the bodies would be equivalent (really isomorphic).
 ///   3. other cases TBD (e.g. vector.generic when available).
 static LogicalResult isEquivalentToOp(PatternRewriter &rewriter,
+                                      PDLResultList &pdlResults,
                                       ArrayRef<PDLValue> pdlValues) {
   assert(pdlValues.size() == 2 && "expected 2 PDL values");
   Operation *operation = pdlValues[0].cast<Operation *>();
   Attribute attribute = pdlValues[1].cast<Attribute>();
 
-  auto modelOpNameAttr = attribute.dyn_cast<StringAttr>();
+  auto modelOpNameAttr = dyn_cast<StringAttr>(attribute);
   if (!modelOpNameAttr)
     return failure(); // TODO: notifyMatchFailure needs an Operation* handle.
   auto modelOpName = modelOpNameAttr.strref();
@@ -209,12 +209,13 @@ static LogicalResult isEquivalentToOp(PatternRewriter &rewriter,
 /// Note: 0 is the convention to express "do not tile", it is considered to
 /// divide everything.
 static LogicalResult isDimMultipleOf(PatternRewriter &rewriter,
+                                     PDLResultList &pdlResults,
                                      ArrayRef<PDLValue> pdlValues) {
   assert(pdlValues.size() == 2 && "expected 2 PDL values");
   ValueRange operands = pdlValues[0].cast<ValueRange>();
   Attribute attribute = pdlValues[1].cast<Attribute>();
 
-  auto dict = attribute.dyn_cast<DictionaryAttr>();
+  auto dict = dyn_cast<DictionaryAttr>(attribute);
   if (!dict)
     return failure(); // TODO: notifyMatchFailure needs an Operation* handle.
 
@@ -238,7 +239,7 @@ static LogicalResult isDimMultipleOf(PatternRewriter &rewriter,
 
   ShapedType shapedType;
   if (static_cast<int64_t>(operands.size()) > operandNumber)
-    shapedType = operands[operandNumber].getType().dyn_cast<ShapedType>();
+    shapedType = dyn_cast<ShapedType>(operands[operandNumber].getType());
   if (!shapedType || shapedType.getRank() <= dim)
     return failure();
   return success(divisor == 0 || (shapedType.getShape()[dim] > 0 &&
@@ -252,12 +253,13 @@ static LogicalResult isDimMultipleOf(PatternRewriter &rewriter,
 /// Succeed if `value`[`operand_number`] is a ranked type whose `dim` is
 /// dynamic.
 static LogicalResult isDimStatic(PatternRewriter &rewriter,
+                                 PDLResultList &pdlResults,
                                  ArrayRef<PDLValue> pdlValues) {
   assert(pdlValues.size() == 2 && "expected 2 PDL values");
   ValueRange operands = pdlValues[0].cast<ValueRange>();
   Attribute attribute = pdlValues[1].cast<Attribute>();
 
-  auto dict = attribute.dyn_cast<DictionaryAttr>();
+  auto dict = dyn_cast<DictionaryAttr>(attribute);
   if (!dict)
     return failure(); // TODO: notifyMatchFailure needs an Operation* handle.
 
@@ -275,7 +277,7 @@ static LogicalResult isDimStatic(PatternRewriter &rewriter,
 
   ShapedType shapedType;
   if (static_cast<int64_t>(operands.size()) > operandNumber)
-    shapedType = operands[operandNumber].getType().dyn_cast<ShapedType>();
+    shapedType = dyn_cast<ShapedType>(operands[operandNumber].getType());
   return success(shapedType && !shapedType.isDynamicDim(dim));
 }
 
@@ -286,12 +288,13 @@ static LogicalResult isDimStatic(PatternRewriter &rewriter,
 /// Succeed if `value`[`operand_number`] is a ranked type whose `dim` is
 /// dynamic.
 static LogicalResult isDimDynamic(PatternRewriter &rewriter,
+                                  PDLResultList &pdlResults,
                                   ArrayRef<PDLValue> pdlValues) {
   assert(pdlValues.size() == 2 && "expected 2 PDL values");
   ValueRange operands = pdlValues[0].cast<ValueRange>();
   Attribute attribute = pdlValues[1].cast<Attribute>();
 
-  auto dict = attribute.dyn_cast<DictionaryAttr>();
+  auto dict = dyn_cast<DictionaryAttr>(attribute);
   if (!dict)
     return failure(); // TODO: notifyMatchFailure needs an Operation* handle.
 
@@ -309,7 +312,7 @@ static LogicalResult isDimDynamic(PatternRewriter &rewriter,
 
   ShapedType shapedType;
   if (static_cast<int64_t>(operands.size()) > operandNumber)
-    shapedType = operands[operandNumber].getType().dyn_cast<ShapedType>();
+    shapedType = dyn_cast<ShapedType>(operands[operandNumber].getType());
   return success(shapedType && shapedType.isDynamicDim(dim));
 }
 
@@ -424,7 +427,7 @@ DiagnosedSilenceableFailure transform_ext::MatchCallbackOp::apply(
 
 void transform_ext::MatchCallbackOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  mlir::transform::onlyReadsHandle(getInputs(), effects);
+  mlir::transform::onlyReadsHandle(getInputsMutable(), effects);
   mlir::transform::producesHandle(getOutputs(), effects);
   // TODO: it doesn't really modify the payload, we need a separate resource for
   // this mapping.
@@ -901,7 +904,7 @@ transform_ext::TakeFirstOp::apply(mlir::transform::TransformRewriter &rewriter,
     if (payloads.empty())
       continue;
     if (!found) {
-      results.set(getFirst().cast<OpResult>(), payloads);
+      results.set(cast<OpResult>(getFirst()), payloads);
       found = true;
     } else {
       llvm::append_range(concatenated, payloads);
@@ -909,16 +912,15 @@ transform_ext::TakeFirstOp::apply(mlir::transform::TransformRewriter &rewriter,
   }
 
   if (!found)
-    results.set(getFirst().cast<OpResult>(), {});
-  results.set(getRest().cast<OpResult>(), concatenated);
+    results.set(cast<OpResult>(getFirst()), {});
+  results.set(cast<OpResult>(getRest()), concatenated);
   return DiagnosedSilenceableFailure::success();
 }
 
 void transform_ext::TakeFirstOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  mlir::transform::onlyReadsHandle(getInputs(), effects);
-  mlir::transform::producesHandle(getFirst(), effects);
-  mlir::transform::producesHandle(getRest(), effects);
+  mlir::transform::onlyReadsHandle(getInputsMutable(), effects);
+  mlir::transform::producesHandle(getOperation()->getOpResults(), effects);
 }
 
 //===---------------------------------------------------------------------===//
@@ -937,6 +939,6 @@ DiagnosedSilenceableFailure transform_ext::EmitRemarkOp::applyToOne(
 
 void transform_ext::EmitRemarkOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  mlir::transform::onlyReadsHandle(getHandle(), effects);
+  mlir::transform::onlyReadsHandle(getHandleMutable(), effects);
   mlir::transform::onlyReadsPayload(effects);
 }

@@ -7,19 +7,23 @@
 #include <utility>
 
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
-#include "iree/compiler/Dialect/Flow/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
 #include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
+#include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Regex.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::iree_compiler::IREE::Flow {
+
+#define GEN_PASS_DEF_INSERTDEBUGTARGETATORDINALPASS
+#define GEN_PASS_DEF_INSERTDEBUGTARGETATSYMBOLPASS
+#include "iree/compiler/Dialect/Flow/Transforms/Passes.h.inc"
 
 // Filters out non-tensor values for tracing.
 static SmallVector<Value> filterNonTensorValues(ValueRange &&range) {
@@ -72,7 +76,7 @@ static void traceOpWithName(IREE::Flow::DispatchOp dispatchOp,
 // after the op. Updates the function signature to match the return type of the
 // target operation.
 static LogicalResult replaceReturnWithOpResults(mlir::ModuleOp moduleOp,
-                                                mlir::func::FuncOp funcOp,
+                                                IREE::Util::FuncOp funcOp,
                                                 Operation *op) {
   if (!funcOp->isProperAncestor(op))
     return failure();
@@ -99,7 +103,8 @@ static LogicalResult replaceReturnWithOpResults(mlir::ModuleOp moduleOp,
     if (llvm::isa<TensorType>(retVal.getType())) {
       auto type = IREE::HAL::BufferViewType::get(context);
       auto exportOp = builder.create<IREE::HAL::TensorExportOp>(
-          loc, type, retVal, TypeAttr::get(retVal.getType()), /*name=*/nullptr);
+          loc, type, retVal, TypeAttr::get(retVal.getType()), /*name=*/nullptr,
+          /*affinity=*/nullptr);
       exports.push_back(exportOp.getResult());
       newTypes.push_back(type);
     } else {
@@ -110,7 +115,7 @@ static LogicalResult replaceReturnWithOpResults(mlir::ModuleOp moduleOp,
 
   // Create the new return and update the function type.
   IRRewriter rewriter(builder);
-  rewriter.replaceOpWithNewOp<mlir::func::ReturnOp>(oldTerminator, exports);
+  rewriter.replaceOpWithNewOp<IREE::Util::ReturnOp>(oldTerminator, exports);
 
   SmallVector<Type> argTypes;
   for (const auto &arg : llvm::enumerate(funcOp.getArguments()))
@@ -118,46 +123,50 @@ static LogicalResult replaceReturnWithOpResults(mlir::ModuleOp moduleOp,
 
   funcOp.setType(FunctionType::get(context,
                                    /*inputs=*/argTypes, /*results=*/newTypes));
+  funcOp.removeTiedOperandsAttr();
   return success();
 }
 
+namespace {
+
 // Insert break/tracing by ordinal for the specified function.
 struct InsertDebugTargetAtOrdinalPass
-    : public InsertDebugTargetAtOrdinalBase<InsertDebugTargetAtOrdinalPass> {
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<IREE::Flow::FlowDialect, IREE::HAL::HALDialect>();
-  }
-  InsertDebugTargetAtOrdinalPass(std::string breakStr, std::string traceStr) {
-    this->breakDebugTarget = breakStr;
-    this->traceDebugTarget = traceStr;
-  };
-  InsertDebugTargetAtOrdinalPass(const InsertDebugTargetAtOrdinalPass &pass)
-      : InsertDebugTargetAtOrdinalPass(pass.breakDebugTarget,
-                                       pass.traceDebugTarget) {}
-
+    : public IREE::Flow::impl::InsertDebugTargetAtOrdinalPassBase<
+          InsertDebugTargetAtOrdinalPass> {
+  using IREE::Flow::impl::InsertDebugTargetAtOrdinalPassBase<
+      InsertDebugTargetAtOrdinalPass>::InsertDebugTargetAtOrdinalPassBase;
   void runOnOperation() override {
     auto [breakFname, breakOrdinal] =
         getOrdinalFromDebugTarget(breakDebugTarget);
     auto [traceFname, traceOrdinal] =
         getOrdinalFromDebugTarget(traceDebugTarget);
 
+    bool foundBreakFunc = breakFname.empty();
+    bool foundTraceFunc = traceFname.empty();
     for (auto it :
-         llvm::enumerate(getOperation().getOps<FunctionOpInterface>())) {
-      FunctionOpInterface op = it.value();
+         llvm::enumerate(getOperation().getOps<mlir::FunctionOpInterface>())) {
+      mlir::FunctionOpInterface op = it.value();
       Operation *operation = op;
 
-      // Only look for dispatches in upstream func ops.
-      auto funcOp = llvm::dyn_cast<mlir::func::FuncOp>(operation);
+      // Only look for dispatches in util func ops.
+      auto funcOp = llvm::dyn_cast<IREE::Util::FuncOp>(operation);
       if (!funcOp)
         continue;
 
       std::string fName = funcOp.getName().str();
+      if (fName != breakFname && fName != traceFname)
+        continue;
+
       int localBreakOrdinal = -1;
-      if (fName == breakFname)
+      if (fName == breakFname) {
         localBreakOrdinal = breakOrdinal;
+        foundBreakFunc = true;
+      }
       int localTraceOrdinal = -1;
-      if (fName == traceFname)
+      if (fName == traceFname) {
+        foundTraceFunc = true;
         localTraceOrdinal = traceOrdinal;
+      }
 
       auto &bodyRegion = op.getFunctionBody();
       auto dispatchOps =
@@ -182,47 +191,56 @@ struct InsertDebugTargetAtOrdinalPass
           return signalPassFailure();
       }
     }
+
+    if (!foundBreakFunc || !foundTraceFunc) {
+      getOperation()->emitError()
+          << "Failed to find breaking or tracing target function";
+      return signalPassFailure();
+    }
   }
 };
 
 // Break/trace by symbol, after outlining dispatch regions and
 // deduplication.
 struct InsertDebugTargetAtSymbolPass
-    : public InsertDebugTargetAtSymbolBase<InsertDebugTargetAtSymbolPass> {
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<IREE::Flow::FlowDialect, IREE::HAL::HALDialect>();
-  }
-  InsertDebugTargetAtSymbolPass(std::string breakStr, std::string traceStr) {
-    this->breakDebugTarget = breakStr;
-    this->traceDebugTarget = traceStr;
-  };
-  InsertDebugTargetAtSymbolPass(const InsertDebugTargetAtSymbolPass &pass)
-      : InsertDebugTargetAtSymbolPass(pass.breakDebugTarget,
-                                      pass.traceDebugTarget) {}
-
+    : public IREE::Flow::impl::InsertDebugTargetAtSymbolPassBase<
+          InsertDebugTargetAtSymbolPass> {
+  using IREE::Flow::impl::InsertDebugTargetAtSymbolPassBase<
+      InsertDebugTargetAtSymbolPass>::InsertDebugTargetAtSymbolPassBase;
   void runOnOperation() override {
+    bool foundBreakFunc = true;
+    bool foundTraceFunc = true;
+
     // Setup regex for matching symbol names.
     llvm::Regex traceMatcher;
-    if (!traceDebugTarget.empty())
+    if (!traceDebugTarget.empty()) {
+      foundTraceFunc = false;
       traceMatcher = llvm::Regex(traceDebugTarget);
+    }
 
     llvm::Regex breakMatcher;
-    if (!breakDebugTarget.empty())
+    if (!breakDebugTarget.empty()) {
+      foundBreakFunc = false;
       breakMatcher = llvm::Regex(breakDebugTarget);
+    }
 
     for (auto it :
-         llvm::enumerate(getOperation().getOps<FunctionOpInterface>())) {
-      FunctionOpInterface funcOp = it.value();
+         llvm::enumerate(getOperation().getOps<mlir::FunctionOpInterface>())) {
+      mlir::FunctionOpInterface funcOp = it.value();
 
       // Find the target dispatch to break on and trace on all matching
       // dispatches.
       IREE::Flow::DispatchOp breakTarget;
       funcOp.walk([&](IREE::Flow::DispatchOp dispatchOp) {
         std::string entryPointName = dispatchOp.getEntryPointName();
-        if (traceMatcher.match(entryPointName))
+        if (traceMatcher.match(entryPointName)) {
+          foundTraceFunc = true;
           traceOpWithName(dispatchOp, entryPointName);
-        if (!breakTarget && breakMatcher.match(entryPointName))
+        }
+        if (!breakTarget && breakMatcher.match(entryPointName)) {
+          foundBreakFunc = true;
           breakTarget = dispatchOp;
+        }
       });
 
       // Break on the selected operation (dispatch). Currently this breaks on
@@ -231,27 +249,21 @@ struct InsertDebugTargetAtSymbolPass
       // dispatch is not found within the entry block of the function.
       if (breakTarget) {
         Operation *operation = funcOp;
-        auto mlirFuncOp = dyn_cast<mlir::func::FuncOp>(operation);
+        auto mlirFuncOp = dyn_cast<IREE::Util::FuncOp>(operation);
         if (!mlirFuncOp || failed(replaceReturnWithOpResults(
                                getOperation(), mlirFuncOp, breakTarget)))
           return signalPassFailure();
       }
     }
+
+    if (!foundBreakFunc || !foundTraceFunc) {
+      getOperation()->emitError()
+          << "Failed to find any breaking or tracing target dispatch";
+      return signalPassFailure();
+    }
   }
 };
 
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createInsertDebugTargetAtOrdinalPass(std::string breakDebugTarget,
-                                     std::string traceDebugTarget) {
-  return std::make_unique<InsertDebugTargetAtOrdinalPass>(breakDebugTarget,
-                                                          traceDebugTarget);
-}
-
-std::unique_ptr<OperationPass<mlir::ModuleOp>>
-createInsertDebugTargetAtSymbolPass(std::string breakDebugTarget,
-                                    std::string traceDebugTarget) {
-  return std::make_unique<InsertDebugTargetAtSymbolPass>(breakDebugTarget,
-                                                         traceDebugTarget);
-}
+} // namespace
 
 } // namespace mlir::iree_compiler::IREE::Flow

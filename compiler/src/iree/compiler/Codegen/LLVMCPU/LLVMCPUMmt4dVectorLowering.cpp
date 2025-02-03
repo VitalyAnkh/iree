@@ -4,9 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/LLVMCPU/PassDetail.h"
 #include "iree/compiler/Codegen/LLVMCPU/Passes.h"
 #include "llvm/Support/Debug.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
 #include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/Dialect/Vector/Transforms/VectorTransforms.h"
@@ -26,11 +26,18 @@ static llvm::cl::opt<bool> clMmt4dUseIntrinsics(
 
 namespace mlir::iree_compiler {
 
+#define GEN_PASS_DEF_LLVMCPUMMT4DVECTORLOWERINGPASS
+#include "iree/compiler/Codegen/LLVMCPU/Passes.h.inc"
+
 namespace {
 struct LLVMCPUMmt4dVectorLoweringPass
-    : public LLVMCPUMmt4dVectorLoweringBase<LLVMCPUMmt4dVectorLoweringPass> {
+    : public impl::LLVMCPUMmt4dVectorLoweringPassBase<
+          LLVMCPUMmt4dVectorLoweringPass> {
+  using impl::LLVMCPUMmt4dVectorLoweringPassBase<
+      LLVMCPUMmt4dVectorLoweringPass>::LLVMCPUMmt4dVectorLoweringPassBase;
+
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<vector::VectorDialect>();
+    registry.insert<vector::VectorDialect, LLVM::LLVMDialect>();
   }
   void runOnOperation() override;
 };
@@ -55,8 +62,8 @@ void LLVMCPUMmt4dVectorLoweringPass::runOnOperation() {
     RewritePatternSet canonicalizationPatterns(context);
     vector::ContractionOp::getCanonicalizationPatterns(canonicalizationPatterns,
                                                        context);
-    if (failed(applyPatternsAndFoldGreedily(
-            funcOp, std::move(canonicalizationPatterns)))) {
+    if (failed(applyPatternsGreedily(funcOp,
+                                     std::move(canonicalizationPatterns)))) {
       return signalPassFailure();
     }
 
@@ -73,8 +80,8 @@ void LLVMCPUMmt4dVectorLoweringPass::runOnOperation() {
     RewritePatternSet castAwayUnitDimPatterns(&getContext());
     vector::populateCastAwayVectorLeadingOneDimPatterns(
         castAwayUnitDimPatterns);
-    if (failed(applyPatternsAndFoldGreedily(
-            funcOp, std::move(castAwayUnitDimPatterns)))) {
+    if (failed(applyPatternsGreedily(funcOp,
+                                     std::move(castAwayUnitDimPatterns)))) {
       return signalPassFailure();
     }
 
@@ -83,27 +90,21 @@ void LLVMCPUMmt4dVectorLoweringPass::runOnOperation() {
         reductionToContractPatterns);
     vector::ExtractOp::getCanonicalizationPatterns(reductionToContractPatterns,
                                                    context);
-    if (failed(applyPatternsAndFoldGreedily(
-            funcOp, std::move(reductionToContractPatterns)))) {
+    if (failed(applyPatternsGreedily(funcOp,
+                                     std::move(reductionToContractPatterns)))) {
       return signalPassFailure();
     }
   }
 
-  {
+  if (enableVectorContractCustomKernels) {
     // Special-case vector.contract codegen paths. This needs to happen
     // just before the generic vector ops lowerings.
     RewritePatternSet patterns(context);
     auto target = IREE::HAL::ExecutableTargetAttr::lookup(funcOp);
     populateVectorContractCustomKernelsPatterns(target, patterns);
-    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
       return signalPassFailure();
     }
   }
 }
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createLLVMCPUMmt4dVectorLoweringPass() {
-  return std::make_unique<LLVMCPUMmt4dVectorLoweringPass>();
-}
-
 } // namespace mlir::iree_compiler

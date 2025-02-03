@@ -4,15 +4,19 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+from typing import List
 import iree.runtime
+import iree.compiler
 
 import gc
 import numpy as np
+import threading
+import time
 import unittest
 
 
 class NonDeviceHalTest(unittest.TestCase):
-    def testEnums(self):
+    def testMemoryEnums(self):
         print("MemoryType:", iree.runtime.MemoryType)
         print("HOST_VISIBLE:", int(iree.runtime.MemoryType.HOST_VISIBLE))
 
@@ -60,6 +64,13 @@ class NonDeviceHalTest(unittest.TestCase):
             iree.runtime.MemoryType.OPTIMAL & iree.runtime.MemoryType.OPTIMAL,
             int(iree.runtime.MemoryType.OPTIMAL),
         )
+
+    def testElementTypeEnums(self):
+        i8 = iree.runtime.HalElementType.INT_8
+        i4 = iree.runtime.HalElementType.INT_4
+        self.assertTrue(iree.runtime.HalElementType.is_byte_aligned(i8))
+        self.assertFalse(iree.runtime.HalElementType.is_byte_aligned(i4))
+        self.assertEqual(1, iree.runtime.HalElementType.dense_byte_count(i8))
 
 
 class DeviceHalTest(unittest.TestCase):
@@ -143,6 +154,7 @@ class DeviceHalTest(unittest.TestCase):
             repr(bv),
             "<HalBufferView (1, 2), element_type=0x10000010, 13 bytes (at offset 0 into 13), memory_type=DEVICE_LOCAL|HOST_VISIBLE, allowed_access=ALL, allowed_usage=TRANSFER|DISPATCH_STORAGE|MAPPING|MAPPING_PERSISTENT>",
         )
+        self.assertEqual(4, bv.byte_length)
 
     def testBufferMap(self):
         buffer = self.allocator.allocate_buffer(
@@ -200,6 +212,52 @@ class DeviceHalTest(unittest.TestCase):
         sem1.signal(2)
         self.assertEqual(sem1.query(), 2)
 
+    def testSemaphoreSignal(self):
+        sem = self.device.create_semaphore(0)
+        self.assertFalse(sem.wait(1, deadline=0))
+        sem.signal(1)
+        self.assertTrue(sem.wait(1, deadline=0))
+
+    def testSynchronousSemaphoreFailed(self):
+        sem = self.device.create_semaphore(0)
+        sem.fail("TEST FAILURE")
+        with self.assertRaisesRegex(
+            RuntimeError, "^synchronous semaphore failure.*TEST FAILURE"
+        ):
+            sem.wait(1, deadline=0)
+
+    def testAsynchronousSemaphoreFailed(self):
+        sem = self.device.create_semaphore(0)
+        exceptions = []
+
+        def run():
+            print("SIGNALLING ASYNC FAILURE")
+            time.sleep(0.2)
+            sem.fail("TEST FAILURE")
+            print("SIGNALLED")
+
+        def wait():
+            print("WAITING")
+            try:
+                sem.wait(1)
+            except RuntimeError as e:
+                exceptions.append(e)
+
+        runner = threading.Thread(target=run)
+        waiter = threading.Thread(target=wait)
+        waiter.start()
+        runner.start()
+        waiter.join()
+        runner.join()
+        self.assertTrue(exceptions)
+        print(exceptions)
+        # Note: It is impossible to 100% guarantee that this sequences such as to
+        # report an asynchronous vs synchronous failure, although we tip the odds in
+        # this favor with the sleep in the signalling thread. Therefore, we do not
+        # check the "asynchronous" vs "synchronous" message prefix to avoid flaky
+        # test races.
+        self.assertIn("TEST FAILURE", str(exceptions[0]))
+
     def testTrivialQueueAlloc(self):
         sem = self.device.create_semaphore(0)
         buf = self.device.queue_alloca(
@@ -226,16 +284,64 @@ class DeviceHalTest(unittest.TestCase):
         self.device.queue_dealloca(
             buf, wait_semaphores=fence1, signal_semaphores=fence2
         )
-        fence2.wait()
+        self.assertTrue(fence2.wait())
         self.assertEqual(sem.query(), 2)
 
     def testFenceCreateAt(self):
         sem = self.device.create_semaphore(0)
         fence = iree.runtime.HalFence.create_at(sem, 1)
-        with self.assertRaisesRegex(RuntimeError, "DEADLINE_EXCEEDED"):
-            fence.wait(deadline=0)
+        self.assertFalse(fence.wait(deadline=0))
         sem.signal(1)
-        fence.wait(deadline=0)
+        self.assertTrue(fence.wait(deadline=0))
+
+    def testFenceSignal(self):
+        sem = self.device.create_semaphore(0)
+        fence = iree.runtime.HalFence.create_at(sem, 1)
+        self.assertFalse(fence.wait(deadline=0))
+        fence.signal()
+        self.assertTrue(fence.wait(deadline=0))
+
+    def testSynchronousFenceFailed(self):
+        sem = self.device.create_semaphore(0)
+        fence = iree.runtime.HalFence.create_at(sem, 1)
+        fence.fail("TEST FAILURE")
+        with self.assertRaisesRegex(
+            RuntimeError, "^synchronous fence failure.*TEST FAILURE"
+        ):
+            fence.wait(deadline=0)
+
+    def testAsynchronousFenceFailed(self):
+        sem = self.device.create_semaphore(0)
+        fence = iree.runtime.HalFence.create_at(sem, 1)
+        exceptions = []
+
+        def run():
+            print("SIGNALLING ASYNC FAILURE")
+            time.sleep(0.2)
+            fence.fail("TEST FAILURE")
+            print("SIGNALLED")
+
+        def wait():
+            print("WAITING")
+            try:
+                fence.wait()
+            except RuntimeError as e:
+                exceptions.append(e)
+
+        runner = threading.Thread(target=run)
+        waiter = threading.Thread(target=wait)
+        waiter.start()
+        runner.start()
+        waiter.join()
+        runner.join()
+        self.assertTrue(exceptions)
+        print(exceptions)
+        # Note: It is impossible to 100% guarantee that this sequences such as to
+        # report an asynchronous vs synchronous failure, although we tip the odds in
+        # this favor with the sleep in the signalling thread. Therefore, we do not
+        # check the "asynchronous" vs "synchronous" message prefix to avoid flaky
+        # test races.
+        self.assertIn("TEST FAILURE", str(exceptions[0]))
 
     def testFenceJoin(self):
         sem1 = self.device.create_semaphore(0)
@@ -359,7 +465,7 @@ class DeviceHalTest(unittest.TestCase):
 
         sem = self.device.create_semaphore(0)
         self.device.queue_execute(
-            [cb], wait_semaphores=[(sem, 0)], signal_semaphores=[(sem, 1)]
+            cb, wait_semaphores=[(sem, 0)], signal_semaphores=[(sem, 1)]
         )
         iree.runtime.HalFence.create_at(sem, 1).wait()
 
@@ -375,11 +481,300 @@ class DeviceHalTest(unittest.TestCase):
 
         sem = self.device.create_semaphore(0)
         self.device.queue_execute(
-            [cb],
+            cb,
             wait_semaphores=iree.runtime.HalFence.create_at(sem, 0),
             signal_semaphores=iree.runtime.HalFence.create_at(sem, 1),
         )
         iree.runtime.HalFence.create_at(sem, 1).wait()
+
+
+class DeviceDLPackTest(unittest.TestCase):
+    """Tests low level DLPack import/export against the CPU HAL backend.
+
+    This test leverages the fact that numpy is a reasonable dlpack
+    producer/consumer. It has the caveat that our low level support does not
+    allow import of non page aligned data, so we have to take some extra
+    steps to prep it. For pure CPU/Numpy import/export, we have better
+    supported paths than this, but we leverage it here for its testing
+    value, as it exercises code paths that are otherwise only accessible
+    on devices.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.device = iree.runtime.get_device("local-task")
+        self.allocator = self.device.allocator
+        gc.collect()
+
+    def roundtrip(self, input_array, element_type):
+        # We have top copy the input array into our own buffer to ensure
+        # alignment (dlpack import/export require aligned data).
+        orig_bv = self.allocator.allocate_buffer_copy(
+            memory_type=iree.runtime.MemoryType.DEVICE_LOCAL,
+            allowed_usage=iree.runtime.BufferUsage.DEFAULT,
+            device=self.device,
+            buffer=input_array,
+            element_type=element_type,
+        )
+        aligned_input_array = orig_bv.map().asarray(
+            input_array.shape, input_array.dtype
+        )
+
+        # Export the __dlpack__ capsule from numpy, which should be a plain
+        # view over the buffer we originally allocated (therefore, aligned
+        # and importable).
+        input_capsule = aligned_input_array.__dlpack__()
+        aligned_input_array = None
+        gc.collect()
+        imported_bv = self.device.from_dlpack_capsule(input_capsule)
+
+        # Export a capsule from this imported buffer view and create a new
+        # array out of it.
+        class DummyProducer:
+            def __dlpack__(_, stream=None):
+                capsule = self.device.create_dlpack_capsule(imported_bv, 1, 0)
+                return capsule
+
+            def __dlpack_device__(self):
+                return (1, 0)  # CPU, id 0
+
+        reimported_array = np.from_dlpack(DummyProducer())
+        imported_bv = None
+        gc.collect()
+        np.testing.assert_array_equal(input_array, reimported_array)
+
+    def testImportExportF64(self):
+        self.roundtrip(np.random.rand(3, 4), iree.runtime.HalElementType.FLOAT_64)
+
+    def testImportExportF32(self):
+        self.roundtrip(
+            np.random.rand(3, 4, 16, 32, 1, 5, 2).astype(np.float32),
+            iree.runtime.HalElementType.FLOAT_32,
+        )
+
+    def testImportExportF16(self):
+        self.roundtrip(
+            np.random.rand(3, 4).astype(np.float16),
+            iree.runtime.HalElementType.FLOAT_16,
+        )
+
+    def testImportExportSI8(self):
+        self.roundtrip(
+            (np.random.rand(3, 4) * 255.0).astype(np.int8),
+            iree.runtime.HalElementType.SINT_8,
+        )
+
+    def testImportExportSI16(self):
+        self.roundtrip(
+            (np.random.rand(3, 4) * 255.0).astype(np.int16),
+            iree.runtime.HalElementType.SINT_16,
+        )
+
+    def testImportExportSI32(self):
+        self.roundtrip(
+            (np.random.rand(3, 4) * 255.0).astype(np.int32),
+            iree.runtime.HalElementType.SINT_32,
+        )
+
+    def testImportExportSI64(self):
+        self.roundtrip(
+            (np.random.rand(3, 4) * 255.0).astype(np.int64),
+            iree.runtime.HalElementType.SINT_64,
+        )
+
+    def testImportExportUI8(self):
+        self.roundtrip(
+            (np.random.rand(3, 4) * 255.0).astype(np.uint8),
+            iree.runtime.HalElementType.UINT_8,
+        )
+
+    def testImportExportUI16(self):
+        self.roundtrip(
+            (np.random.rand(3, 4) * 255.0).astype(np.uint16),
+            iree.runtime.HalElementType.UINT_16,
+        )
+
+    def testImportExportUI32(self):
+        self.roundtrip(
+            (np.random.rand(3, 4) * 255.0).astype(np.uint32),
+            iree.runtime.HalElementType.UINT_32,
+        )
+
+    def testImportExportUI64(self):
+        self.roundtrip(
+            (np.random.rand(3, 4) * 255.0).astype(np.uint64),
+            iree.runtime.HalElementType.UINT_64,
+        )
+
+    def testImportExportBool(self):
+        self.roundtrip(
+            (np.random.rand(3, 4) * 255.0).astype(np.bool_),
+            iree.runtime.HalElementType.BOOL_8,
+        )
+
+    def testImportExportUI64(self):
+        self.roundtrip(
+            (np.random.rand(3, 4) * 255.0).astype(np.uint64),
+            iree.runtime.HalElementType.UINT_64,
+        )
+
+    def testImportExportComplex64(self):
+        shape = (3, 1, 5, 6, 12, 2, 3)
+        self.roundtrip(
+            np.random.uniform(-1, 1, shape) + 1.0j * np.random.uniform(-1, 1, shape),
+            iree.runtime.HalElementType.COMPLEX_64,
+        )
+
+    def testImportExportComplex64(self):
+        shape = (3, 1, 5, 6, 12, 2, 3)
+        self.roundtrip(
+            (
+                np.random.uniform(-1, 1, shape) + 1.0j * np.random.uniform(-1, 1, shape)
+            ).astype(np.complex128),
+            iree.runtime.HalElementType.COMPLEX_64,
+        )
+
+
+class HalModuleDebugSinkTest(unittest.TestCase):
+    COMPILED_TRACE_TENSOR: bytes
+
+    @classmethod
+    def compile_trace_tensor(cls):
+        if not hasattr(cls, "COMPILED_TRACE_TENSOR"):
+            cls.COMPILED_TRACE_TENSOR = iree.compiler.compile_str(
+                """
+                func.func @trace_args(%arg0: tensor<2xi32>, %arg1: tensor<3xi32>) {
+                    flow.tensor.trace "debug_sink_test" = [
+                        %arg0: tensor<2xi32>,
+                        %arg1: tensor<3xi32>
+                    ]
+                    return
+                }
+                """,
+                target_backends=iree.compiler.core.DEFAULT_TESTING_BACKENDS,
+            )
+        return cls.COMPILED_TRACE_TENSOR
+
+    def testHalModuleBufferViewTraceCallback(self):
+        """Check that the trace tensor callback gets called with the expected
+        arguments."""
+        program_bytes = HalModuleDebugSinkTest.compile_trace_tensor()
+
+        arg0 = np.array([1, 2], dtype=np.int32)
+        arg1 = np.array([3, 4, 5], dtype=np.int32)
+
+        callback_key: str = None
+        callback_buffer_views = None
+
+        def callback(key: str, buffer_views: List[iree.runtime.HalBufferView]):
+            nonlocal callback_key
+            callback_key = key
+            nonlocal callback_buffer_views
+            callback_buffer_views = buffer_views
+
+        instance = iree.runtime.VmInstance()
+        device = iree.runtime.get_device(iree.compiler.core.DEFAULT_TESTING_DRIVER)
+        hal_module = iree.runtime.create_hal_module(
+            instance, device, debug_sink=iree.runtime.HalModuleDebugSink(callback)
+        )
+        program_module = iree.runtime.VmModule.copy_buffer(instance, program_bytes)
+        context = iree.runtime.VmContext(instance)
+        context.register_modules([hal_module, program_module])
+        fn = program_module.lookup_function("trace_args")
+        fn_invoker = iree.runtime.FunctionInvoker(context, device, fn)
+        fn_invoker(arg0, arg1)
+
+        assert callback_key == "debug_sink_test"
+        assert len(callback_buffer_views) == 2
+        actual_arg0 = iree.runtime.DeviceArray(
+            device, callback_buffer_views[0]
+        ).to_host()
+        actual_arg1 = iree.runtime.DeviceArray(
+            device, callback_buffer_views[1]
+        ).to_host()
+        np.testing.assert_equal(actual_arg0, arg0)
+        np.testing.assert_equal(actual_arg1, arg1)
+
+    def testNoneHalModuleDebugSink(self):
+        device = iree.runtime.get_device(iree.compiler.core.DEFAULT_TESTING_DRIVER)
+        instance = iree.runtime.VmInstance()
+        hal_module = iree.runtime.create_hal_module(
+            instance,
+            device,
+            debug_sink=None,
+        )
+
+    def testExceptionInHalModuleBufferViewTraceCallback(self):
+        """When an exception occurs in the callback check that it properly propagates
+        through the bindings and results in a IREE module function failed invocation.
+        """
+        program_bytes = HalModuleDebugSinkTest.compile_trace_tensor()
+
+        arg0 = np.array([1, 2], dtype=np.int32)
+        arg1 = np.array([3, 4, 5], dtype=np.int32)
+
+        device = iree.runtime.get_device(iree.compiler.core.DEFAULT_TESTING_DRIVER)
+
+        class TestException(Exception):
+            def __init__(self, msg: str):
+                super().__init__(msg)
+
+        def callback(key: str, buffer_views: List[iree.runtime.HalBufferView]):
+            raise TestException("This is a test exception")
+
+        instance = iree.runtime.VmInstance()
+        hal_module = iree.runtime.create_hal_module(
+            instance, device, debug_sink=iree.runtime.HalModuleDebugSink(callback)
+        )
+        program_module = iree.runtime.VmModule.copy_buffer(instance, program_bytes)
+        context = iree.runtime.VmContext(instance)
+        context.register_modules([hal_module, program_module])
+        fn = program_module.lookup_function("trace_args")
+        fn_invoker = iree.runtime.FunctionInvoker(context, device, fn)
+        # TODO: once IREE status chains messages test for the actual message we raise
+        # within the callback.
+        self.assertRaisesRegex(RuntimeError, "UNKNOWN", fn_invoker, arg0, arg1)
+
+    def testHalModuleBufferViewTraceCallbackReferencingItselfDoesNotLeak(self):
+        """Check that if we do not hold reference to the HAL module or VM context,
+        but we hold a reference to the debug sink in the callback, the callback object
+        does not leak.
+        """
+        is_callback_destroyed: bool = False
+
+        class Callback:
+            def __del__(self):
+                nonlocal is_callback_destroyed
+                is_callback_destroyed = True
+
+            def __call__(
+                self, key: str, buffer_views: List[iree.runtime.HalBufferView]
+            ):
+                pass
+
+        callback = Callback()
+        debug_sink = iree.runtime.HalModuleDebugSink(callback)
+        setattr(callback, "debug_sink", debug_sink)
+
+        device = iree.runtime.get_device(iree.compiler.core.DEFAULT_TESTING_DRIVER)
+
+        vm_instance = iree.runtime.VmInstance()
+        hal_module = iree.runtime.create_hal_module(
+            vm_instance,
+            device,
+            debug_sink=debug_sink,
+        )
+        vm_context = iree.runtime.VmContext(vm_instance)
+        vm_context.register_modules([hal_module])
+        assert not is_callback_destroyed
+
+        del callback
+        del debug_sink
+        del hal_module
+        del vm_instance
+        del vm_context
+        gc.collect()
+        assert is_callback_destroyed
 
 
 if __name__ == "__main__":

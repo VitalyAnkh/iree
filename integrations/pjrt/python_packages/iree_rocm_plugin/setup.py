@@ -32,7 +32,7 @@ class CMakeBuildPy(iree_pjrt_setup.BaseCMakeBuildPy):
         print("*****************************", file=sys.stderr)
         self.build_configuration(
             os.path.join(THIS_DIR, "build", "cmake"),
-            extra_cmake_args=("-DIREE_EXTERNAL_HAL_DRIVERS=ROCM",),
+            extra_cmake_args=("-DIREE_EXTERNAL_HAL_DRIVERS=rocm",),
         )
         print("Target populated.", file=sys.stderr)
 
@@ -52,12 +52,12 @@ setup(
     name=f"iree-pjrt-plugin-rocm{iree_pjrt_setup.PACKAGE_SUFFIX}",
     version=f"{iree_pjrt_setup.PACKAGE_VERSION}",
     author="The IREE Team",
-    author_email="iree-discuss@googlegroups.com",
+    author_email="iree-technical-discussion@lists.lfaidata.foundation",
     license="Apache-2.0",
     description="IREE PJRT Plugin for ROCM (generic)",
     long_description=README,
     long_description_content_type="text/markdown",
-    url="https://github.com/openxla/iree",
+    url="https://github.com/iree-org/iree",
     classifiers=[
         "Development Status :: 3 - Alpha",
         "License :: OSI Approved :: Apache Software License",
@@ -86,7 +86,7 @@ setup(
         # plugins. This augments the path based scanning that Jax does, which
         # is not always robust to all packaging circumstances.
         "jax_plugins": [
-            "iree-rocm = jax_plugins.iree_rocm",
+            "iree-hip = jax_plugins.iree_rocm",
         ],
     },
     install_requires=iree_pjrt_setup.install_requires,

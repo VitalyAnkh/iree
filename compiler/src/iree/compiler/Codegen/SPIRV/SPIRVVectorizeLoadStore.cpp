@@ -12,7 +12,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "iree/compiler/Codegen/SPIRV/PassDetail.h"
 #include "iree/compiler/Codegen/SPIRV/Passes.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
@@ -36,6 +35,9 @@ constexpr int kMaxVectorNumBits = 128;
 constexpr int kMaxVectorNumElements = 4;
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_SPIRVVECTORIZELOADSTOREPASS
+#include "iree/compiler/Codegen/SPIRV/Passes.h.inc"
 
 //===----------------------------------------------------------------------===//
 // Utility Functions
@@ -253,7 +255,7 @@ private:
 MemRefUsageAnalysis::MemRefUsageAnalysis(mlir::Operation *op) {
   op->walk([&](Operation *op) {
     TypeSwitch<Operation *>(op)
-        .Case<func::FuncOp>([this](func::FuncOp funcOp) {
+        .Case<mlir::FunctionOpInterface>([this](auto funcOp) {
           for (Value arg : funcOp.getArguments()) {
             analyzeMemRefValue(arg);
           }
@@ -279,8 +281,8 @@ void MemRefUsageAnalysis::analyzeMemRefValue(Value value) {
 template <typename OpTy>
 class MemRefConversionPattern : public OpConversionPattern<OpTy> {
 public:
-  MemRefConversionPattern<OpTy>(MLIRContext *context,
-                                const MemRefUsageAnalysis &memrefUsageAnalysis)
+  MemRefConversionPattern(MLIRContext *context,
+                          const MemRefUsageAnalysis &memrefUsageAnalysis)
       : OpConversionPattern<OpTy>::OpConversionPattern(context),
         memrefUsageAnalysis(memrefUsageAnalysis) {}
 
@@ -319,11 +321,11 @@ public:
       signatureConverter.addInputs(index, arg.getType());
     }
     // Creates a new function with the update signature.
-    rewriter.applySignatureConversion(&funcOp.getFunctionBody(),
+    rewriter.applySignatureConversion(&funcOp.getFunctionBody().front(),
                                       signatureConverter);
 
     // Creates a new function with the update signature.
-    rewriter.updateRootInPlace(funcOp, [&] {
+    rewriter.modifyOpInPlace(funcOp, [&] {
       funcOp.setType(rewriter.getFunctionType(
           signatureConverter.getConvertedTypes(), std::nullopt));
     });
@@ -647,10 +649,9 @@ public:
                                          "cannot get vectorized memref type");
     }
     rewriter.replaceOpWithNewOp<IREE::HAL::InterfaceBindingSubspanOp>(
-        subspanOp, *vecMemRef, subspanOp.getSet(), subspanOp.getBinding(),
-        subspanOp.getDescriptorType(), subspanOp.getByteOffset(),
-        subspanOp.getDynamicDims(), subspanOp.getAlignmentAttr(),
-        subspanOp.getDescriptorFlagsAttr());
+        subspanOp, *vecMemRef, subspanOp.getLayout(), subspanOp.getBinding(),
+        subspanOp.getByteOffset(), subspanOp.getDynamicDims(),
+        subspanOp.getAlignmentAttr(), subspanOp.getDescriptorFlagsAttr());
     return success();
   }
 };
@@ -735,8 +736,8 @@ public:
   LogicalResult
   matchAndRewrite(OpT op, typename OpT::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.updateRootInPlace(op,
-                               [&] { op->setOperands(adaptor.getOperands()); });
+    rewriter.modifyOpInPlace(op,
+                             [&] { op->setOperands(adaptor.getOperands()); });
     return success();
   }
 };
@@ -985,7 +986,7 @@ struct ReifyExtractOfCreateMask final
   LogicalResult matchAndRewrite(vector::ExtractOp extractOp,
                                 PatternRewriter &rewriter) const override {
     // Restrict to the degenerate case where we are extracting a single element.
-    if (extractOp.getResult().getType().isa<VectorType>()) {
+    if (isa<VectorType>(extractOp.getResult().getType())) {
       return failure();
     }
     auto maskOp = extractOp.getVector().getDefiningOp<vector::CreateMaskOp>();
@@ -999,11 +1000,11 @@ struct ReifyExtractOfCreateMask final
     for (auto [idx, size] :
          llvm::zip_equal(extractOp.getMixedPosition(), maskOp.getOperands())) {
       Value idxVal;
-      if (idx.is<Attribute>()) {
+      if (auto attr = dyn_cast<Attribute>(idx)) {
         idxVal = rewriter.create<arith::ConstantIndexOp>(
-            loc, idx.get<Attribute>().cast<IntegerAttr>().getInt());
+            loc, dyn_cast<IntegerAttr>(attr).getInt());
       } else {
-        idxVal = idx.get<Value>();
+        idxVal = dyn_cast<Value>(idx);
       }
       Value cmpIdx = rewriter.create<arith::CmpIOp>(
           loc, arith::CmpIPredicate::slt, idxVal, size);
@@ -1019,7 +1020,8 @@ struct ReifyExtractOfCreateMask final
 //===----------------------------------------------------------------------===//
 
 class SPIRVVectorizeLoadStorePass final
-    : public SPIRVVectorizeLoadStoreBase<SPIRVVectorizeLoadStorePass> {
+    : public impl::SPIRVVectorizeLoadStorePassBase<
+          SPIRVVectorizeLoadStorePass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<affine::AffineDialect, memref::MemRefDialect>();
   }
@@ -1034,22 +1036,20 @@ private:
 void SPIRVVectorizeLoadStorePass::runOnOperation() {
   // Uses the signature conversion methodology of the dialect conversion
   // framework to implement the conversion.
-  ModuleOp module = getOperation();
+  auto funcOp = getOperation();
   MLIRContext *context = &getContext();
 
   // Prior pass should have unrolled and broken down vectors with rank > 1.
-  for (func::FuncOp func : module.getOps<func::FuncOp>()) {
-    auto result = func.walk([](VectorTransferOpInterface transferOp) {
-      if (cast<VectorType>(transferOp.getVectorType()).getRank() > 1) {
-        transferOp.emitOpError(
-            "with rank > 1 should be broken down by prior passes");
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
-    if (result.wasInterrupted()) {
-      signalPassFailure();
+  auto result = funcOp.walk([](VectorTransferOpInterface transferOp) {
+    if (cast<VectorType>(transferOp.getVectorType()).getRank() > 1) {
+      transferOp.emitOpError(
+          "with rank > 1 should be broken down by prior passes");
+      return WalkResult::interrupt();
     }
+    return WalkResult::advance();
+  });
+  if (result.wasInterrupted()) {
+    signalPassFailure();
   }
 
   memrefUsageAnalysis = &getAnalysis<MemRefUsageAnalysis>();
@@ -1089,26 +1089,19 @@ void SPIRVVectorizeLoadStorePass::runOnOperation() {
       [&](auto op) { return !memrefUsageAnalysis->shouldConvertTransfer(op); });
   target.markUnknownOpDynamicallyLegal([&](Operation *op) { return true; });
 
-  if (failed(applyPartialConversion(module, target,
+  if (failed(applyPartialConversion(funcOp, target,
                                     std::move(conversionPatterns)))) {
     return signalPassFailure();
   }
 
-  for (func::FuncOp func : module.getOps<func::FuncOp>()) {
-    RewritePatternSet rewritingPatterns(context);
-    rewritingPatterns.add<ScalarizeVectorTransferRead, ScalarizeVectorLoad,
-                          ScalarizeVectorTransferWrite>(context);
-    rewritingPatterns.add<ReifyExtractOfCreateMask>(context);
+  RewritePatternSet rewritingPatterns(context);
+  rewritingPatterns.add<ScalarizeVectorTransferRead, ScalarizeVectorLoad,
+                        ScalarizeVectorTransferWrite>(context);
+  rewritingPatterns.add<ReifyExtractOfCreateMask>(context);
 
-    if (failed(
-            applyPatternsAndFoldGreedily(func, std::move(rewritingPatterns)))) {
-      return signalPassFailure();
-    }
+  if (failed(applyPatternsGreedily(funcOp, std::move(rewritingPatterns)))) {
+    return signalPassFailure();
   }
-}
-
-std::unique_ptr<OperationPass<ModuleOp>> createSPIRVVectorizeLoadStore() {
-  return std::make_unique<SPIRVVectorizeLoadStorePass>();
 }
 
 } // namespace mlir::iree_compiler

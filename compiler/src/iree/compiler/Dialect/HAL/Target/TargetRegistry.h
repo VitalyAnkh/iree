@@ -12,88 +12,148 @@
 #include <vector>
 
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
+#include "iree/compiler/Dialect/HAL/Target/TargetDevice.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/CommandLine.h"
 
 namespace mlir::iree_compiler::IREE::HAL {
 
-using CreateTargetBackendFn = std::function<std::shared_ptr<TargetBackend>()>;
+//===----------------------------------------------------------------------===//
+// TargetRegistration
+//===----------------------------------------------------------------------===//
 
-// Registers an executable translation target backend creation function.
-//
-// For example:
-//   llvm-aot-x86_64
-//   llvm-aot-armv8-dotprod
-//   llvm-jit
-//   vulkan-v1.1-low
-//   vulkan-v1.1-high
-class TargetBackendRegistration {
+template <typename T>
+using TargetFactoryFn = std::function<std::shared_ptr<T>()>;
+
+template <typename T>
+class TargetRegistration {
 public:
-  // TODO: Remove the registerStaticGlobal mode once callers are migrated.
-  TargetBackendRegistration(StringRef name, CreateTargetBackendFn fn,
-                            bool registerStaticGlobal = true);
+  TargetRegistration(TargetFactoryFn<T> fn) : initFn(std::move(fn)) {}
+  std::shared_ptr<T> acquire() {
+    std::call_once(initFlag, [&]() { cachedValue = initFn(); });
+    return cachedValue;
+  }
 
-  std::shared_ptr<TargetBackend> acquire();
-
-private:
-  CreateTargetBackendFn initFn;
+protected:
+  TargetFactoryFn<T> initFn;
   std::once_flag initFlag;
-  std::shared_ptr<TargetBackend> cachedValue;
+  std::shared_ptr<T> cachedValue;
 };
+using TargetBackendRegistration = TargetRegistration<TargetBackend>;
+using TargetDeviceRegistration = TargetRegistration<TargetDevice>;
 
-// A registry of target
-class TargetBackendList {
+template <typename T>
+class TargetFactoryList {
 public:
-  void add(llvm::StringRef name, CreateTargetBackendFn fn) {
-    entries.push_back(std::make_pair(name, fn));
+  void add(llvm::StringRef name, TargetFactoryFn<T> fn) {
+    entries.push_back(std::make_pair(name.str(), fn));
   }
 
 private:
-  llvm::SmallVector<std::pair<llvm::StringRef, CreateTargetBackendFn>> entries;
-  friend class TargetBackendRegistry;
+  llvm::SmallVector<std::pair<std::string, TargetFactoryFn<T>>> entries;
+  friend class TargetRegistry;
 };
+class TargetBackendList : public TargetFactoryList<TargetBackend> {};
+class TargetDeviceList : public TargetFactoryList<TargetDevice> {};
 
-// A concrete target backend registry.
-class TargetBackendRegistry {
+//===----------------------------------------------------------------------===//
+// TargetRegistry
+//===----------------------------------------------------------------------===//
+
+// A concrete target registry.
+class TargetRegistry {
 public:
-  // Merge from a list of of targets. The registry will own the registration
-  // entries.
-  void mergeFrom(const TargetBackendList &targets);
+  // Returns the global registry.
+  // This should only be used at initialization-time for built-in devices.
+  // All other usage should use scoped registries.
+  static TargetRegistry &getMutableTargetRegistry();
+  // Returns the read-only global registry.
+  // This is used by passes which depend on it from their default constructor.
+  static const TargetRegistry &getGlobal();
+
+  // Merge from a list of of target devices.
+  // The receiving registry will own the registration entries.
+  void mergeFrom(const TargetDeviceList &targetDevices);
+  // Merge from a list of of target backends.
+  // The receiving registry will own the registration entries.
+  void mergeFrom(const TargetBackendList &targetBackends);
+
   // Initialize from an existing registry. This registry will not own the
   // backing registration entries. The source registry must remain live for the
   // life of this.
-  void mergeFrom(const TargetBackendRegistry &registry);
+  void mergeFrom(const TargetRegistry &registry);
 
-  // Returns the read-only global registry. This is used by passes which depend
-  // on it from their default constructor.
-  static const TargetBackendRegistry &getGlobal();
-
+  // Returns a list of registered target devices.
+  std::vector<std::string> getRegisteredTargetDevices() const;
   // Returns a list of registered target backends.
   std::vector<std::string> getRegisteredTargetBackends() const;
 
+  // Returns the target device with the given name.
+  std::shared_ptr<TargetDevice> getTargetDevice(StringRef targetName) const;
   // Returns the target backend with the given name.
   std::shared_ptr<TargetBackend> getTargetBackend(StringRef targetName) const;
 
+  // Returns one device per entry in |targetNames|.
+  SmallVector<std::shared_ptr<TargetDevice>>
+  getTargetDevices(ArrayRef<std::string> targetNames) const;
   // Returns one backend per entry in |targetNames|.
   SmallVector<std::shared_ptr<TargetBackend>>
   getTargetBackends(ArrayRef<std::string> targetNames) const;
 
 private:
-  llvm::StringMap<TargetBackendRegistration *> registrations;
+  llvm::StringMap<TargetDeviceRegistration *> deviceRegistrations;
+  llvm::SmallVector<std::unique_ptr<TargetDeviceRegistration>>
+      ownedDeviceRegistrations;
+  llvm::StringMap<TargetBackendRegistration *> backendRegistrations;
   llvm::SmallVector<std::unique_ptr<TargetBackendRegistration>>
-      ownedRegistrations;
-
-  friend class TargetBackendRegistration;
+      ownedBackendRegistrations;
 };
 
-// Returns a sorted uniqued set of target backends used in the executable.
-SmallVector<std::string>
-gatherExecutableTargetNames(IREE::HAL::ExecutableOp executableOp);
-
-// Returns a sorted uniqued set of target backends used in the entire module.
-SmallVector<std::string> gatherExecutableTargetNames(mlir::ModuleOp moduleOp);
-
 } // namespace mlir::iree_compiler::IREE::HAL
+
+//===----------------------------------------------------------------------===//
+// TargetRegistryRef
+//===----------------------------------------------------------------------===//
+
+namespace llvm::cl {
+
+struct TargetRegistryRef {
+  const mlir::iree_compiler::IREE::HAL::TargetRegistry *value =
+      &mlir::iree_compiler::IREE::HAL::TargetRegistry::getGlobal();
+  TargetRegistryRef() = default;
+  TargetRegistryRef(const mlir::iree_compiler::IREE::HAL::TargetRegistry &value)
+      : value(&value) {}
+  TargetRegistryRef(const mlir::iree_compiler::IREE::HAL::TargetRegistry *value)
+      : value(value) {}
+  operator bool() const noexcept {
+    return value->getRegisteredTargetDevices() !=
+               mlir::iree_compiler::IREE::HAL::TargetRegistry::getGlobal()
+                   .getRegisteredTargetDevices() &&
+           value->getRegisteredTargetBackends() !=
+               mlir::iree_compiler::IREE::HAL::TargetRegistry::getGlobal()
+                   .getRegisteredTargetBackends();
+  }
+  const mlir::iree_compiler::IREE::HAL::TargetRegistry *operator->() const {
+    return value;
+  }
+};
+
+extern template class basic_parser<TargetRegistryRef>;
+
+template <>
+class parser<TargetRegistryRef> : public basic_parser<TargetRegistryRef> {
+public:
+  parser(Option &O) : basic_parser(O) {}
+  bool parse(Option &O, StringRef ArgName, StringRef Arg,
+             TargetRegistryRef &Val);
+  StringRef getValueName() const override { return "target registry"; }
+  void printOptionDiff(const Option &O, TargetRegistryRef V,
+                       const OptVal &Default, size_t GlobalWidth) const;
+  void anchor() override;
+};
+
+} // namespace llvm::cl
 
 #endif // IREE_COMPILER_DIALECT_HAL_TARGET_TARGETREGISTRY_H_

@@ -17,11 +17,11 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/ViewLikeInterfaceUtils.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
@@ -103,6 +103,26 @@ static LogicalResult verifyOpDynamicDims(Operation *op, ValueRange values,
            << " dimension values are attached";
   }
   return success();
+}
+
+static LogicalResult produceSliceErrorMsg(SliceVerificationResult result,
+                                          Operation *op,
+                                          RankedTensorType expectedType) {
+  switch (result) {
+  case SliceVerificationResult::Success:
+    return success();
+  case SliceVerificationResult::RankTooLarge:
+    return op->emitError("expected rank to be smaller or equal to ")
+           << "the other rank. ";
+  case SliceVerificationResult::SizeMismatch:
+    return op->emitError("expected type to be ")
+           << expectedType << " or a rank-reduced version. (size mismatch) ";
+  case SliceVerificationResult::ElemTypeMismatch:
+    return op->emitError("expected element type to be ")
+           << expectedType.getElementType();
+  default:
+    llvm_unreachable("unexpected slicing op verification result");
+  }
 }
 
 // Gets the dropped dimensions for `flow.dispatch.tensor.load/store`.
@@ -558,6 +578,25 @@ ValueRange DispatchRegionOp::getResultDynamicDims(unsigned idx) {
                                shapedType ? shapedType.getNumDynamicDims() : 0);
 }
 
+LogicalResult DispatchRegionOp::reifyResultShapes(
+    OpBuilder &b, ReifiedRankedShapedTypeDims &reifiedReturnShapes) {
+  SmallVector<Type> resultTypes(getResultTypes());
+  unsigned counter = 0;
+  for (Type resultType : resultTypes) {
+    auto shapedType = llvm::dyn_cast<ShapedType>(resultType);
+    if (!shapedType) {
+      reifiedReturnShapes.push_back({});
+      continue;
+    }
+    SmallVector<Value> dynamicDims =
+        getResultDims().slice(counter, shapedType.getNumDynamicDims());
+    reifiedReturnShapes.push_back(
+        mlir::getMixedValues(shapedType.getShape(), dynamicDims, b));
+    counter += shapedType.getNumDynamicDims();
+  }
+  return success();
+}
+
 /// Canonicalizes a DispatchRegionOp: Drop all unused results. Returns `true`
 /// if the IR was modified.
 bool dropUnusedDispatchRegionResults(RewriterBase &rewriter,
@@ -603,7 +642,7 @@ bool dropUnusedDispatchRegionResults(RewriterBase &rewriter,
   for (const auto &it : llvm::enumerate(returnOp.getOperands()))
     if (!unusedResults.contains(it.index()))
       yieldedValues.push_back(it.value());
-  rewriter.updateRootInPlace(
+  rewriter.modifyOpInPlace(
       returnOp, [&]() { returnOp.getOperandsMutable().assign(yieldedValues); });
 
   // Replace all uses of the old op.
@@ -679,12 +718,12 @@ static void processMixedOperands(ArrayRef<OpFoldResult> valueOrAttrs,
                                  SmallVectorImpl<int64_t> &staticValues,
                                  int64_t dynamicIndexValue) {
   for (OpFoldResult valueOrAttr : valueOrAttrs) {
-    if (auto value = valueOrAttr.dyn_cast<Value>()) {
+    if (auto value = dyn_cast<Value>(valueOrAttr)) {
       dynamicValues.push_back(value);
       staticValues.push_back(dynamicIndexValue);
     } else {
       auto operandValue =
-          llvm::cast<IntegerAttr>(valueOrAttr.dyn_cast<Attribute>()).getInt();
+          llvm::cast<IntegerAttr>(dyn_cast<Attribute>(valueOrAttr)).getInt();
       staticValues.push_back(operandValue);
     }
   }
@@ -722,7 +761,7 @@ DispatchTensorLoadOp::inferResultType(IREE::Flow::DispatchTensorType sourceType,
                                       ArrayRef<OpFoldResult> mixedSizes) {
   auto shape =
       llvm::map_to_vector(mixedSizes, [&](OpFoldResult valueOrAttr) -> int64_t {
-        if (auto attr = valueOrAttr.dyn_cast<Attribute>()) {
+        if (auto attr = dyn_cast<Attribute>(valueOrAttr)) {
           return llvm::cast<IntegerAttr>(attr).getInt();
         }
         return ShapedType::kDynamic;
@@ -840,7 +879,15 @@ LogicalResult DispatchTensorStoreOp::verify() {
                                  getTargetDims()))) {
     return failure();
   }
-  return success();
+
+  // We only verify that the source tensor type is consistent with the type
+  // inferred from the slice sizes.
+  RankedTensorType sourceTensorType = getValue().getType();
+  auto inferredType = RankedTensorType::get(getStaticSizes(),
+                                            sourceTensorType.getElementType());
+  SliceVerificationResult result =
+      isRankReducedType(inferredType, sourceTensorType);
+  return produceSliceErrorMsg(result, *this, inferredType);
 }
 
 void DispatchTensorStoreOp::build(OpBuilder &builder, OperationState &state,
@@ -1097,6 +1144,12 @@ bool DispatchWorkgroupsOp::canClosureContainOp(Operation *op) {
   return false;
 }
 
+bool DispatchWorkgroupsOp::isAtomicallyHoistableOp() { return true; }
+
+bool DispatchWorkgroupsOp::isOperandHoistable(OpOperand *operand) {
+  return getOperandTiedResults(operand->getOperandNumber()).empty();
+}
+
 // Refines the tensor access from what is declared on |type| based on actual
 // usage. We expect that the access was set correctly to begin with but today
 // we sometimes specify things too wide.
@@ -1295,6 +1348,27 @@ LogicalResult verifyDispatchWorkgroupInfoOp(Operation *op, uint64_t dimension) {
 }
 
 //===----------------------------------------------------------------------===//
+// flow.dispatch.workload.ordinal
+//===----------------------------------------------------------------------===//
+
+void DispatchWorkloadOrdinalOp::inferResultDivisibility(
+    ArrayRef<IREE::Util::IntegerDivisibility> argDivs,
+    IREE::Util::SetIntDivisibilityFn setResultDivisibility) {
+  if (argDivs[0].isUninitialized()) {
+    setResultDivisibility(getResult(),
+                          IREE::Util::ConstantIntDivisibility(1, 1));
+    return;
+  }
+  setResultDivisibility(getResult(), argDivs[0].getValue());
+}
+
+void DispatchWorkloadOrdinalOp::inferResultRanges(
+    ArrayRef<ConstantIntRanges> argRanges, SetIntRangeFn setResultRange) {
+  assert(!argRanges.empty() && "expected range of input to be set");
+  setResultRange(getResult(), argRanges[0]);
+}
+
+//===----------------------------------------------------------------------===//
 // flow.executable
 //===----------------------------------------------------------------------===//
 
@@ -1372,8 +1446,10 @@ void DispatchOp::build(OpBuilder &builder, OperationState &state,
   state.addOperands(resultDims);
   state.addAttributes(attributes);
   state.attributes.erase(IREE::Util::TiedOpInterface::getStorageAttrName());
-  state.addAttribute(IREE::Util::TiedOpInterface::getStorageAttrName(),
-                     tiedOperands);
+  if (tiedOperands) {
+    state.addAttribute(IREE::Util::TiedOpInterface::getStorageAttrName(),
+                       tiedOperands);
+  }
   state.attributes.erase(getOperandSegmentSizeAttr());
   state.addAttribute(getOperandSegmentSizeAttr(),
                      builder.getDenseI32ArrayAttr({
@@ -1482,8 +1558,10 @@ void FuncOp::build(OpBuilder &builder, OperationState &state, StringRef name,
   state.addAttribute("function_type", TypeAttr::get(type));
   state.attributes.append(attrs.begin(), attrs.end());
   state.attributes.erase(IREE::Util::TiedOpInterface::getStorageAttrName());
-  state.addAttribute(IREE::Util::TiedOpInterface::getStorageAttrName(),
-                     tiedOperands);
+  if (tiedOperands) {
+    state.addAttribute(IREE::Util::TiedOpInterface::getStorageAttrName(),
+                       tiedOperands);
+  }
   state.addRegion();
   if (!argAttrs.empty() || !resAttrs.empty()) {
     assert(type.getNumInputs() == argAttrs.size());
@@ -1510,8 +1588,10 @@ void CallOp::build(OpBuilder &builder, OperationState &state,
   state.addOperands(resultDims);
   state.addAttributes(attributes);
   state.attributes.erase(IREE::Util::TiedOpInterface::getStorageAttrName());
-  state.addAttribute(IREE::Util::TiedOpInterface::getStorageAttrName(),
-                     tiedOperands);
+  if (tiedOperands) {
+    state.addAttribute(IREE::Util::TiedOpInterface::getStorageAttrName(),
+                       tiedOperands);
+  }
   state.attributes.erase(getOperandSegmentSizeAttr());
   state.addAttribute(getOperandSegmentSizeAttr(),
                      builder.getDenseI32ArrayAttr({
@@ -1519,6 +1599,17 @@ void CallOp::build(OpBuilder &builder, OperationState &state,
                          static_cast<int32_t>(argumentDims.size()),
                          static_cast<int32_t>(resultDims.size()),
                      }));
+}
+
+void CallOp::build(OpBuilder &builder, OperationState &state,
+                   SymbolRefAttr callee, TypeRange resultTypes,
+                   ValueRange resultDims, ValueRange arguments,
+                   ArrayAttr tiedOperands,
+                   ArrayRef<NamedAttribute> attributes) {
+  build(
+      builder, state, callee, resultTypes, resultDims, arguments,
+      IREE::Util::buildDynamicDimsForValues(state.location, arguments, builder),
+      tiedOperands, attributes);
 }
 
 FunctionType CallOp::getCalleeType() {
@@ -1557,6 +1648,24 @@ LogicalResult CallOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   }
 
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// flow.tensor.constant
+//===----------------------------------------------------------------------===//
+
+// static
+bool TensorConstantOp::isBuildableWith(Attribute value, Type type) {
+  return isa<RankedTensorType>(type);
+}
+
+//===----------------------------------------------------------------------===//
+// flow.tensor.dynamic_constant
+//===----------------------------------------------------------------------===//
+
+// static
+bool TensorDynamicConstantOp::isBuildableWith(Attribute value, Type type) {
+  return TensorConstantOp::isBuildableWith(value, type);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1718,6 +1827,26 @@ LogicalResult TensorSplatOp::verify() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult TensorCloneOp::verify() {
+  if (failed(verifyOpDynamicDims(getOperation(), {getOperand()},
+                                 getArgumentDims())) ||
+      failed(verifyOpDynamicDims(getOperation(), {getResult()},
+                                 getArgumentDims()))) {
+    return failure();
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// flow.tensor.barrier
+//===----------------------------------------------------------------------===//
+
+LogicalResult TensorBarrierOp::verify() { return success(); }
+
+//===----------------------------------------------------------------------===//
+// flow.tensor.transfer
+//===----------------------------------------------------------------------===//
+
+LogicalResult TensorTransferOp::verify() {
   if (failed(verifyOpDynamicDims(getOperation(), {getOperand()},
                                  getArgumentDims())) ||
       failed(verifyOpDynamicDims(getOperation(), {getResult()},
@@ -1918,6 +2047,16 @@ void ChannelCountOp::getAsmResultNames(
 void ChannelDefaultOp::getAsmResultNames(
     function_ref<void(Value, StringRef)> setNameFn) {
   setNameFn(getResult(), "default_channel");
+}
+
+void ChannelDefaultOp::build(OpBuilder &odsBuilder, OperationState &odsState,
+                             StringRef group) {
+  ChannelDefaultOp::build(odsBuilder, odsState,
+                          odsBuilder.getStringAttr(group));
+}
+
+void ChannelDefaultOp::build(OpBuilder &odsBuilder, OperationState &odsState) {
+  ChannelDefaultOp::build(odsBuilder, odsState, StringAttr());
 }
 
 //===----------------------------------------------------------------------===//

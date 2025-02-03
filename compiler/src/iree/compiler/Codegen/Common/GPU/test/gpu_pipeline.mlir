@@ -1,8 +1,12 @@
 // Test un-peeled epilogue generating AsyncCopyOp using zfill
-// RUN: iree-opt --iree-codegen-gpu-pipelining=epilogue-peeling=false --split-input-file %s | FileCheck %s
-// RUN: iree-opt --iree-codegen-gpu-pipelining="pipeline-depth=3 schedule-index=2 epilogue-peeling=false" --split-input-file %s | FileCheck -check-prefix=CHECK-NV %s
+// RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-pipelining{epilogue-peeling=false}))" --split-input-file %s | FileCheck %s
+// RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-pipelining{pipeline-depth=3 schedule-index=2 epilogue-peeling=false}))" --split-input-file %s | FileCheck -check-prefix=CHECK-NV %s
 
-
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
 func.func @_matmul_f16_f16_dispatch_0_fill_3456x1024() {
   %c2048 = arith.constant 2048 : index
   %c32 = arith.constant 32 : index
@@ -15,11 +19,11 @@ func.func @_matmul_f16_f16_dispatch_0_fill_3456x1024() {
   %3 = gpu.thread_id  z
   %4 = memref.alloc() : memref<4x32x40xf16, 3>
   %5 = memref.alloc() : memref<4x32x40xf16, 3>
-  %6 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%c0) : memref<3456x2048xf16>
+  %6 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) : memref<3456x2048xf16>
   memref.assume_alignment %6, 64 : memref<3456x2048xf16>
-  %7 = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) alignment(64) offset(%c0) : memref<2048x1024xf16>
+  %7 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) : memref<2048x1024xf16>
   memref.assume_alignment %7, 64 : memref<2048x1024xf16>
-  %8 = hal.interface.binding.subspan set(0) binding(2) type(storage_buffer) alignment(64) offset(%c0) : memref<3456x1024xf16>
+  %8 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : memref<3456x1024xf16>
   memref.assume_alignment %8, 64 : memref<3456x1024xf16>
   %workgroup_id_x = hal.interface.workgroup.id[0] : index
   %workgroup_id_y = hal.interface.workgroup.id[1] : index
@@ -57,6 +61,11 @@ func.func @_matmul_f16_f16_dispatch_0_fill_3456x1024() {
 
 // -----
 
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
 func.func @nvidia_tenscore_schedule_f16() {
   %c3 = arith.constant 3 : index
   %c31 = arith.constant 31 : index
@@ -73,11 +82,11 @@ func.func @nvidia_tenscore_schedule_f16() {
   %alloc = memref.alloc() : memref<128x256xf16, #gpu.address_space<workgroup>>
   %alloc_1 = memref.alloc() : memref<3x128x32xf16, #gpu.address_space<workgroup>>
   %alloc_2 = memref.alloc() : memref<3x32x256xf16, #gpu.address_space<workgroup>>
-  %3 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%c0) flags(ReadOnly) : memref<512x1280xf16>
+  %3 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : memref<512x1280xf16>
   memref.assume_alignment %3, 64 : memref<512x1280xf16>
-  %4 = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) alignment(64) offset(%c0) flags(ReadOnly) : memref<1280x1280xf16>
+  %4 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : memref<1280x1280xf16>
   memref.assume_alignment %4, 64 : memref<1280x1280xf16>
-  %5 = hal.interface.binding.subspan set(0) binding(2) type(storage_buffer) alignment(64) offset(%c0) : memref<512x1280xf16>
+  %5 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : memref<512x1280xf16>
   memref.assume_alignment %5, 64 : memref<512x1280xf16>
   %workgroup_id_x = hal.interface.workgroup.id[0] : index
   %workgroup_id_y = hal.interface.workgroup.id[1] : index
@@ -503,6 +512,12 @@ func.func @nvidia_tenscore_schedule_f16() {
 //          CHECK-NV:  vector.store
 
 // -----
+
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
 func.func @nvidia_tenscore_schedule_f32() {
   %c31 = arith.constant 31 : index
   %c2 = arith.constant 2 : index
@@ -519,11 +534,11 @@ func.func @nvidia_tenscore_schedule_f32() {
   %alloc = memref.alloc() : memref<128x128xf32, #gpu.address_space<workgroup>>
   %alloc_2 = memref.alloc() : memref<3x128x32xf32, #gpu.address_space<workgroup>>
   %alloc_3 = memref.alloc() : memref<3x32x128xf32, #gpu.address_space<workgroup>>
-  %3 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%c0) flags(ReadOnly) : memref<256x256xf32>
+  %3 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : memref<256x256xf32>
   memref.assume_alignment %3, 64 : memref<256x256xf32>
-  %4 = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) alignment(64) offset(%c0) flags(ReadOnly) : memref<256x256xf32>
+  %4 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : memref<256x256xf32>
   memref.assume_alignment %4, 64 : memref<256x256xf32>
-  %5 = hal.interface.binding.subspan set(0) binding(2) type(storage_buffer) alignment(64) offset(%c0) : memref<256x256xf32>
+  %5 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : memref<256x256xf32>
   memref.assume_alignment %5, 64 : memref<256x256xf32>
   %workgroup_id_x = hal.interface.workgroup.id[0] : index
   %workgroup_id_y = hal.interface.workgroup.id[1] : index
@@ -1345,5 +1360,3 @@ func.func @nvidia_tenscore_schedule_f32() {
 // CHECK-NV-COUNT-32:    nvgpu.mma.sync
 //          CHECK-NV:  }
 //          CHECK-NV:  vector.store
-
-// -----

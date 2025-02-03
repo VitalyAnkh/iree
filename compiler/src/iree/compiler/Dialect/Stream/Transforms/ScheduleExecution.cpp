@@ -8,14 +8,13 @@
 #include "iree/compiler/Dialect/Stream/IR/StreamDialect.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamTypes.h"
-#include "iree/compiler/Dialect/Stream/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Stream/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/Support/Debug.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
@@ -28,11 +27,14 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Transforms/TopologicalSortUtils.h"
 
 #define DEBUG_TYPE "iree-stream-schedule-execution"
 
 namespace mlir::iree_compiler::IREE::Stream {
+
+#define GEN_PASS_DEF_SCHEDULEEXECUTIONPASS
+#include "iree/compiler/Dialect/Stream/Transforms/Passes.h.inc"
+
 namespace {
 
 // Incremental builder for a partitioned region of executable work.
@@ -150,8 +152,8 @@ struct ExecutePartitionBuilder {
     // want to preserve those as long as possible.
     if (auto affinityOp =
             dyn_cast<IREE::Stream::AffinityOpInterface>(clonedOp)) {
-      if (affinityOp.getAffinity() == partition->affinity) {
-        affinityOp.setAffinity(nullptr);
+      if (affinityOp.getAffinityAttr() == partition->affinity) {
+        affinityOp.setAffinityAttr(nullptr);
       }
     }
 
@@ -273,9 +275,6 @@ LogicalResult processRegion(Location loc, MLIRContext *context, Region &region,
         auto awaitOp = builder.create<IREE::Stream::TimepointAwaitOp>(
             executeOp.getLoc(), newResult, newResultSize,
             executeOp.getResultTimepoint());
-        if (executeOp.getAffinity().has_value()) {
-          awaitOp.setAffinityAttr(executeOp.getAffinityAttr());
-        }
 
         // Explicitly copy the Value since it is marked as const.
         Value toBeDeleted = oldResult;
@@ -283,14 +282,14 @@ LogicalResult processRegion(Location loc, MLIRContext *context, Region &region,
         toBeDeleted.replaceAllUsesWith(awaitOp.getResults().front());
         deadOps.insert(oldResult.getDefiningOp());
       }
-
-      // Sort the ops in the execution region. This is safe because we are
-      // still unaliased and SSA values imply ordering.
-      mlir::sortTopologically(block);
     }
     for (auto *deadOp : llvm::reverse(deadOps)) {
       deadOp->erase();
     }
+
+    // Sort the ops in the execution region. This is safe because we are
+    // still unaliased and SSA values imply ordering.
+    mlir::sortTopologically(block);
 
     LLVM_DEBUG({
       llvm::dbgs() << "\nPartitions constructed:\n";
@@ -312,14 +311,22 @@ LogicalResult processRegion(Location loc, MLIRContext *context, Region &region,
   return success();
 }
 
-class ScheduleExecutionPass
-    : public ScheduleExecutionBase<ScheduleExecutionPass> {
-public:
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<IREE::Stream::StreamDialect>();
-    registry.insert<IREE::Util::UtilDialect>();
-  }
+//===----------------------------------------------------------------------===//
+// --iree-stream-schedule-execution
+//===----------------------------------------------------------------------===//
 
+struct RemoveBarriers : public OpRewritePattern<IREE::Stream::AsyncBarrierOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(IREE::Stream::AsyncBarrierOp op,
+                                PatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, op.getOperand(0));
+    return success();
+  }
+};
+
+struct ScheduleExecutionPass
+    : public IREE::Stream::impl::ScheduleExecutionPassBase<
+          ScheduleExecutionPass> {
   void runOnOperation() override {
     auto *context = &getContext();
     auto parentOp = getOperation();
@@ -349,18 +356,18 @@ public:
     for (auto op : context->getRegisteredOperations()) {
       op.getCanonicalizationPatterns(patterns, context);
     }
+
+    // Barriers are used only for analysis and can be removed as part of
+    // cleanup.
+    patterns.insert<RemoveBarriers>(context);
+
     FrozenRewritePatternSet frozenPatterns(std::move(patterns));
-    if (failed(applyPatternsAndFoldGreedily(getOperation(), frozenPatterns))) {
+    if (failed(applyPatternsGreedily(getOperation(), frozenPatterns))) {
       return signalPassFailure();
     }
   }
 };
 
 } // namespace
-
-std::unique_ptr<InterfacePass<CallableOpInterface>>
-createScheduleExecutionPass() {
-  return std::make_unique<ScheduleExecutionPass>();
-}
 
 } // namespace mlir::iree_compiler::IREE::Stream

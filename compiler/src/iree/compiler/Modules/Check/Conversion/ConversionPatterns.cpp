@@ -7,6 +7,7 @@
 #include "iree/compiler/Modules/Check/Conversion/ConversionPatterns.h"
 
 #include "iree/compiler/Dialect/HAL/Conversion/ConversionTarget.h"
+#include "iree/compiler/Dialect/HAL/Conversion/StreamToHAL/Utils.h"
 #include "iree/compiler/Dialect/HAL/Conversion/TypeConverter.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/VM/Conversion/ImportUtils.h"
@@ -68,7 +69,7 @@ static LogicalResult applyDefaultCheckBufferRewrite(
   state.addAttributes(srcOp->getAttrs());
 
   // Add device argument.
-  Value device = rewriter.create<IREE::HAL::ExSharedDeviceOp>(srcOp->getLoc());
+  Value device = lookupDeviceFor(srcOp, rewriter);
   state.addOperands({device});
 
   for (auto [srcOperand, dstOperand] :
@@ -78,7 +79,7 @@ static LogicalResult applyDefaultCheckBufferRewrite(
     // during development.
     assert(
         (!HALTypeConverter::shouldConvertToBufferView(srcOperand.getType()) ||
-         dstOperand.getType().isa<IREE::HAL::BufferViewType>()) &&
+         isa<IREE::HAL::BufferViewType>(dstOperand.getType())) &&
         "expect that tensors have been mapped to buffer views");
     state.addOperands({dstOperand});
   }

@@ -11,7 +11,6 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
@@ -59,7 +58,7 @@ static Value getByteOffsetForIndices(OpBuilder &builder, Location loc,
   }
   SmallVector<int64_t> strides;
   int64_t offset;
-  if (failed(getStridesAndOffset(memrefType, strides, offset)) ||
+  if (failed(memrefType.getStridesAndOffset(strides, offset)) ||
       strides[0] != 1) {
     emitError(loc, "expected memref stride 1");
     return {};
@@ -146,10 +145,9 @@ struct ConvertMemRefGlobalOp : public OpConversionPattern<memref::GlobalOp> {
     auto constantOp = initializerBuilder.create<IREE::Util::BufferConstantOp>(
         globalOp.getLoc(), /*name=*/nullptr, globalOp.getInitialValueAttr(),
         alignmentAttr, /*mimeType=*/nullptr);
-    initializerBuilder.create<IREE::Util::GlobalStoreOp>(
-        globalOp.getLoc(), constantOp.getResult(), newOp.getName());
-    initializerBuilder.create<IREE::Util::InitializerReturnOp>(
-        globalOp.getLoc());
+    newOp.createStoreOp(globalOp.getLoc(), constantOp.getResult(),
+                        initializerBuilder);
+    initializerBuilder.create<IREE::Util::ReturnOp>(globalOp.getLoc());
 
     return success();
   }

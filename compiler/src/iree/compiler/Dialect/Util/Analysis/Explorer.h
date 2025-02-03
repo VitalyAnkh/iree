@@ -37,6 +37,31 @@ enum class TraversalAction {
   IGNORE,
 };
 
+enum class TraversalBehavior : uint32_t {
+  // When traversing defining ops any tied result will move through its tied
+  // operand. When traversing uses any tied operand will move through its tied
+  // results (as many as are tied to the operand).
+  DEFAULT = 0u,
+  // Don't traverse through tied operands or results.
+  DONT_WALK_TIED_VALUES = 1 << 0u,
+};
+inline TraversalBehavior operator~(TraversalBehavior value) {
+  return static_cast<TraversalBehavior>(~static_cast<uint32_t>(value));
+}
+inline TraversalBehavior operator|(TraversalBehavior lhs,
+                                   TraversalBehavior rhs) {
+  return static_cast<TraversalBehavior>(static_cast<uint32_t>(lhs) |
+                                        static_cast<uint32_t>(rhs));
+}
+inline TraversalBehavior operator&(TraversalBehavior lhs,
+                                   TraversalBehavior rhs) {
+  return static_cast<TraversalBehavior>(static_cast<uint32_t>(lhs) &
+                                        static_cast<uint32_t>(rhs));
+}
+inline bool bitEnumContains(TraversalBehavior bits, TraversalBehavior bit) {
+  return (static_cast<uint32_t>(bits) & static_cast<uint32_t>(bit)) != 0;
+}
+
 // Boolean operations on TraversalResult behave as though `INCOMPLETE` is
 // truthy to allow for |='ing results.
 enum class TraversalResult {
@@ -88,8 +113,22 @@ public:
   // Returns the traversal action to perform for the given op.
   TraversalAction getTraversalAction(Operation *op);
 
+  // Registers a traversal action for ops with the given interface.
+  // Overrides the explorer default and can be overridden by dialect and op
+  // actions.
+  void setOpInterfaceAction(TypeID interfaceId, TraversalAction action);
+  template <typename InterfaceT>
+  void setOpInterfaceAction(TraversalAction action) {
+    setOpInterfaceAction(InterfaceT::getInterfaceID(), action);
+  }
+  template <typename InterfaceT, typename InterfaceT2, typename... InterfaceTs>
+  void setOpInterfaceAction(TraversalAction action) {
+    setOpInterfaceAction<InterfaceT>(action);
+    setOpInterfaceAction<InterfaceT2, InterfaceTs...>(action);
+  }
+
   // Registers a default action for all ops in the given dialect namespace.
-  // Individual op actions can override this.
+  // Overrides interface actions and individual op actions can override this.
   void setDialectAction(StringRef dialectNamespace, TraversalAction action);
   template <typename DialectT>
   void setDialectAction(TraversalAction action) {
@@ -102,7 +141,7 @@ public:
   }
 
   // Registers a traversal action for the given op, overriding the explorer
-  // default and any dialect action specified.
+  // default and any dialect or interface action specified.
   void setOpAction(OperationName op, TraversalAction action);
   template <typename OpT>
   void setOpAction(TraversalAction action) {
@@ -172,6 +211,17 @@ public:
   // Calls |fn| once for each global in the root.
   void forEachGlobal(std::function<void(const GlobalInfo *)> fn);
 
+  // Calls |fn| once for each initializer in the root in program order.
+  void forEachInitializer(
+      std::function<void(IREE::Util::InitializerOpInterface)> fn);
+
+  // Calls |fn| once for each non-initializer function-like op in the root.
+  void forEachFunction(std::function<void(FunctionOpInterface)> fn);
+
+  // Calls |fn| once for each initializer and then once for each function-like
+  // op in the root. Effectively just forEachInitializer + forEachFunction.
+  void forEachFunctionLikeOp(std::function<void(FunctionOpInterface)> fn);
+
   // Returns true if the two values _may_ alias each other via a tie or a join.
   // Conservative: returns true if value usage cannot be tracked.
   //
@@ -204,7 +254,15 @@ public:
   TraversalResult walk(OperationWalkFn fn);
 
   // Walks all unique SSA values nested within the root op.
-  TraversalResult walkValues(ValueWalkFn fn);
+  TraversalResult walkValues(ValueWalkFn fn) {
+    return walkAllValues(fn, std::nullopt);
+  }
+  // Walks all unique SSA values nested within the root op that have the given
+  // type.
+  template <typename OpT>
+  TraversalResult walkValuesOfType(ValueWalkFn fn) {
+    return walkAllValues(fn, OpT::getTypeID());
+  }
 
   // Walks all unique SSA values used/defined by |op| and all nested regions.
   TraversalResult walkValues(Operation *op, ValueWalkFn fn);
@@ -280,7 +338,9 @@ public:
   //  Walk %2: [%2 of producer.b]
   //  Walk @some_user::%arg0: [%0 of producer.a]
   //  Walk @some_user::ret0: [%2 of producer.b]
-  TraversalResult walkDefiningOps(Value value, ResultWalkFn fn);
+  TraversalResult
+  walkDefiningOps(Value value, ResultWalkFn fn,
+                  TraversalBehavior options = TraversalBehavior::DEFAULT);
 
   // Randomly walks uses of |value| and any transitive alias of |value|.
   // The uses may come from any part of the program.
@@ -301,13 +361,17 @@ public:
   //  Walk %arg0: [%arg0 of producer.a]
   //  Walk %0: [%0 of call @some_user, %arg0 of producer.b]
   //  Walk %2: [%2 of return, %1 of return]
-  TraversalResult walkTransitiveUses(Value value, UseWalkFn fn);
+  TraversalResult
+  walkTransitiveUses(Value value, UseWalkFn fn,
+                     TraversalBehavior options = TraversalBehavior::DEFAULT);
 
   // Randomly walks uses of |value| and any transitive alias of |value| and
   // returns each owner operation once. As a value may be used multiple times
   // by a single operation this is equivalent to a walkTransitiveUses with
   // deduplication on the owner of the use.
-  TraversalResult walkTransitiveUsers(Value value, OperationWalkFn fn);
+  TraversalResult
+  walkTransitiveUsers(Value value, OperationWalkFn fn,
+                      TraversalBehavior options = TraversalBehavior::DEFAULT);
 
 private:
   // Maps callee callable region -> call sites.
@@ -316,10 +380,13 @@ private:
   void initializeGlobalInfos();
   void initializeInverseCallGraph();
 
+  TraversalResult walkAllValues(ValueWalkFn fn, std::optional<TypeID> typeID);
+
   WalkResult recursiveWalk(Operation *parentOp, const OperationWalkFn &fn);
   WalkResult recursiveWalkValues(Operation *parentOp,
                                  DenseSet<Value> &visitedValues,
-                                 const ValueWalkFn &fn);
+                                 const ValueWalkFn &fn,
+                                 std::optional<TypeID> typeID = std::nullopt);
 
   Operation *rootOp = nullptr;
   AsmState asmState;
@@ -332,10 +399,12 @@ private:
   bool isCallGraphIncomplete = false;
 
   TraversalAction defaultAction;
+  DenseMap<TypeID, TraversalAction> interfaceActions;
   DenseMap<StringRef, TraversalAction> dialectActions;
   DenseMap<OperationName, TraversalAction> opActions;
 
-  DenseMap<Operation *, GlobalInfo> globalInfos;
+  DenseMap<Operation *, std::unique_ptr<GlobalInfo>> globalInfos;
+  DenseMap<StringRef, GlobalInfo *> globalInfosByName;
   ModuleAnalysisManager analysisManager;
 };
 

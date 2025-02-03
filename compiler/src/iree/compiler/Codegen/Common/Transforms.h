@@ -7,7 +7,6 @@
 #ifndef IREE_COMPILER_CODEGEN_COMMON_TRANSFORMS_H_
 #define IREE_COMPILER_CODEGEN_COMMON_TRANSFORMS_H_
 
-#include "iree-dialects/Dialect/LinalgExt/Transforms/Transforms.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Interfaces/BufferizationInterfaces.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
@@ -18,6 +17,25 @@ struct OneShotBufferizationOptions;
 } // namespace mlir::bufferization
 
 namespace mlir::iree_compiler {
+
+/// Common helper class for tracking lowering configs through pattern
+/// applications.
+class ConfigTrackingListener : public RewriterBase::Listener {
+public:
+  ConfigTrackingListener() = default;
+  void notifyOperationReplaced(Operation *op, ValueRange replacement) override;
+};
+
+using IGEMMConfigFn =
+    std::function<LogicalResult(linalg::GenericOp, IREE::LinalgExt::Im2colOp)>;
+using IGEMMControlFn = std::function<bool(Operation *)>;
+
+/// Converts conv_2d ops into linalg_ext.im2col + matmul, and sets a lowering
+/// configuration on the matmul.
+LogicalResult convertToIGEMMAndSetConfig(
+    FunctionOpInterface funcOp,
+    std::optional<IGEMMConfigFn> configFn = std::nullopt,
+    std::optional<IGEMMControlFn> controlFn = std::nullopt);
 
 /// Eliminates tensor.empty ops to avoid buffer allocations.
 LogicalResult eliminateEmptyTensors(
@@ -42,20 +60,38 @@ FailureOr<IREETileAndFuseResult>
 tileAndFuseDispatchUsingSCFForOp(RewriterBase &rewriter, TilingInterface op,
                                  linalg::LinalgTilingOptions tilingOptions);
 
-/// Populate patterns related to clean up the IR after tile and distribute to
-/// workgroups.
+/// Result of the tiled operation.
+struct IREETilingResult {
+  SmallVector<Operation *> tiledOps;
+  SmallVector<Value> tiledValues;
+  SmallVector<scf::ForOp> loops;
+  SmallVector<Value> workgroupCount;
+  // TODO(ravishankarm): Cleanup the following returns. We should not need
+  // these.
+  llvm::SmallBitVector tiledLoops;
+  SmallVector<OpFoldResult> tileOffsets;
+  SmallVector<OpFoldResult> tileSizes;
+};
+FailureOr<IREETilingResult>
+tileDispatchUsingSCFFopOp(RewriterBase &rewriter, TilingInterface op,
+                          linalg::LinalgTilingOptions options);
+
+/// Populate patterns related to clean up the IR after tile and distribute
+/// to workgroups.
 void populateTileAndDistributeToWorkgroupsCleanupPatterns(
-    RewritePatternSet &patterns, linalg::LinalgTilingOptions options);
+    RewritePatternSet &patterns);
 
 /// Populate IREE patterns related to resolving
 /// `memref.extract_strided_metadata`.
 void populateIREEResolveExtractStridedMetadataPatterns(
-    MLIRContext *context, RewritePatternSet &patterns);
+    RewritePatternSet &patterns);
 
 /// Populate patterns that replaces maximumf/minimumf with minumf/maxnumf ops.
 /// This is supposed to be used for targets which have faulty codegen
 /// for maximumf/minimumf ops, e.g. LLVM NVIDIA-PTX.
 void populateReplaceSlowMinMaxOpsPatterns(RewritePatternSet &patterns);
+
+void populateSwapExtractWithExpandPattern(RewritePatternSet &patterns);
 
 } // namespace mlir::iree_compiler
 

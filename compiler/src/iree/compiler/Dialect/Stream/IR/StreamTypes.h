@@ -11,7 +11,7 @@
 
 #include "iree/compiler/Dialect/Stream/IR/StreamDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
-#include "iree/compiler/Utils/IndexSet.h"
+#include "iree/compiler/Utils/IntegerSet.h"
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -27,37 +27,6 @@
 #include "iree/compiler/Dialect/Stream/IR/StreamEnums.h.inc" // IWYU pragma: export
 // clang-format on
 
-// It's unfortunate this is required.
-namespace mlir {
-
-template <>
-struct FieldParser<
-    std::optional<mlir::iree_compiler::IREE::Stream::CollectiveReductionOp>> {
-  static FailureOr<mlir::iree_compiler::IREE::Stream::CollectiveReductionOp>
-  parse(AsmParser &parser) {
-    std::string value;
-    if (parser.parseKeywordOrString(&value))
-      return failure();
-    auto result = mlir::iree_compiler::IREE::Stream::symbolizeEnum<
-        mlir::iree_compiler::IREE::Stream::CollectiveReductionOp>(value);
-    if (!result.has_value())
-      return failure();
-    return result.value();
-  }
-};
-static inline AsmPrinter &operator<<(
-    AsmPrinter &printer,
-    std::optional<mlir::iree_compiler::IREE::Stream::CollectiveReductionOp>
-        param) {
-  printer << (param.has_value()
-                  ? mlir::iree_compiler::IREE::Stream::stringifyEnum(
-                        param.value())
-                  : StringRef{""});
-  return printer;
-}
-
-} // namespace mlir
-
 namespace mlir::iree_compiler::IREE::Stream {
 class AffinityAttr;
 } // namespace mlir::iree_compiler::IREE::Stream
@@ -69,9 +38,7 @@ class AffinityAttr;
 
 #include "iree/compiler/Dialect/Stream/IR/StreamAttrInterfaces.h.inc" // IWYU pragma: export
 
-namespace mlir::iree_compiler::IREE::Stream {
 #include "iree/compiler/Dialect/Stream/IR/StreamTypeInterfaces.h.inc" // IWYU pragma: export
-} // namespace mlir::iree_compiler::IREE::Stream
 
 // clang-format off: must be included after all LLVM/MLIR headers.
 #define GET_TYPEDEF_CLASSES
@@ -86,9 +53,24 @@ struct AsyncAccessRange {
   Value start; // may be nullptr to indicate 0
   Value end;
   Value length;
+
+  // Returns true if the access is read-only.
+  bool isReadOnly() const { return access == ResourceAccessBitfield::Read; }
+
+  // Prints a textual representation of the range.
+  void print(llvm::raw_ostream &os, AsmState &asmState);
+
+  // Returns true if |lhs| and |rhs| may overlap and false only if it can be
+  // locally proven that they do not.
+  static bool mayOverlap(const AsyncAccessRange &lhs,
+                         const AsyncAccessRange &rhs);
 };
 
+} // namespace mlir::iree_compiler::IREE::Stream
+
 #include "iree/compiler/Dialect/Stream/IR/StreamOpInterfaces.h.inc" // IWYU pragma: export
+
+namespace mlir::iree_compiler::IREE::Stream {
 
 //===----------------------------------------------------------------------===//
 // custom<ParameterReference>($scope, $key)

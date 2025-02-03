@@ -14,10 +14,35 @@ iree_lit_test_suite(
   NAME
     lit
   SRCS
+    "config_ukernel_argmax_gfx908.mlir"
+    "config_ukernel_argmax_gfx942.mlir"
+    "config_ukernel_multi_mma_gfx942.mlir"
+    "default_tuning_specs_amdgpu.mlir"
+    "lowering_strategy_from_tuning_spec.mlir"
+    "ukernel_pipeline_transform.mlir"
+  TOOLS
+    FileCheck
+    iree-opt
+  DATA
+    tuning_spec_mmt_tile_and_fuse.mlir
+)
+
+### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###
+
+# NOTE: The following tests are CMake-only because they depend on AMD device
+# bitcode libraries that are provided by custom CMake code in target/ROCM.
+# By contrast, the above tests that only require ukernel bitcode are part of the
+# Bazel build because ukernel bitcode is something that we generate ourselves.
+
+iree_lit_test_suite(
+  NAME
+    lit
+  SRCS
+    "external_function_validation.mlir"
+    "gisel_abort.mlir"
     "smoketest.mlir"
+    "target_device_features.mlir"
   TOOLS
     FileCheck
     iree-opt
 )
-
-### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###

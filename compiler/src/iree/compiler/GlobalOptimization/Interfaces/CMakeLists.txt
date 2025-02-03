@@ -18,20 +18,21 @@ iree_cc_library(
   SRCS
     "Interfaces.cpp"
   DEPS
-    ::HoistableTypeInterface
+    ::HoistableInterfaces
     MLIRIR
   PUBLIC
 )
 
 iree_cc_library(
   NAME
-    HoistableTypeInterface
+    HoistableInterfaces
   HDRS
     "HoistableTypeInterface.h"
   SRCS
     "HoistableTypeInterface.cpp"
   DEPS
     LLVMSupport
+    MLIRArithDialect
     MLIRIR
     iree::compiler::Dialect::Flow::IR
     iree::compiler::Dialect::Util::IR

@@ -52,6 +52,24 @@ def Util_ClosureOpInterface : OpInterface<"ClosureOpInterface"> {
     >,
     InterfaceMethod<
       /*desc=*/[{
+        Returns the value captured by the closure operands or the provided value
+        if it was not captured.
+      }],
+      /*retTy=*/"Value",
+      /*methodName=*/"getClosureCapturedValue",
+      /*args=*/(ins "Value":$closureValue),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        if (auto arg = dyn_cast<BlockArgument>(closureValue)) {
+          if (arg.getParentRegion() == &$_op.getClosureBodyRegion()) {
+            return $_op.getClosureOperands()[arg.getArgNumber()];
+          }
+        }
+        return closureValue;
+      }]
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
         Returns true if the given operation can exist in the closure.
         Not all operations that a closure can contain are guaranteed to be folded
         into the closure, such as when the operation may have side-effects.
@@ -91,6 +109,32 @@ def Util_ClosureOpInterface : OpInterface<"ClosureOpInterface"> {
       /*methodName=*/"getResultAccess",
       /*args=*/(ins "unsigned":$resultIndex)
     >,
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// IREE::Util::InferIntDivisibilityOpInterface
+//===----------------------------------------------------------------------===//
+
+def InferIntDivisibilityOpInterface :
+    OpInterface<"InferIntDivisibilityOpInterface"> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::Util";
+
+  let description = [{
+    Allows operations to participate in integer divisibility analysis.
+  }];
+
+  let methods = [
+    InterfaceMethod<
+    /*desc=*/[{
+
+    }],
+    /*retTy=*/"void",
+    /*methodName=*/"inferResultDivisibility",
+    /*args=*/(ins
+        "::llvm::ArrayRef<::mlir::iree_compiler::IREE::Util::IntegerDivisibility>":$argDivs,
+        "::mlir::iree_compiler::IREE::Util::SetIntDivisibilityFn":$setResultDivs)
+    >
   ];
 }
 
@@ -150,7 +194,8 @@ def Util_GlobalOpInterface : OpInterface<"GlobalOpInterface"> {
         // Assumed by accessors:
         TypeAttr:$type,
         UnitAttr:$is_mutable,
-        OptionalAttr<AnyAttr>:$initial_value
+        OptionalAttr<AnyAttr>:$initial_value,
+        OptionalAttr<Util_InliningPolicyAttrInterface>:$inlining_policy
       );
     ```
   }];
@@ -267,6 +312,50 @@ def Util_GlobalOpInterface : OpInterface<"GlobalOpInterface"> {
         }
       }]
     >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns an optional inlining policy for the global.
+      }],
+      /*retTy=*/"IREE::Util::InliningPolicyAttrInterface",
+      /*methodName=*/"getGlobalInliningPolicy",
+      /*args=*/(ins),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        return $_op.getInliningPolicyAttr();
+      }]
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Sets (or clears) the inlining policy of the global.
+      }],
+      /*retTy=*/"void",
+      /*methodName=*/"setGlobalInliningPolicy",
+      /*args=*/(ins "IREE::Util::InliningPolicyAttrInterface":$value),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        if (value) {
+          $_op.setInliningPolicyAttr(value);
+        } else {
+          $_op.removeInliningPolicyAttr();
+        }
+      }]
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Creates an operation loading the value of the global.
+      }],
+      /*retTy=*/"IREE::Util::GlobalLoadOpInterface",
+      /*methodName=*/"createLoadOp",
+      /*args=*/(ins "Location":$loc, "OpBuilder &":$builder)
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Creates an operation storing the value of the global.
+      }],
+      /*retTy=*/"IREE::Util::GlobalStoreOpInterface",
+      /*methodName=*/"createStoreOp",
+      /*args=*/(ins "Location":$loc, "Value":$value, "OpBuilder &":$builder)
+    >,
   ];
 
   let verify = [{
@@ -320,6 +409,35 @@ def Util_GlobalAddressOpInterface : Util_GlobalAccessorOpInterface<"GlobalAddres
         return $_op->getResult(0);
       }]
     >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns true if the global whose address is taken is immutable outside
+        of initializers.
+      }],
+      /*retTy=*/"bool",
+      /*methodName=*/"isGlobalImmutable",
+      /*args=*/(ins),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        return $_op.getIsImmutable();
+      }]
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Sets whether the global is immutable outside of initializers.
+      }],
+      /*retTy=*/"void",
+      /*methodName=*/"setGlobalImmutable",
+      /*args=*/(ins "bool":$value),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        if (value) {
+          $_op.setIsImmutableAttr(UnitAttr::get($_op.getContext()));
+        } else {
+          $_op.removeIsImmutableAttr();
+        }
+      }]
+    >,
   ];
 }
 
@@ -357,6 +475,34 @@ def Util_GlobalLoadOpInterface : Util_GlobalAccessorOpInterface<"GlobalLoadOpInt
         return $_op->getResult(0);
       }]
     >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns true if the global loaded is immutable outside of initializers.
+      }],
+      /*retTy=*/"bool",
+      /*methodName=*/"isGlobalImmutable",
+      /*args=*/(ins),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        return $_op.getIsImmutable();
+      }]
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Sets whether the global is immutable outside of initializers.
+      }],
+      /*retTy=*/"void",
+      /*methodName=*/"setGlobalImmutable",
+      /*args=*/(ins "bool":$value),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        if (value) {
+          $_op.setIsImmutableAttr(UnitAttr::get($_op.getContext()));
+        } else {
+          $_op.removeIsImmutableAttr();
+        }
+      }]
+    >,
   ];
 }
 
@@ -392,6 +538,18 @@ def Util_GlobalStoreOpInterface : Util_GlobalAccessorOpInterface<"GlobalStoreOpI
       /*methodBody=*/[{}],
       /*defaultImplementation=*/[{
         return $_op.getValue();
+      }]
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Sets the value stored by the operation.
+      }],
+      /*retTy=*/"void",
+      /*methodName=*/"setStoredGlobalValue",
+      /*args=*/(ins "Value":$value),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        return $_op.getValueMutable().assign(value);
       }]
     >,
   ];
@@ -454,6 +612,18 @@ def Util_GlobalStoreIndirectOpInterface : Util_GlobalIndirectAccessorOpInterface
       /*methodBody=*/[{}],
       /*defaultImplementation=*/[{
         return $_op.getValue();
+      }]
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Sets the value stored by the operation.
+      }],
+      /*retTy=*/"void",
+      /*methodName=*/"setStoredGlobalValue",
+      /*args=*/(ins "Value":$value),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        return $_op.getValueMutable().assign(value);
       }]
     >,
   ];
@@ -597,6 +767,17 @@ def Util_TiedOpInterface : OpInterface<"TiedOpInterface"> {
   let methods = [
     InterfaceMethod<
       /*desc=*/[{
+      }],
+      /*retTy=*/"void",
+      /*methodName=*/"getAllTiedOperands",
+      /*args=*/(ins "SmallVectorImpl<int64_t> &":$indices),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        IREE::Util::detail::getAllTiedOperands($_op, indices);
+      }]
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
         Returns the set of operands that results may be tied to as an
         (index, length) pair ala getODSOperandIndexAndLength.
 
@@ -607,8 +788,9 @@ def Util_TiedOpInterface : OpInterface<"TiedOpInterface"> {
         of successor operands.
       }],
       /*retTy=*/"std::pair<unsigned, unsigned>",
-      /*methodName=*/"getTiedOperandsIndexAndLength", (ins),
-      /*args=*/[{}],
+      /*methodName=*/"getTiedOperandsIndexAndLength",
+      /*args=*/(ins),
+      /*methodBody=*/[{}],
       /*defaultImplementation=*/[{
         return {0, $_op->getNumOperands()};
       }]
@@ -623,8 +805,9 @@ def Util_TiedOpInterface : OpInterface<"TiedOpInterface"> {
         ones it will tie.
       }],
       /*retTy=*/"std::pair<unsigned, unsigned>",
-      /*methodName=*/"getTiedResultsIndexAndLength", (ins),
-      /*args=*/[{}],
+      /*methodName=*/"getTiedResultsIndexAndLength",
+      /*args=*/(ins),
+      /*methodBody=*/[{}],
       /*defaultImplementation=*/[{
         return {0, $_op->getNumResults()};
       }]
@@ -658,7 +841,7 @@ def Util_TiedOpInterface : OpInterface<"TiedOpInterface"> {
       /*args=*/(ins "Value":$result),
       /*methodBody=*/[{}],
       /*defaultImplementation=*/[{
-        auto resultIndex = result.cast<mlir::OpResult>().getResultNumber();
+        auto resultIndex = cast<mlir::OpResult>(result).getResultNumber();
         auto operandIndex = cast<TiedOpInterface>($_op.getOperation())
             .getTiedResultOperandIndex(resultIndex);
         return operandIndex.has_value() ?
@@ -836,7 +1019,7 @@ def Util_ShapeAwareOp : OpInterface<"ShapeAwareOpInterface"> {
       /*methodBody=*/[{
         auto shapeAwareOp = dyn_cast<IREE::Util::ShapeAwareOpInterface>(result.getDefiningOp());
         return shapeAwareOp.buildResultShape(
-            result.cast<mlir::OpResult>().getResultNumber(), builder);
+            cast<mlir::OpResult>(result).getResultNumber(), builder);
       }]
     >,
   ];
@@ -976,7 +1159,7 @@ def Util_GlobalType : TypeInterface<"GlobalTypeInterface"> {
       /*defaultImplementation=*/[{
         // If one is a shaped type, then they both must be and have compatible
         // shapes.
-        if ($_type.template isa<ShapedType>() || accessType.isa<ShapedType>()) {
+        if (isa<ShapedType>($_type) || isa<ShapedType>(accessType)) {
           return succeeded(mlir::verifyCompatibleShape($_type, accessType));
         }
         // Otherwise, the types must be the same.
@@ -987,8 +1170,112 @@ def Util_GlobalType : TypeInterface<"GlobalTypeInterface"> {
 }
 
 //===----------------------------------------------------------------------===//
-// IREE::Util::HoistableTypeInterface
+// IREE::Util::Hoistable*Interface
 //===----------------------------------------------------------------------===//
+
+def Util_HoistableAttrInterface : AttrInterface<"HoistableAttrInterface"> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::Util";
+
+  let description = [{
+    Interface used to control hoisting of dialect attributes associated with
+    ops that are hoisted. Attributes implementing this interface can opt into
+    being replicated onto the global and initializer produced during hoisting.
+
+    Hoisting will walk up ancestors of hoisted ops to see if any contain
+    attributes with this interface to allow context-scoped behavior such as
+    target execution environment for a function.
+  }];
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns true if dialect attributes of this type are replicated to the
+        global and initializer created during hoisting.
+      }],
+      /*retTy=*/"bool",
+      /*methodName=*/"shouldAttachToHoistedOps",
+      /*args=*/(ins),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        return true;
+      }]
+    >,
+  ];
+
+  let extraClassDeclaration = [{
+    // Walks |fromOp| and up to gather all dialect attributes that want to be
+    // hoisted along with it. If the same named attribute is present on multiple
+    // ancestors only the most narrowly scoped value will be used.
+    static void gatherHoistableAttrs(Operation *fromOp,
+                                     NamedAttrList &dialectAttrs);
+
+    // Copies any hoistable attributes from the source op to the target op.
+    static void gatherHoistableAttrs(Operation *fromOp, Operation *toOp);
+  }];
+}
+
+def Util_HoistableOpInterface : OpInterface<"HoistableOpInterface"> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::Util";
+
+  let description = [{
+    Interface used to control hoisting of ops into globals.
+  }];
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns true if this op is valid to hoist as a transient value in the
+        global initializer.
+      }],
+      /*retTy=*/"bool",
+      /*methodName=*/"isHoistableOp",
+      /*args=*/(ins),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        return true;
+      }]
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns true if this op is valid to hoist as a leaf value in the
+        global initializer.
+      }],
+      /*retTy=*/"bool",
+      /*methodName=*/"isHoistableLeafOp",
+      /*args=*/(ins),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        return true;
+      }]
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns true if this op is should be treated as atomic from the
+        perspective of the hoisting analysis. This causes all nested ops to
+        share hoistability with this op.
+      }],
+      /*retTy=*/"bool",
+      /*methodName=*/"isAtomicallyHoistableOp",
+      /*args=*/(ins),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        return false;
+      }]
+    >,
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns true if the operand for this op is hoistable.
+      }],
+      /*retTy=*/"bool",
+      /*methodName=*/"isOperandHoistable",
+      /*args=*/(ins "OpOperand *":$operand),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        return true;
+      }]
+    >,
+  ];
+}
 
 def Util_HoistableType : TypeInterface<"HoistableTypeInterface"> {
   let cppNamespace = "::mlir::iree_compiler::IREE::Util";
@@ -1199,6 +1486,35 @@ def Util_SubrangeOperandOpInterface : OpInterface<"SubrangeOperandOpInterface"> 
 }
 
 //===----------------------------------------------------------------------===//
+// IREE::Util::InliningPolicyAttrInterface
+//===----------------------------------------------------------------------===//
+
+def Util_InliningPolicyAttrInterface : AttrInterface<"InliningPolicyAttrInterface"> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::Util";
+
+  let description = [{
+    Interface allowing attributes to control the inlining behavior of functions
+    and globals they are associated with.
+  }];
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns true if the inlinable operation (function, global, etc) is
+        allowed to be inlined into the inline site (caller, accessor, etc).
+      }],
+      /*retTy=*/"bool",
+      /*methodName=*/"isLegalToInline",
+      /*args=*/(ins
+        "Operation *":$inlineSite,
+        "Operation *":$inlinable
+      ),
+      /*methodBody=*/[{}]
+    >,
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // IREE::Util::SerializableAttrInterface
 //===----------------------------------------------------------------------===//
 
@@ -1271,6 +1587,13 @@ def Util_SerializableAttrInterface :
       }]
     >,
   ];
+
+  let extraClassDeclaration = [{
+    // Serializes |count| copies of |elementAttr| to |os|.
+    static LogicalResult serializeSplatValue(
+        Location loc, Attribute elementAttr, int64_t count,
+        llvm::endianness endian, llvm::raw_ostream &os);
+  }];
 }
 
 #endif  // IREE_DIALECT_UTIL_IR_UTIL_INTERFACES

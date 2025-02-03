@@ -7,7 +7,6 @@
 #include "iree/hal/utils/file_transfer.h"
 
 #include "iree/base/internal/math.h"
-#include "iree/hal/utils/memory_file.h"
 
 //===----------------------------------------------------------------------===//
 // Configuration
@@ -39,8 +38,6 @@
 //===----------------------------------------------------------------------===//
 // iree_hal_transfer_operation_t
 //===----------------------------------------------------------------------===//
-
-// TODO(benvanik): move to utils/ without relying on iree_hal_memory_file_t.
 
 // Maximum number of transfer workers that can be used; common usage should be
 // 1-4 but on very large systems with lots of bandwidth we may be able to
@@ -242,8 +239,8 @@ static iree_status_t iree_hal_transfer_operation_create(
   // steps are part of this transfer.
   IREE_TRACE({
     static iree_atomic_int32_t next_trace_id = IREE_ATOMIC_VAR_INIT(0);
-    operation->trace_id = iree_atomic_fetch_add_int32(
-        &next_trace_id, 1, iree_memory_order_seq_cst);
+    operation->trace_id =
+        iree_atomic_fetch_add(&next_trace_id, 1, iree_memory_order_seq_cst);
     IREE_TRACE_ZONE_APPEND_VALUE_I64(z0, operation->trace_id);
   });
 
@@ -279,6 +276,7 @@ static iree_status_t iree_hal_transfer_operation_create(
     // Create semaphore for tracking worker progress.
     worker->pending_timepoint = 0ull;
     status = iree_hal_semaphore_create(device, worker->pending_timepoint,
+                                       IREE_HAL_SEMAPHORE_FLAG_NONE,
                                        &worker->semaphore);
     if (!iree_status_is_ok(status)) break;
   }
@@ -523,7 +521,8 @@ static iree_status_t iree_hal_transfer_worker_copy_file_to_buffer(
         operation->device, operation->queue_affinity, wait_semaphore_list,
         signal_semaphore_list, operation->staging_buffer,
         worker->staging_buffer_offset, operation->buffer,
-        operation->buffer_offset + transfer_offset, transfer_length);
+        operation->buffer_offset + transfer_offset, transfer_length,
+        IREE_HAL_COPY_FLAG_NONE);
   }
 
   // Wait for the copy to complete and tick again if we expect there to be more
@@ -687,7 +686,7 @@ static iree_status_t iree_hal_transfer_worker_copy_buffer_to_staging(
       operation->device, operation->queue_affinity, wait_semaphore_list,
       signal_semaphore_list, operation->buffer,
       operation->buffer_offset + transfer_offset, operation->staging_buffer,
-      worker->staging_buffer_offset, transfer_length);
+      worker->staging_buffer_offset, transfer_length, IREE_HAL_COPY_FLAG_NONE);
 
   // Wait for the copy to complete so we can write it to the file.
   if (iree_status_is_ok(status)) {
@@ -859,7 +858,7 @@ IREE_API_EXPORT iree_status_t iree_hal_device_queue_read_streaming(
     const iree_hal_semaphore_list_t signal_semaphore_list,
     iree_hal_file_t* source_file, uint64_t source_offset,
     iree_hal_buffer_t* target_buffer, iree_device_size_t target_offset,
-    iree_device_size_t length, uint32_t flags,
+    iree_device_size_t length, iree_hal_read_flags_t flags,
     iree_hal_file_transfer_options_t options) {
   IREE_RETURN_IF_ERROR(
       iree_hal_file_validate_access(source_file, IREE_HAL_MEMORY_ACCESS_READ));
@@ -871,7 +870,16 @@ IREE_API_EXPORT iree_status_t iree_hal_device_queue_read_streaming(
     return iree_hal_device_queue_copy(
         device, queue_affinity, wait_semaphore_list, signal_semaphore_list,
         storage_buffer, (iree_device_size_t)source_offset, target_buffer,
-        target_offset, length);
+        target_offset, length, IREE_HAL_COPY_FLAG_NONE);
+  }
+
+  // This host-side transfer utility requires synchronous I/O.
+  // HAL implementations are expected to handle asynchronous files themselves.
+  if (!iree_hal_file_supports_synchronous_io(source_file)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "provided source file does not support synchronous I/O and cannot be "
+        "used with streaming file transfer");
   }
 
   // Allocate full transfer operation.
@@ -899,7 +907,7 @@ IREE_API_EXPORT iree_status_t iree_hal_device_queue_write_streaming(
     const iree_hal_semaphore_list_t signal_semaphore_list,
     iree_hal_buffer_t* source_buffer, iree_device_size_t source_offset,
     iree_hal_file_t* target_file, uint64_t target_offset,
-    iree_device_size_t length, uint32_t flags,
+    iree_device_size_t length, iree_hal_write_flags_t flags,
     iree_hal_file_transfer_options_t options) {
   // EXPERIMENTAL: assume memory files only today (as that's all we have).
   IREE_RETURN_IF_ERROR(
@@ -912,7 +920,16 @@ IREE_API_EXPORT iree_status_t iree_hal_device_queue_write_streaming(
     return iree_hal_device_queue_copy(
         device, queue_affinity, wait_semaphore_list, signal_semaphore_list,
         source_buffer, source_offset, storage_buffer,
-        (iree_device_size_t)target_offset, length);
+        (iree_device_size_t)target_offset, length, IREE_HAL_COPY_FLAG_NONE);
+  }
+
+  // This host-side transfer utility requires synchronous I/O.
+  // HAL implementations are expected to handle asynchronous files themselves.
+  if (!iree_hal_file_supports_synchronous_io(target_file)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "provided target file does not support synchronous I/O and cannot be "
+        "used with streaming file transfer");
   }
 
   // Allocate full transfer operation.

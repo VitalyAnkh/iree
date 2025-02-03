@@ -7,7 +7,8 @@
 #include "iree/hal/drivers/cuda/memory_pools.h"
 
 #include "iree/hal/drivers/cuda/cuda_buffer.h"
-#include "iree/hal/drivers/cuda/status_util.h"
+#include "iree/hal/drivers/cuda/cuda_dynamic_symbols.h"
+#include "iree/hal/drivers/cuda/cuda_status_util.h"
 
 // NOTE: these are currently global for all devices; we could make
 // device-specific ones by malloc() and leaking (with LSAN note) unique string
@@ -20,7 +21,7 @@ static const char* IREE_HAL_CUDA_OTHER_POOL_RESERVED_ID =
 #endif  // IREE_TRACING_FEATURE_ALLOCATION_TRACKING
 
 static iree_status_t iree_hal_cuda_create_memory_pool(
-    iree_hal_cuda_context_wrapper_t* context,
+    const iree_hal_cuda_dynamic_symbols_t* cuda_symbols, CUdevice cu_device,
     iree_hal_cuda_memory_pool_params_t params,
     CUmemoryPool* IREE_RESTRICT out_pool) {
   *out_pool = NULL;
@@ -32,18 +33,18 @@ static iree_status_t iree_hal_cuda_create_memory_pool(
       .location =
           {
               .type = CU_MEM_LOCATION_TYPE_DEVICE,
-              .id = context->cu_device,
+              .id = cu_device,
           },
       .win32SecurityAttributes = NULL,
       .reserved = {0},
   };
 
   CUmemoryPool pool = NULL;
-  CUDA_RETURN_IF_ERROR(context->syms, cuMemPoolCreate(&pool, &pool_props),
-                       "cuMemPoolCreate");
+  IREE_CUDA_RETURN_IF_ERROR(cuda_symbols, cuMemPoolCreate(&pool, &pool_props),
+                            "cuMemPoolCreate");
 
-  iree_status_t status = CU_RESULT_TO_STATUS(
-      context->syms,
+  iree_status_t status = IREE_CURESULT_TO_STATUS(
+      cuda_symbols,
       cuMemPoolSetAttribute(pool, CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
                             &params.release_threshold),
       "cuMemPoolSetAttribute");
@@ -51,33 +52,39 @@ static iree_status_t iree_hal_cuda_create_memory_pool(
   if (iree_status_is_ok(status)) {
     *out_pool = pool;
   } else {
-    CUDA_IGNORE_ERROR(context->syms, cuMemPoolDestroy(pool));
+    IREE_CUDA_IGNORE_ERROR(cuda_symbols, cuMemPoolDestroy(pool));
   }
   return status;
 }
 
 iree_status_t iree_hal_cuda_memory_pools_initialize(
-    iree_hal_cuda_context_wrapper_t* context,
+    iree_hal_device_t* parent_device,
+    const iree_hal_cuda_dynamic_symbols_t* cuda_symbols, CUdevice cu_device,
     const iree_hal_cuda_memory_pooling_params_t* pooling_params,
+    iree_allocator_t host_allocator,
     iree_hal_cuda_memory_pools_t* IREE_RESTRICT out_pools) {
-  IREE_ASSERT_ARGUMENT(context);
+  IREE_ASSERT_ARGUMENT(parent_device);
+  IREE_ASSERT_ARGUMENT(cuda_symbols);
   IREE_ASSERT_ARGUMENT(pooling_params);
   IREE_ASSERT_ARGUMENT(out_pools);
   IREE_TRACE_ZONE_BEGIN(z0);
 
   memset(out_pools, 0, sizeof(*out_pools));
-  out_pools->context = context;
+  out_pools->parent_device = parent_device;
+  out_pools->cuda_symbols = cuda_symbols;
+  out_pools->host_allocator = host_allocator;
 
   iree_status_t status = iree_ok_status();
 
   if (iree_status_is_ok(status)) {
-    status = iree_hal_cuda_create_memory_pool(
-        context, pooling_params->device_local, &out_pools->device_local);
+    status = iree_hal_cuda_create_memory_pool(cuda_symbols, cu_device,
+                                              pooling_params->device_local,
+                                              &out_pools->device_local);
   }
 
   if (iree_status_is_ok(status)) {
-    status = iree_hal_cuda_create_memory_pool(context, pooling_params->other,
-                                              &out_pools->other);
+    status = iree_hal_cuda_create_memory_pool(
+        cuda_symbols, cu_device, pooling_params->other, &out_pools->other);
   }
 
   IREE_TRACE_ZONE_END(z0);
@@ -89,13 +96,13 @@ void iree_hal_cuda_memory_pools_deinitialize(
   IREE_TRACE_ZONE_BEGIN(z0);
 
   if (pools->device_local) {
-    CUDA_IGNORE_ERROR(pools->context->syms,
-                      cuMemPoolDestroy(pools->device_local));
+    IREE_CUDA_IGNORE_ERROR(pools->cuda_symbols,
+                           cuMemPoolDestroy(pools->device_local));
     pools->device_local = NULL;
   }
 
   if (pools->other) {
-    CUDA_IGNORE_ERROR(pools->context->syms, cuMemPoolDestroy(pools->other));
+    IREE_CUDA_IGNORE_ERROR(pools->cuda_symbols, cuMemPoolDestroy(pools->other));
     pools->other = NULL;
   }
 
@@ -117,8 +124,8 @@ static void iree_hal_cuda_memory_pool_track_alloc(
     iree_atomic_int64_t* bytes_allocated =
         is_device_local ? &pools->statistics.device_bytes_allocated
                         : &pools->statistics.host_bytes_allocated;
-    iree_atomic_fetch_add_int64(bytes_allocated, allocation_size,
-                                iree_memory_order_relaxed);
+    iree_atomic_fetch_add(bytes_allocated, allocation_size,
+                          iree_memory_order_relaxed);
   });
 }
 
@@ -137,8 +144,8 @@ static void iree_hal_cuda_memory_pool_track_free(
                         : &pools->statistics.host_bytes_freed;
     iree_device_size_t allocation_size =
         iree_hal_buffer_allocation_size(buffer);
-    iree_atomic_fetch_add_int64(bytes_freed, allocation_size,
-                                iree_memory_order_relaxed);
+    iree_atomic_fetch_add(bytes_freed, allocation_size,
+                          iree_memory_order_relaxed);
   });
 }
 
@@ -146,26 +153,26 @@ void iree_hal_cuda_memory_pools_merge_statistics(
     iree_hal_cuda_memory_pools_t* pools,
     iree_hal_allocator_statistics_t* statistics) {
   IREE_STATISTICS({
-    statistics->device_bytes_allocated = iree_atomic_load_int64(
+    statistics->device_bytes_allocated = iree_atomic_load(
         &pools->statistics.device_bytes_allocated, iree_memory_order_relaxed);
-    statistics->host_bytes_allocated = iree_atomic_load_int64(
+    statistics->host_bytes_allocated = iree_atomic_load(
         &pools->statistics.host_bytes_allocated, iree_memory_order_relaxed);
-    statistics->device_bytes_freed = iree_atomic_load_int64(
+    statistics->device_bytes_freed = iree_atomic_load(
         &pools->statistics.device_bytes_freed, iree_memory_order_relaxed);
-    statistics->host_bytes_freed = iree_atomic_load_int64(
+    statistics->host_bytes_freed = iree_atomic_load(
         &pools->statistics.host_bytes_freed, iree_memory_order_relaxed);
     if (pools->device_local) {
       cuuint64_t pool_peak = 0;
-      CUDA_IGNORE_ERROR(
-          pools->context->syms,
+      IREE_CUDA_IGNORE_ERROR(
+          pools->cuda_symbols,
           cuMemPoolGetAttribute(pools->device_local,
                                 CU_MEMPOOL_ATTR_USED_MEM_HIGH, &pool_peak));
       statistics->device_bytes_peak += (iree_device_size_t)pool_peak;
     }
     if (pools->other) {
       cuuint64_t pool_peak = 0;
-      CUDA_IGNORE_ERROR(
-          pools->context->syms,
+      IREE_CUDA_IGNORE_ERROR(
+          pools->cuda_symbols,
           cuMemPoolGetAttribute(pools->other, CU_MEMPOOL_ATTR_USED_MEM_HIGH,
                                 &pool_peak));
       statistics->host_bytes_peak += (iree_device_size_t)pool_peak;
@@ -176,13 +183,13 @@ void iree_hal_cuda_memory_pools_merge_statistics(
 iree_status_t iree_hal_cuda_memory_pools_trim(
     iree_hal_cuda_memory_pools_t* pools,
     const iree_hal_cuda_memory_pooling_params_t* pooling_params) {
-  CUDA_RETURN_IF_ERROR(
-      pools->context->syms,
+  IREE_CUDA_RETURN_IF_ERROR(
+      pools->cuda_symbols,
       cuMemPoolTrimTo(pools->device_local,
                       pooling_params->device_local.minimum_capacity),
       "cuMemPoolTrimTo");
-  CUDA_RETURN_IF_ERROR(
-      pools->context->syms,
+  IREE_CUDA_RETURN_IF_ERROR(
+      pools->cuda_symbols,
       cuMemPoolTrimTo(pools->other, pooling_params->other.minimum_capacity),
       "cuMemPoolTrimTo");
   return iree_ok_status();
@@ -198,7 +205,7 @@ static void iree_hal_cuda_async_buffer_release_callback(
   IREE_TRACE_ZONE_BEGIN(z0);
 
   CUdeviceptr device_ptr = iree_hal_cuda_buffer_device_pointer(buffer);
-  CUDA_IGNORE_ERROR(pools->context->syms, cuMemFree(device_ptr));
+  IREE_CUDA_IGNORE_ERROR(pools->cuda_symbols, cuMemFree(device_ptr));
   iree_hal_cuda_memory_pool_track_free(pools, buffer);
 
   IREE_TRACE_ZONE_END(z0);
@@ -225,8 +232,8 @@ iree_status_t iree_hal_cuda_memory_pools_alloca(
           : pools->other;
 
   CUdeviceptr device_ptr = 0;
-  iree_status_t status = CU_RESULT_TO_STATUS(
-      pools->context->syms,
+  iree_status_t status = IREE_CURESULT_TO_STATUS(
+      pools->cuda_symbols,
       cuMemAllocFromPoolAsync(&device_ptr, (size_t)allocation_size, memory_pool,
                               stream),
       "cuMemAllocFromPoolAsync");
@@ -237,16 +244,22 @@ iree_status_t iree_hal_cuda_memory_pools_alloca(
   // doesn't dealloca the buffer.
   iree_hal_buffer_t* buffer = NULL;
   if (iree_status_is_ok(status)) {
+    const iree_hal_buffer_placement_t placement = {
+        .device = pools->parent_device,
+        .queue_affinity = params.queue_affinity ? params.queue_affinity
+                                                : IREE_HAL_QUEUE_AFFINITY_ANY,
+        .flags = IREE_HAL_BUFFER_PLACEMENT_FLAG_ASYNCHRONOUS,
+    };
     iree_hal_buffer_release_callback_t release_callback = {
         .fn = iree_hal_cuda_async_buffer_release_callback,
         .user_data = pools,
     };
     status = iree_hal_cuda_buffer_wrap(
-        /*device_allocator=*/NULL, params.type, params.access, params.usage,
-        allocation_size, /*byte_offset=*/0,
+        placement, params.type, params.access, params.usage, allocation_size,
+        /*byte_offset=*/0,
         /*byte_length=*/allocation_size, IREE_HAL_CUDA_BUFFER_TYPE_ASYNC,
-        device_ptr, /*host_ptr=*/NULL, release_callback,
-        pools->context->host_allocator, &buffer);
+        device_ptr, /*host_ptr=*/NULL, release_callback, pools->host_allocator,
+        &buffer);
   }
 
   if (iree_status_is_ok(status)) {
@@ -256,7 +269,8 @@ iree_status_t iree_hal_cuda_memory_pools_alloca(
   } else if (buffer) {
     iree_hal_buffer_release(buffer);
   } else {
-    CUDA_IGNORE_ERROR(pools->context->syms, cuMemFreeAsync(device_ptr, stream));
+    IREE_CUDA_IGNORE_ERROR(pools->cuda_symbols,
+                           cuMemFreeAsync(device_ptr, stream));
   }
 
   IREE_TRACE_ZONE_END(z0);
@@ -278,16 +292,14 @@ iree_status_t iree_hal_cuda_memory_pools_dealloca(
   if (iree_hal_cuda_buffer_type(buffer) == IREE_HAL_CUDA_BUFFER_TYPE_ASYNC) {
     // Try to schedule the buffer for freeing.
     CUdeviceptr device_ptr = iree_hal_cuda_buffer_device_pointer(buffer);
-    status = CU_RESULT_TO_STATUS(pools->context->syms,
-                                 cuMemFreeAsync(device_ptr, stream),
-                                 "cuMemFreeAsync");
+    status = IREE_CURESULT_TO_STATUS(pools->cuda_symbols,
+                                     cuMemFreeAsync(device_ptr, stream),
+                                     "cuMemFreeAsync");
     if (iree_status_is_ok(status)) {
       // Drop the release callback so that we don't try to double-free the
       // buffer. Note that we only do this if the CUDA free succeeded as
       // otherwise we still need to synchronously deallocate the buffer when it
       // is destroyed.
-      // Drop the release callback so that we don't try to double-free the
-      // buffer.
       iree_hal_cuda_buffer_drop_release_callback(buffer);
 
       // Update statistics (note that it may not yet be accurate).

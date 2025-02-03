@@ -12,24 +12,27 @@
 
 #include <utility>
 
-#include "PassDetail.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
-#include "iree/compiler/Dialect/Flow/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/GraphWriter.h"
+#include "llvm/Support/ToolOutputFile.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Support/FileUtilities.h"
 #include "mlir/Support/IndentedOstream.h"
 
 namespace mlir::iree_compiler::IREE::Flow {
+
+#define GEN_PASS_DEF_DUMPDISPATCHGRAPHPASS
+#include "iree/compiler/Dialect/Flow/Transforms/Passes.h.inc"
 
 namespace {
 
@@ -37,7 +40,6 @@ static const StringRef kLineStyleControlFlow = "dashed";
 static const StringRef kLineStyleDataFlow = "solid";
 static const StringRef kShapeNode = "box";
 static const StringRef kShapeBox = "box";
-static const StringRef kShapeTab = "tab";
 static const StringRef kShapeNone = "plain";
 static const StringRef kShapeEllipse = "ellipse";
 
@@ -124,23 +126,18 @@ public:
   std::optional<int> clusterId;
 };
 
-/// This pass generates a Graphviz dataflow visualization of an MLIR operation.
-/// Note: See https://www.graphviz.org/doc/info/lang.html for more information
-/// about the Graphviz DOT language.
-class DumpDispatchGraphPass
-    : public DumpDispatchGraphBase<DumpDispatchGraphPass> {
+class GraphPrinter {
 public:
-  DumpDispatchGraphPass(raw_ostream &os) : os(os) {}
-  DumpDispatchGraphPass(const DumpDispatchGraphPass &o)
-      : DumpDispatchGraphPass(o.os.getOStream()) {}
+  GraphPrinter(raw_ostream &os, unsigned maxLabelLen, bool printAttrs,
+               bool printControlFlowEdges, bool printDataFlowEdges,
+               bool printResultTypes)
+      : os(os), maxLabelLen(maxLabelLen), printAttrs(printAttrs),
+        printControlFlowEdges(printControlFlowEdges),
+        printDataFlowEdges(printDataFlowEdges),
+        printResultTypes(printResultTypes) {}
 
-  void runOnOperation() override {
-    auto modOp = dyn_cast<ModuleOp>(getOperation());
-    if (!modOp)
-      return;
-
-    auto funcOps = modOp.getOps<func::FuncOp>();
-
+  void emitFunctions(ModuleOp module) {
+    auto funcOps = module.getOps<mlir::FunctionOpInterface>();
     if (funcOps.empty())
       return;
 
@@ -151,6 +148,7 @@ public:
     });
   }
 
+private:
   /// Create a CFG graph for a region. Used in `Region::viewGraph`.
   void emitRegionCFG(Region &region) {
     printControlFlowEdges = true;
@@ -158,7 +156,6 @@ public:
     emitGraph([&]() { processRegion(region); });
   }
 
-private:
   /// Emit all edges. This function should be called after all nodes have been
   /// emitted.
   void emitAllEdgeStmts() {
@@ -340,7 +337,8 @@ private:
     if (isa<arith::ConstantOp>(op))
       return;
 
-    if (isa<func::ReturnOp>(op))
+    if (op->hasTrait<OpTrait::ReturnLike>() &&
+        isa<mlir::FunctionOpInterface>(op->getParentOp()))
       return;
 
     if (auto load = dyn_cast<DispatchTensorLoadOp>(op)) {
@@ -384,10 +382,9 @@ private:
     auto innerModule = executableOp.getInnerModule();
     if (!innerModule)
       return;
-    auto funcOps = innerModule.getOps<func::FuncOp>();
-    auto funcIt = llvm::find_if(funcOps, [&](func::FuncOp op) {
-      return op.getNameAttr() == calleeNameAttr;
-    });
+    auto funcOps = innerModule.getOps<mlir::FunctionOpInterface>();
+    auto funcIt = llvm::find_if(
+        funcOps, [&](auto op) { return op.getNameAttr() == calleeNameAttr; });
     if (funcIt == funcOps.end())
       return;
 
@@ -435,7 +432,7 @@ private:
   std::string getLabel(Operation *op) {
     return strFromOs([&](raw_ostream &os) {
       if (op->getNumRegions() == 0) {
-        auto funcOp = op->getParentOfType<func::FuncOp>();
+        auto funcOp = op->getParentOfType<mlir::FunctionOpInterface>();
         AsmState state(funcOp);
         printResults(os, op, state);
         os << " = " << op->getName();
@@ -581,12 +578,50 @@ private:
   DenseMap<Value, Node> valueToNode;
   /// Counter for generating unique node/subgraph identifiers.
   int counter = 0;
+
+  /// Pass options.
+  unsigned maxLabelLen = 20;
+  bool printAttrs = true;
+  bool printControlFlowEdges = false;
+  bool printDataFlowEdges = true;
+  bool printResultTypes = true;
+};
+
+/// This pass generates a Graphviz dataflow visualization of an MLIR operation.
+/// Note: See https://www.graphviz.org/doc/info/lang.html for more information
+/// about the Graphviz DOT language.
+class DumpDispatchGraphPass
+    : public IREE::Flow::impl::DumpDispatchGraphPassBase<
+          DumpDispatchGraphPass> {
+public:
+  using IREE::Flow::impl::DumpDispatchGraphPassBase<
+      DumpDispatchGraphPass>::DumpDispatchGraphPassBase;
+
+  void runOnOperation() override {
+    auto modOp = dyn_cast<ModuleOp>(getOperation());
+    if (!modOp)
+      return;
+
+    // Open the output file we'll be streaming to.
+    // Since we are processing the entire module at once we overwrite the file.
+    std::string errorMessage;
+    auto file = openOutputFile(outputFile, &errorMessage);
+    if (!file) {
+      llvm::errs() << errorMessage << "\n";
+      return signalPassFailure();
+    }
+
+    GraphPrinter printer(file->os(), maxLabelLen, printAttrs,
+                         printControlFlowEdges, printDataFlowEdges,
+                         printResultTypes);
+    printer.emitFunctions(modOp);
+
+    file->keep();
+  }
+
+private:
 };
 
 } // namespace
-
-std::unique_ptr<Pass> createDumpDispatchGraphPass(raw_ostream &os) {
-  return std::make_unique<DumpDispatchGraphPass>(os);
-}
 
 } // namespace mlir::iree_compiler::IREE::Flow

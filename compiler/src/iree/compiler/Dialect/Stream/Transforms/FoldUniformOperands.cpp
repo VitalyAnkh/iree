@@ -8,24 +8,27 @@
 #include <utility>
 
 #include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
-#include "iree/compiler/Dialect/Stream/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Stream/Transforms/Passes.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
 #define DEBUG_TYPE "iree-stream-fold-uniform-operands"
 
 namespace mlir::iree_compiler::IREE::Stream {
+
+#define GEN_PASS_DEF_FOLDUNIFORMOPERANDSPASS
+#include "iree/compiler/Dialect/Stream/Transforms/Passes.h.inc"
+
 namespace {
 
 //===----------------------------------------------------------------------===//
@@ -41,7 +44,7 @@ namespace {
 //   stream.cmd.dispatch @foo(%0, %1 : index, index)
 // + deduped arguments in the executable
 static void
-deduplicateOperands(mlir::func::FuncOp funcOp,
+deduplicateOperands(mlir::FunctionOpInterface funcOp,
                     SmallVector<IREE::Stream::CmdDispatchOp> &dispatchOps) {
   auto &entryBlock = funcOp.front();
   auto anyDispatchOp = dispatchOps.front();
@@ -114,7 +117,7 @@ deduplicateOperands(mlir::func::FuncOp funcOp,
   }
 
   LLVM_DEBUG({
-    llvm::dbgs() << "deduplicateOperands for " << funcOp.getSymName() << "\n";
+    llvm::dbgs() << "deduplicateOperands for " << funcOp.getName() << "\n";
     llvm::dbgs() << "  dead operands: ";
     llvm::interleaveComma(deadOperandsMap.set_bits(), llvm::dbgs());
     llvm::dbgs() << "\n";
@@ -167,7 +170,7 @@ deduplicateOperands(mlir::func::FuncOp funcOp,
 //   stream.cmd.dispatch @foo(%c101 : index)
 // + inlined %c1 in the executable
 static void
-inlineUniformConstants(mlir::func::FuncOp funcOp,
+inlineUniformConstants(mlir::FunctionOpInterface funcOp,
                        SmallVector<IREE::Stream::CmdDispatchOp> &dispatchOps) {
   auto &entryBlock = funcOp.front();
   auto anyDispatchOp = dispatchOps.front();
@@ -207,8 +210,7 @@ inlineUniformConstants(mlir::func::FuncOp funcOp,
   }
 
   LLVM_DEBUG({
-    llvm::dbgs() << "inlineUniformConstants for " << funcOp.getSymName()
-                 << "\n";
+    llvm::dbgs() << "inlineUniformConstants for " << funcOp.getName() << "\n";
     for (unsigned i = 0; i < operandValues.size(); ++i) {
       if (!operandValues[i].has_value())
         continue;
@@ -251,19 +253,12 @@ inlineUniformConstants(mlir::func::FuncOp funcOp,
 }
 
 //===----------------------------------------------------------------------===//
-// -iree-stream-specialize-dispatches
+// --iree-stream-specialize-dispatches
 //===----------------------------------------------------------------------===//
 
-class FoldUniformOperandsPass
-    : public FoldUniformOperandsBase<FoldUniformOperandsPass> {
-public:
-  FoldUniformOperandsPass() = default;
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<mlir::arith::ArithDialect>();
-    registry.insert<IREE::Stream::StreamDialect>();
-  }
-
+struct FoldUniformOperandsPass
+    : public IREE::Stream::impl::FoldUniformOperandsPassBase<
+          FoldUniformOperandsPass> {
   void runOnOperation() override {
     SymbolTable symbolTable(getOperation());
 
@@ -304,9 +299,5 @@ public:
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createFoldUniformOperandsPass() {
-  return std::make_unique<FoldUniformOperandsPass>();
-}
 
 } // namespace mlir::iree_compiler::IREE::Stream

@@ -1,5 +1,5 @@
 // RUN: iree-opt --split-input-file \
-// RUN:   --pass-pipeline='builtin.module(func.func(iree-codegen-generic-vectorization,iree-spirv-initial-vector-lowering,iree-codegen-hoist-redundant-vector-transfers,iree-spirv-final-vector-lowering))' \
+// RUN:   --pass-pipeline='builtin.module(func.func(iree-codegen-generic-vectorization,iree-spirv-initial-vector-lowering,iree-codegen-optimize-tensor-insert-extract-slices,iree-spirv-final-vector-lowering))' \
 // RUN:   %s | FileCheck %s
 
 func.func @matmul_1x4x4(%lhs: tensor<1x4xf32>, %rhs: tensor<4x4xf32>, %init: tensor<1x4xf32>) -> tensor<1x4xf32> {
@@ -177,7 +177,7 @@ func.func @matmul_2x8x128_fp16(%a: tensor<2x128xf16>, %b: tensor<128x8xf16>, %x:
 //    CHECK-LABEL: func.func @matmul_2x8x128_fp16
 //     CHECK-SAME: (%[[LHS:.+]]: tensor<2x128xf16>, %[[RHS:.+]]: tensor<128x8xf16>, %[[X:.+]]: tensor<2x8xf16>, %[[Y:.+]]: tensor<2x8xf16>)
 //          CHECK:   %[[ZERO:.+]] = arith.constant dense<0.000000e+00> : vector<8xf16>
-//          CHECK:   %[[FOR:.+]]:3 = scf.for %arg4 = %{{.+}} to %{{.+}} step %{{.+}} iter_args(%arg5 = %{{.+}}, %arg6 = %[[ZERO]], %arg7 = %[[ZERO]])
+//          CHECK:   %[[FOR:.+]]:2 = scf.for %arg4 = %{{.+}} to %{{.+}} step %{{.+}} iter_args(%arg5 = %[[ZERO]], %arg6 = %[[ZERO]])
 //  CHECK-COUNT-2:     vector.transfer_read %[[LHS]]{{.+}} : tensor<2x128xf16>, vector<8xf16>
 //  CHECK-COUNT-8:     vector.transfer_read %[[RHS]]{{.+}} : tensor<128x8xf16>, vector<8xf16>
 // CHECK-COUNT-32:     vector.fma {{.+}} : vector<4xf16>
@@ -185,23 +185,23 @@ func.func @matmul_2x8x128_fp16(%a: tensor<2x128xf16>, %b: tensor<128x8xf16>, %x:
 //          CHECK:     %[[ISS1:.+]] = vector.insert_strided_slice %{{.+}}, %[[ISS0]] {offsets = [4], strides = [1]} : vector<4xf16> into vector<8xf16>
 //          CHECK:     %[[ISS2:.+]] = vector.insert_strided_slice %{{.+}}, %[[ZERO]] {offsets = [0], strides = [1]} : vector<4xf16> into vector<8xf16>
 //          CHECK:     %[[ISS3:.+]] = vector.insert_strided_slice %{{.+}}, %[[ISS2]] {offsets = [4], strides = [1]} : vector<4xf16> into vector<8xf16>
-//          CHECK:     scf.yield %arg5, %[[ISS1]], %[[ISS3]] : tensor<2x8xf16>, vector<8xf16>, vector<8xf16>
+//          CHECK:     scf.yield %[[ISS1]], %[[ISS3]] : vector<8xf16>, vector<8xf16>
 //          CHECK:   }
 // CHECK:   %[[X0:.+]] = vector.transfer_read %[[X]]{{.+}} : tensor<2x8xf16>, vector<8xf16>
 // CHECK:   %[[X1:.+]] = vector.transfer_read %[[X]]{{.+}} : tensor<2x8xf16>, vector<8xf16>
-// CHECK:   %[[LHS0:.+]] = vector.extract_strided_slice %[[FOR]]#1 {offsets = [0], sizes = [4], strides = [1]} : vector<8xf16> to vector<4xf16>
+// CHECK:   %[[LHS0:.+]] = vector.extract_strided_slice %[[FOR]]#0 {offsets = [0], sizes = [4], strides = [1]} : vector<8xf16> to vector<4xf16>
 // CHECK:   %[[RHS0:.+]] = vector.extract_strided_slice %[[X0]] {offsets = [0], sizes = [4], strides = [1]} : vector<8xf16> to vector<4xf16>
 // CHECK:   %[[DIV0:.+]] = arith.divf %[[LHS0]], %[[RHS0]]
 // CHECK:   %[[ISS0:.+]] = vector.insert_strided_slice %[[DIV0]], %[[ZERO]] {offsets = [0], strides = [1]} : vector<4xf16> into vector<8xf16>
-// CHECK:   %[[LHS1:.+]] = vector.extract_strided_slice %[[FOR]]#1 {offsets = [4], sizes = [4], strides = [1]} : vector<8xf16> to vector<4xf16>
+// CHECK:   %[[LHS1:.+]] = vector.extract_strided_slice %[[FOR]]#0 {offsets = [4], sizes = [4], strides = [1]} : vector<8xf16> to vector<4xf16>
 // CHECK:   %[[RHS1:.+]] = vector.extract_strided_slice %[[X0]] {offsets = [4], sizes = [4], strides = [1]} : vector<8xf16> to vector<4xf16>
 // CHECK:   %[[DIV1:.+]] = arith.divf %[[LHS1]], %[[RHS1]]
 // CHECK:   %[[ISS1:.+]] = vector.insert_strided_slice %[[DIV1]], %[[ISS0]] {offsets = [4], strides = [1]} : vector<4xf16> into vector<8xf16>
-// CHECK:   %[[LHS2:.+]] = vector.extract_strided_slice %[[FOR]]#2 {offsets = [0], sizes = [4], strides = [1]} : vector<8xf16> to vector<4xf16>
+// CHECK:   %[[LHS2:.+]] = vector.extract_strided_slice %[[FOR]]#1 {offsets = [0], sizes = [4], strides = [1]} : vector<8xf16> to vector<4xf16>
 // CHECK:   %[[RHS2:.+]] = vector.extract_strided_slice %[[X1]] {offsets = [0], sizes = [4], strides = [1]} : vector<8xf16> to vector<4xf16>
 // CHECK:   %[[DIV2:.+]] = arith.divf %[[LHS2]], %[[RHS2]]
 // CHECK:   %[[ISS2:.+]] = vector.insert_strided_slice %[[DIV2]], %[[ZERO]] {offsets = [0], strides = [1]} : vector<4xf16> into vector<8xf16>
-// CHECK:   %[[LHS3:.+]] = vector.extract_strided_slice %[[FOR]]#2 {offsets = [4], sizes = [4], strides = [1]} : vector<8xf16> to vector<4xf16>
+// CHECK:   %[[LHS3:.+]] = vector.extract_strided_slice %[[FOR]]#1 {offsets = [4], sizes = [4], strides = [1]} : vector<8xf16> to vector<4xf16>
 // CHECK:   %[[RHS3:.+]] = vector.extract_strided_slice %[[X1]] {offsets = [4], sizes = [4], strides = [1]} : vector<8xf16> to vector<4xf16>
 // CHECK:   %[[DIV3:.+]] = arith.divf %[[LHS3]], %[[RHS3]]
 // CHECK:   %[[ISS3:.+]] = vector.insert_strided_slice %[[DIV3]], %[[ISS2]] {offsets = [4], strides = [1]} : vector<4xf16> into vector<8xf16>
@@ -268,10 +268,12 @@ func.func @matmul_4x4x4_i8_to_i32(%lhs: tensor<4x4xi8>, %rhs : tensor<4x4xi8>) -
 // the target env. We expect the matmul to follow the inner product lowering.
 
 func.func @matmul_4x4x4_i8_to_i32_dot_prod(%lhs: tensor<4x4xi8>, %rhs : tensor<4x4xi8>) -> tensor<4x4xi32> attributes {
-  spirv.target_env = #spirv.target_env<#spirv.vce<v1.5,
-                                         [DotProduct, DotProductInputAll, DotProductInput4x8Bit],
-                                         [SPV_KHR_integer_dot_product]>,
-                                       #spirv.resource_limits<>> } {
+  iree.gpu.target = #iree_gpu.target<arch = "", features = "spirv:v1.6,cap:Shader", wgp = <
+    compute = fp32|int32|int16|int8, storage = b32|b16|b8, subgroup = none, dot = dp4xi8toi32, mma = [],
+    subgroup_size_choices = [64], max_workgroup_sizes = [1024, 1024, 1024],
+    max_thread_count_per_workgroup = 1024, max_workgroup_memory_bytes = 65536,
+    max_workgroup_counts = [65535, 65535, 65535]>>
+} {
   %c0 = arith.constant 0 : i32
   %i0 = arith.constant 0 : index
   %init = tensor.empty() : tensor<4x4xi32>
@@ -326,10 +328,12 @@ func.func @matmul_4x4x4_i8_to_i32_dot_prod(%lhs: tensor<4x4xi8>, %rhs : tensor<4
 // the target env. We expect the matmul to follow the inner product lowering.
 
 func.func @matmul_4x16x4_i8_to_i32_dot_prod(%lhs: tensor<4x16xi8>, %rhs : tensor<16x4xi8>) -> tensor<4x4xi32> attributes {
-  spirv.target_env = #spirv.target_env<#spirv.vce<v1.5,
-                                         [DotProduct, DotProductInputAll, DotProductInput4x8Bit],
-                                         [SPV_KHR_integer_dot_product]>,
-                                       #spirv.resource_limits<>> } {
+  iree.gpu.target = #iree_gpu.target<arch = "", features = "spirv:v1.6,cap:Shader", wgp = <
+    compute = fp32|int32|int16|int8, storage = b32|b16|b8, subgroup = none, dot = dp4xi8toi32, mma = [],
+    subgroup_size_choices = [64], max_workgroup_sizes = [1024, 1024, 1024],
+    max_thread_count_per_workgroup = 1024, max_workgroup_memory_bytes = 65536,
+    max_workgroup_counts = [65535, 65535, 65535]>>
+} {
   %c0 = arith.constant 0 : i32
   %i0 = arith.constant 0 : index
   %init = tensor.empty() : tensor<4x4xi32>

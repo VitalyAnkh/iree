@@ -19,7 +19,8 @@ import numpy as np
 from iree.compiler.tools import InputType, compile_file
 from iree.runtime import load_vm_flatbuffer_file
 
-MODEL_ARTIFACTS_URL = "https://storage.googleapis.com/iree-model-artifacts/mnist_train.a49ba1535a45ac0f3e6be22a7ed5dddf4a53cd1f41126af938f0667b998f8e11.tar"
+# TODO(#18518): Migrate this file to a new (ideally public) location
+MODEL_ARTIFACTS_URL = "https://storage.googleapis.com/iree-model-artifacts/mnist_train.2bec0cb356ae7c059e04624a627eb3b15b0a556cbd781bbed9f8d32e80a4311d.tar"
 
 Tensor = TypeVar("Tensor")
 

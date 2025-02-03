@@ -6,14 +6,12 @@
 
 #include "iree/compiler/Codegen/VMVX/KernelDispatch.h"
 
-#include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree/compiler/Codegen/Interfaces/PartitionableLoopsInterface.h"
 #include "iree/compiler/Codegen/Utils/CPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
-#include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 
 #define DEBUG_TYPE "vmvx-kernel-dispatch"
-#define KD_DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 
 namespace mlir::iree_compiler {
 
@@ -37,7 +35,7 @@ getDefaultDistributionTileSizes(TilingInterface op) {
 
 /// Sets the lowering configuration for dispatch region for linalg_ext.fft
 /// root op.
-static LogicalResult setRootConfig(func::FuncOp entryPointFn,
+static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
                                    IREE::LinalgExt::FftOp fftOp) {
   assert(!getLoweringConfig(fftOp) && "expected lowering_config is not set");
   SmallVector<int64_t> distTileSizes = getDefaultDistributionTileSizes(fftOp);
@@ -58,7 +56,7 @@ static LogicalResult setRootConfig(func::FuncOp entryPointFn,
       IREE::Codegen::DispatchLoweringPassPipeline::VMVXDefault);
 }
 
-static LogicalResult setRootConfig(func::FuncOp entryPointFn,
+static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
                                    TilingInterface tilingInterfaceOp) {
   assert(!getLoweringConfig(tilingInterfaceOp) &&
          "expected lowering_config is not set");
@@ -71,8 +69,8 @@ static LogicalResult setRootConfig(func::FuncOp entryPointFn,
       IREE::Codegen::DispatchLoweringPassPipeline::VMVXDefault);
 }
 
-static LogicalResult setVMVXRootConfigImpl(func::FuncOp entryPointFn,
-                                           Operation *op) {
+static LogicalResult
+setVMVXRootConfigImpl(mlir::FunctionOpInterface entryPointFn, Operation *op) {
   auto setRootConfigFn = [&](Operation *op) -> LogicalResult {
     return TypeSwitch<Operation *, LogicalResult>(op)
         .Case<IREE::LinalgExt::FftOp>(
@@ -84,7 +82,8 @@ static LogicalResult setVMVXRootConfigImpl(func::FuncOp entryPointFn,
   return setRootConfigFn(op);
 }
 
-static LogicalResult lowerUsingVMVXDefaultPipeline(func::FuncOp op) {
+static LogicalResult
+lowerUsingVMVXDefaultPipeline(mlir::FunctionOpInterface op) {
   auto translationInfo = IREE::Codegen::TranslationInfoAttr::get(
       op.getContext(),
       IREE::Codegen::DispatchLoweringPassPipeline::VMVXDefault);
@@ -92,7 +91,8 @@ static LogicalResult lowerUsingVMVXDefaultPipeline(func::FuncOp op) {
 }
 
 /// Sets the translation information to use for a dispatch region.
-static LogicalResult setConfigForKernel(func::FuncOp entryPointFn) {
+static LogicalResult
+setConfigForKernel(mlir::FunctionOpInterface entryPointFn) {
   SmallVector<Operation *> computeOps = getComputeOps(entryPointFn);
   if (computeOps.empty()) {
     return lowerUsingVMVXDefaultPipeline(entryPointFn);
@@ -116,22 +116,13 @@ static LogicalResult setConfigForKernel(func::FuncOp entryPointFn) {
   return success();
 }
 
-LogicalResult initVMVXLaunchConfig(ModuleOp moduleOp) {
-  llvm::StringMap<IREE::HAL::ExecutableExportOp> exportOps =
-      getAllEntryPoints(moduleOp);
-  for (auto funcOp : moduleOp.getOps<func::FuncOp>()) {
-    auto exportOp = exportOps.lookup(funcOp.getName());
-    if (!exportOp) {
-      continue;
-    }
+LogicalResult initVMVXLaunchConfig(FunctionOpInterface funcOp) {
+  if (getTranslationInfo(funcOp)) {
+    return success();
+  }
 
-    if (getTranslationInfo(exportOp)) {
-      continue;
-    }
-
-    if (failed(setConfigForKernel(funcOp))) {
-      return failure();
-    }
+  if (failed(setConfigForKernel(funcOp))) {
+    return failure();
   }
 
   return success();

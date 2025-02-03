@@ -13,75 +13,112 @@ include "mlir/Pass/PassBase.td"
 // Common passes for all backends (keep alphabetical)
 //===---------------------------------------------------------------------===//
 
-def AddFastMathFlags
+def AddFastMathFlagsPass
     : Pass<"iree-codegen-add-fast-math-flags", "LLVM::LLVMFuncOp"> {
   let summary = "Add fast math flags to all the operations supporting them, "
                 "given a floating-point mode.";
-  let constructor = "mlir::iree_compiler::createAddFastMathFlagsPass()";
 }
 
-def BubbleUpOrdinalOps : Pass<"iree-codegen-bubble-up-ordinal-ops", ""> {
+def BlockDynamicDimensionsPass
+    : Pass<"iree-codegen-block-dynamic-dimensions"> {
+  let summary = "Expand dynamic dimensions that are known to be multiples of "
+                "statically known values.";
+}
+
+def BubbleUpOrdinalOpsPass : Pass<"iree-codegen-bubble-up-ordinal-ops", ""> {
   let summary = "Bubbles op ordinal ops to allow for workgroup count computation";
-  let constructor = "mlir::iree_compiler::createBubbleUpOrdinalOpsPass()";
+  let description = [{
+    Pass to bubble up ordinal operations to allow workgroup count computation
+    based on slices to correlate back to workload computation.
+  }];
 }
 
-def BufferizeCopyOnlyDispatches :
-  Pass<"iree-codegen-bufferize-copy-only-dispatches", "ModuleOp"> {
+def BufferizeCopyOnlyDispatchesPass :
+  InterfacePass<"iree-codegen-bufferize-copy-only-dispatches", "mlir::FunctionOpInterface"> {
   let summary =
       "Bufferize dispatches that copy to/from interfaces to convert to a linalg.copy op";
-  let constructor = "mlir::iree_compiler::createBufferizeCopyOnlyDispatchesPass()";
+  let description = [{
+    Pass to bufferize dispatches that are copying from one interface to
+    another. This will create a `linalg.generic` op which is a copy that can
+    then be used by backends to handle appropriately.
+  }];
 }
 
-def CleanupBufferAllocView :
-    Pass<"iree-codegen-cleanup-buffer-alloc-view", "func::FuncOp"> {
+def ConfigTrackingCanonicalizerPass :
+    Pass<"iree-codegen-config-tracking-canonicalize", ""> {
+  let summary = "Codegen specific canonicalization pass that tracks lowering configs";
+  let options = [
+    Option<"testConvergence", "test-convergence", "bool",
+           /*default=*/"false", "Fails if the patterns fail to converge">
+  ];
+}
+
+def CleanupBufferAllocViewPass :
+    InterfacePass<"iree-codegen-cleanup-buffer-alloc-view", "mlir::FunctionOpInterface"> {
   let summary =
       "Performs cleanups over HAL interface/buffer allocation/view operations";
-  let constructor = "mlir::iree_compiler::createCleanupBufferAllocViewPass()";
 }
 
-def ConcretizePadResultShape :
-    Pass<"iree-codegen-concretize-pad-result-shape", "func::FuncOp"> {
+def ConcretizePadResultShapePass :
+    InterfacePass<"iree-codegen-concretize-pad-result-shape", "mlir::FunctionOpInterface"> {
   let summary =
       "Concretizes tensor.pad op's result shape if its source op"
       "implements OffsetSizeAndStrideOpInterface.";
-  let constructor = "mlir::iree_compiler::createConcretizePadResultShapePass()";
 }
 
-def ConvertBf16ArithToF32 : Pass<"iree-convert-bf16-arith-to-f32", "ModuleOp"> {
+def ConvertAccGEMMToGEMMPass :
+    Pass<"iree-convert-accgemm-to-gemm", ""> {
+  let summary = "Convert accumulating GEMMs to GEMMs post dispatch creation.";
+}
+
+def ConvertBf16ArithToF32Pass : Pass<"iree-convert-bf16-arith-to-f32", ""> {
   let summary = "Convert bf16 arithmetic operations to f32";
-  let constructor = "mlir::iree_compiler::createConvertBf16ArithToF32Pass()";
 }
 
-def ConvertBf16ToUInt16Buffers :
-    Pass<"iree-convert-bf16-to-uint16-buffers", "ModuleOp"> {
-  let summary = "Convert bf16 buffers to uint16 equivalents";
-  let constructor = "mlir::iree_compiler::createConvertBf16ToUInt16BuffersPass()";
+def ConvertBf16ToUInt16BuffersPass :
+    Pass<"iree-codegen-convert-bf16-to-uint16-buffers", ""> {
+  let summary = "Convert BF16 buffer ops and conversions to simulated behavior with uint16.";
 }
 
-def ConvertToDestinationPassingStyle :
-    Pass<"iree-codegen-convert-to-destination-passing-style", "func::FuncOp"> {
+def ConvertToDestinationPassingStylePass :
+    InterfacePass<"iree-codegen-convert-to-destination-passing-style", "mlir::FunctionOpInterface"> {
   let summary =
       "Transforms the code to make the dispatch use destination-passing style";
-  let constructor = "mlir::iree_compiler::createConvertToDestinationPassingStylePass()";
+  let description = [{
+    Converts entry point function within dispatch regions to use
+    destination-passing style, which is better suited for the upstream
+    comprehensive bufferization pass.
+  }];
   let options = [
+    Option<"convertInputsToDestinations", "convert-inputs-to-destinations",
+           "bool", /*default=*/"true",
+           "Controls whether to adjust consumers to convert one of its inputs to a destination">,
     Option<"useWARForCooperativeMatrixCodegen", "use-war-for-cooperative-matrix-codegen",
            "bool", /*default=*/"false",
            "WAR for failure in Cooperative matrix codegen pipelines. See #10648.">
   ];
 }
 
-def DecomposeAffineOps: Pass<"decompose-affine-ops"> {
+def ConvolutionToIGEMMPass :
+    InterfacePass<"iree-codegen-convolution-to-igemm", "mlir::FunctionOpInterface"> {
+  let summary =
+      "Transforms convolution operations into an implicit GEMM format.";
+  let dependentDialects = [
+    "tensor::TensorDialect",
+    "iree_compiler::IREE::LinalgExt::IREELinalgExtDialect"
+  ];
+}
+
+def DecomposeAffineOpsPass: Pass<"iree-codegen-decompose-affine-ops"> {
   let summary = "Decompose `affine.apply` operations into sub `affine.apply`";
   let description = [{
     Decompose `affine.apply` operations into sub `affine.apply` where each
     sub expression references values that are defined in the same loop scope.
     The sub expression are then stitched back together following the loop
     nest order.
-
     The goal of this pass is to break down `affine.apply` expressions such
     that the resulting sub expressions can be hoisted out in their respective
     loop.
-
     E.g., Let's say we have
     ```mlir
     %res = affine.apply
@@ -106,34 +143,22 @@ def DecomposeAffineOps: Pass<"decompose-affine-ops"> {
     ```
     Now the sequence of instructions leading to and including
     `%inv1x32_plus_inv2` can be hoisted out of the loop.
-
     This pass requires `scf.for` structures to still be around otherwise
     the break down will be meaningless.
-
     Note: The decomposition performed by this pass will be undone by
     canonicalization. Make sure to lower the resulting ops before that.
   }];
-  let constructor = "mlir::iree_compiler::createDecomposeAffineOpsPass()";
   let dependentDialects = [
-      "affine::AffineDialect"
+      "mlir::affine::AffineDialect"
   ];
 }
 
-def DecomposeBatchMmt4DOps
-    : Pass<"iree-codegen-decompose-batch-mmt4d-ops", "func::FuncOp"> {
-  let summary = "Decompose batch_mmt4d ops into mmt4d ops";
-  let constructor =
-      "mlir::iree_compiler::createDecomposeBatchMmt4DOpsPass()";
-}
-
-def DecomposeConvolutionToLowerDimOps :
+def DecomposeConvolutionToLowerDimOpsPass :
     Pass<"iree-codegen-decompose-convolution-to-lower-dim-ops", ""> {
   let summary = "Decomposes linalg convolution ops to lower dim ops";
-  let constructor =
-  "mlir::iree_compiler::createDecomposeConvolutionToLowerDimOpsPass()";
 }
 
-def DecomposeLinalgGeneric :
+def DecomposeLinalgGenericPass :
     Pass<"iree-codegen-decompose-linalg-generic", ""> {
   let summary = "Decomposes linalg generic ops into individual ops";
   let description = [{
@@ -145,68 +170,101 @@ def DecomposeLinalgGeneric :
 
     Operates on tensor based linalg ops.
   }];
-  let constructor = "mlir::iree_compiler::createDecomposeLinalgGenericPass()";
 }
 
-def DecomposePackUnPackOps :
-    Pass<"iree-codegen-decompose-pack-unpack-ops", "func::FuncOp"> {
+def DecomposePackUnPackOpsPass :
+    InterfacePass<"iree-codegen-decompose-pack-unpack-ops", "mlir::FunctionOpInterface"> {
   let summary = "Decompose pack/unpack ops into vectorizable ops";
-  let constructor = "mlir::iree_compiler::createDecomposePackUnPackOpsPass()";
+  let options = [
+    Option<"tileOuterToOne", "tile-outer-to-one", "bool", "false",
+           "Always apply tiling to make outer dimension be ones">,
+    Option<"useOnlyReshapes", "use-only-reshapes", "bool", "false",
+           "Use decomposition into reshape ops, even when packing unit dimensions.">
+  ];
+  let dependentDialects = [
+    "arith::ArithDialect",
+    "linalg::LinalgDialect",
+    "scf::SCFDialect",
+    "tensor::TensorDialect"
+  ];
+}
+
+def DecomposeBoundaryPackUnPackOpsPass :
+    InterfacePass<"iree-codegen-decompose-boundary-pack-unpack-ops", "mlir::FunctionOpInterface"> {
+  let summary = "Wrapper for DecomposePackUnPackOpsPass to decompose ops at function boundaries";
   let options = [
     Option<"tileOuterToOne", "tile-outer-to-one", "bool", "false",
            "Always apply tiling to make outer dimension be ones">
   ];
+  let dependentDialects = [
+    "arith::ArithDialect",
+    "linalg::LinalgDialect",
+    "scf::SCFDialect",
+    "tensor::TensorDialect"
+  ];
 }
 
-def DecomposeSoftmax :
-    Pass<"iree-codegen-decompose-softmax", "func::FuncOp"> {
+def DecomposeSoftmaxPass :
+    InterfacePass<"iree-codegen-decompose-softmax", "mlir::FunctionOpInterface"> {
   let summary =
       "Decomposes softmax op into a sequence of linalg ops";
-  let constructor = "mlir::iree_compiler::createDecomposeSoftmaxPass()";
+  let options = [
+    Option<"useFusion", "use-fusion",
+           "bool", /*default=*/"true",
+           "Whether to use the internal pass fusion logic for the exp function. See #15862.">
+  ];
 }
 
-def ReplaceSlowMinMaxOps
-    : Pass<"iree-codegen-replace-slow-min-max-ops", "func::FuncOp"> {
+def DropVectorUnitDimsPass :
+    InterfacePass<"iree-codegen-drop-vector-unit-dims", "mlir::FunctionOpInterface"> {
+  let summary = "Pass to drop vector unit dims.";
+}
+
+def ReconcileTranslationInfoPass
+    : Pass<"iree-codegen-reconcile-translation-info", "IREE::HAL::ExecutableVariantOp"> {
+  let summary =
+      "Reconcile information (like workgroup_size, subgroup_size) across "
+      "`TranslationInfo` set on each function in the dispatch and merge them"
+      "and set them at the appropriate places in the surrounding HAL ops";
+}
+
+def ReplaceSlowMinMaxOpsPass
+    : InterfacePass<"iree-codegen-replace-slow-min-max-ops", "mlir::FunctionOpInterface"> {
   let summary =
       "Replace slow min/max operations that propagate NaNs and distinguish "
       "between +/-0.0 with faster min/max operations that ignore them.";
-  let constructor = "mlir::iree_compiler::createReplaceSlowMinMaxOpsPass()";
 }
 
-def EliminateEmptyTensors :
-    Pass<"iree-eliminate-empty-tensors", "ModuleOp"> {
+def EliminateEmptyTensorsPass :
+    InterfacePass<"iree-eliminate-empty-tensors", "mlir::FunctionOpInterface"> {
   let summary = "Eliminate tensor.empty ops to avoid buffer allocations";
-  let constructor = "mlir::iree_compiler::createEliminateEmptyTensorsPass()";
 }
 
-def EmulateNarrowType :
-    Pass<"iree-codegen-emulate-narrow-type", "ModuleOp"> {
+def EmulateNarrowTypePass :
+    Pass<"iree-codegen-emulate-narrow-type", ""> {
   let summary = "Emulate narrow integer operations using wide integer operations";
-  let constructor = "mlir::iree_compiler::createEmulateNarrowTypePass()";
+  let description = [{
+    A pass to emulate memref load operations that use narrow integer types
+    with equivalent operations on supported wide integer types.
+  }];
 }
 
-def EraseDeadAllocAndStores :
-    Pass<"iree-codegen-erase-dead-alloc-and-stores", "func::FuncOp"> {
+def EraseDeadAllocAndStoresPass :
+    InterfacePass<"iree-codegen-erase-dead-alloc-and-stores", "mlir::FunctionOpInterface"> {
   let summary = "Erase alloc ops if all the uses are just stores";
-  let constructor =
-      "mlir::iree_compiler::createEraseDeadAllocAndStoresPass()";
 }
 
-def EraseHALDescriptorTypeFromMemRef
+def EraseHALDescriptorTypeFromMemRefPass
     : Pass<"iree-codegen-erase-hal-descriptor-type-from-memref"> {
   let summary = "Erase #hal.descriptor_type from MemRef memory space";
-  let constructor =
-      "mlir::iree_compiler::createEraseHALDescriptorTypeFromMemRefPass()";
 }
 
-def ConvertHALDescriptorTypeToGPUAddressSpace
+def ConvertHALDescriptorTypeToGPUAddressSpacePass
     : Pass<"iree-codegen-convert-hal-descriptor-type-to-gpu-address-space"> {
   let summary = "Convert #hal.descriptor_type to #gpu.address_space<global>";
-  let constructor =
-      "mlir::iree_compiler::createConvertHALDescriptorTypeToGPUAddressSpacePass()";
 }
 
-def ExtractAddressComputation: Pass<"extract-address-computation"> {
+def ExtractAddressComputationPass : Pass<"iree-codegen-extract-address-computation"> {
   let summary = "Extract address computations from memory accesses";
   let description = [{
     Extract the address computation from the instructions with memory
@@ -223,52 +281,58 @@ def ExtractAddressComputation: Pass<"extract-address-computation"> {
     memref.load %new_base[%c0,...]
     ```
   }];
-  let constructor = "mlir::iree_compiler::createExtractAddressComputationPass()";
   let dependentDialects = [
       "memref::MemRefDialect"
   ];
 }
 
-def FlattenMemRefSubspan :
-  Pass<"iree-codegen-flatten-memref-subspan", "ModuleOp"> {
+def FlattenMemRefSubspanPass : Pass<"iree-codegen-flatten-memref-subspan", "ModuleOp"> {
   let summary =
       "Flatten n-D MemRef subspan ops to 1-D ones and fold byte offsets";
-  let constructor = "mlir::iree_compiler::createFlattenMemRefSubspanPass()";
+  let description = [{
+    Flattens n-D MemRef subspan ops to 1-D MemRef and folds the byte offsets
+    on subspan ops to the consumer load/store ops, in preparation for lowering
+    to backends that require linearized access.
+  }];
 }
 
-def FoldAffineMinInDistributedLoops :
-  Pass<"iree-codegen-fold-affinemin-in-distributed-loops", "func::FuncOp"> {
+def FoldAffineMinInDistributedLoopsPass :
+  InterfacePass<"iree-codegen-fold-affinemin-in-distributed-loops", "mlir::FunctionOpInterface"> {
   let summary = "Fold `affine.min` ops in distributed loops";
-  let constructor = "mlir::iree_compiler::createFoldAffineMinInDistributedLoopsPass()";
 }
 
-def FoldTensorExtractOp :
+def FoldTensorExtractOpPass :
   Pass<"iree-codegen-fold-tensor-extract-op", ""> {
   let summary = "Fold `tensor.extract` operations prior to lowering to LLVM";
-  let constructor = "mlir::iree_compiler::createFoldTensorExtractOpPass()";
+  let description = [{
+    After running the upstream TensorConstantBufferize pass, remove
+    tensor_loads introduced for use only in tensor_extract. These can be
+    folded to use a load of the created memref object that holds the constant
+    values.
+  }];
 }
 
-def ForOpCanonicalization :
-  Pass<"iree-codegen-canonicalize-scf-for", "func::FuncOp"> {
+def ForOpCanonicalizationPass :
+  InterfacePass<"iree-codegen-canonicalize-scf-for", "mlir::FunctionOpInterface"> {
   let summary =
       "Adhoc canonicalization of selected loop-carried values/dependencies for scf.for ops";
-  let constructor = "mlir::iree_compiler::createForOpCanonicalizationPass()";
 }
 
-def FuseTensorPadWithConsumer :
-    Pass<"iree-codegen-fuse-tensor-pad-with-consumer", "func::FuncOp"> {
+def FuseTensorPadWithConsumerPass :
+    InterfacePass<"iree-codegen-fuse-tensor-pad-with-consumer", "mlir::FunctionOpInterface"> {
   let summary = "Fuse tensor.pad op into its consumer op's tiled loop nest";
-  let constructor = "mlir::iree_compiler::createFuseTensorPadWithConsumerPass()";
 }
 
-def GenericVectorization :
-    Pass<"iree-codegen-generic-vectorization", "func::FuncOp"> {
+def GenericVectorizationPass :
+    InterfacePass<"iree-codegen-generic-vectorization", "mlir::FunctionOpInterface"> {
   let summary = "Pass to perform vectorization on tensor/linalg ops.";
   let options = [
     Option<"enableVectorMasking", "enable-vector-masking", "bool",/*default=*/"false",
       "Enable vector masking during vectorization.">,
     Option<"useConfiguredVectorSizes", "use-configured-vector-sizes", "bool",/*default=*/"true",
       "Control whether the op lowering config represents a set of masked vector sizes">,
+    Option<"vectorizeCopies", "vectorize-copies", "bool", /*default=*/"true",
+      "Enable vectorization of linalg.copy operations.">,
     Option<"vectorizePadding", "vectorize-padding", "bool", /*default=*/"false",
       "Rewrite all tensor.pad ops in the function to vector form.">,
     Option<"vectorizeGatherAccesses", "vectorize-gather-accesses", "bool", /*default=*/"false",
@@ -284,32 +348,45 @@ def GenericVectorization :
             /*default=*/"2147483647",
            "Max vector size allowed to avoid creating large vectors.">
   ];
-  let constructor =
-      "mlir::iree_compiler::createGenericVectorizationPass()";
 }
 
-def HoistRedundantVectorTransfers :
-    Pass<"iree-codegen-hoist-redundant-vector-transfers", "func::FuncOp"> {
-  let summary = "Hoist redundant vector transfers";
-  let constructor = "mlir::iree_compiler::createHoistRedundantVectorTransfersPass()";
+def OptimizeTensorInsertExtractSlicesPass
+    : InterfacePass<"iree-codegen-optimize-tensor-insert-extract-slices",
+                    "mlir::FunctionOpInterface"> {
+  let summary = "Optimize tensor.insert_slice/tensor.extract_slice operations "
+                "(e.g. hoist and fold)";
+  let options = [
+    Option<"foldIdentitySlices", "fold-identity-slices", "bool", "false",
+           "Enable folding of identity tensor.*_slice ops.">
+  ];
 }
 
-def HoistUnrolledVectorExtractInsertSlice :
-    Pass<"iree-codegen-hoist-vector-extract-insert-slice", "func::FuncOp"> {
+def HoistUnrolledVectorExtractInsertSlicePass :
+    InterfacePass<"iree-codegen-hoist-vector-extract-insert-slice", "mlir::FunctionOpInterface"> {
   let summary = "Hoist unrolled vector (extract, insert) pairs out of scf.for op";
-  let constructor =  "mlir::iree_compiler::createHoistUnrolledVectorExtractInsertSlicePass()";
 }
 
-def HoistStaticallyBoundAllocations :
-    Pass<"iree-hoist-statically-bound-allocations", "func::FuncOp"> {
+def HoistStaticallyBoundAllocationsPass :
+    InterfacePass<"iree-codegen-hoist-statically-bound-allocations", "mlir::FunctionOpInterface"> {
   let summary = "Hoist statically bound alloca ops to the entry block of functions";
-  let constructor = "mlir::iree_compiler::createHoistStaticallyBoundAllocationsPass()";
+  // Note: These options only exist to help with testing, real world uses should look at the target.
+  // There also should be no observable change if the input IR is not scalable.
+  let options = [
+    Option<"vscaleMin", "vscale-min", "unsigned",
+            /*default=*/"0",
+           "Minimum possible value of vscale.">,
+    Option<"vscaleMax", "vscale-max", "unsigned",
+            /*default=*/"0",
+           "Maximum possible value of vscale (a value of zero means unbounded).">
+  ];
+  let dependentDialects = [
+      "affine::AffineDialect"
+  ];
 }
 
-def IREEComprehensiveBufferize :
-    Pass<"iree-codegen-iree-comprehensive-bufferize", "ModuleOp"> {
+def IREEComprehensiveBufferizePass :
+    InterfacePass<"iree-codegen-iree-comprehensive-bufferize", "mlir::FunctionOpInterface"> {
   let summary = "Convert from to Linalg ops on tensors to buffers";
-  let constructor = "mlir::iree_compiler::createIREEComprehensiveBufferizePass()";
   let options = [
     Option<"testAnalysisOnly", "test-analysis-only", "bool",
             /*default=*/"false",
@@ -320,97 +397,190 @@ def IREEComprehensiveBufferize :
   ];
 }
 
-def IREEExpandStridedMetadata :
+def IREEExpandStridedMetadataPass :
     Pass<"iree-codegen-expand-strided-metadata", ""> {
   let summary = "Resolve memref.extract_strided_metadata operations";
-  let constructor = "mlir::iree_compiler::createIREEExpandStridedMetadataPass()";
   let options = [
     Option<"allowUnresolved", "allow-unresolved", "bool", /*default=*/"false",
            "Allow unresolved strided metadata op (for testing)">,
   ];
 }
 
-def InstrumentMemoryAccesses :
-    Pass<"iree-codegen-instrument-memory-accesses", "func::FuncOp"> {
+def InstrumentMemoryAccessesPass :
+    InterfacePass<"iree-codegen-instrument-memory-accesses", "mlir::FunctionOpInterface"> {
   let summary = "Instruments memory reads and writes for address tracking when dispatch instrumentation is enabled.";
-  let constructor = "mlir::iree_compiler::createInstrumentMemoryAccessesPass()";
 }
 
-def LowerUKernelOpsToCalls :
+def LinkTuningSpecsPass : Pass<"iree-codegen-link-tuning-specs", "ModuleOp"> {
+  let summary =
+      "Link nested transform dialect tuning specs named sequences into a single entry point";
+  let description = [{
+    Given a module with multiple nested tuning specs, introduce a new named sequence
+    that includes all the other tuning spec entry points. The order of inclusion is the same
+    as the order in which these nested tuning specs appear in the IR.
+
+    A tuning spec entry point is a `transform.named_sequence` op annotated with the
+    `iree_codegen.tuning_spec` unit attribute. We require it to perform in-place op
+    modification and not consume the handle.
+  }];
+  let dependentDialects = ["transform::TransformDialect"];
+}
+
+def LowerExecutableUsingTransformDialectPass :
+    Pass<"iree-codegen-lower-executable-using-transform-dialect", "ModuleOp"> {
+  let summary = "Lower executables using the transform dialect recipe provided in the module.";
+}
+
+def LowerUKernelOpsToCallsPass :
     Pass<"iree-codegen-lower-ukernel-ops-to-calls", "ModuleOp"> {
   let summary = "Lower micro-kernel wrapper ops into function calls";
-  let constructor = "mlir::iree_compiler::createLowerUKernelOpsToCallsPass()";
 }
 
-def MaterializeEncodingIntoNop :
-    Pass<"iree-codegen-materialize-encoding-into-nop", "func::FuncOp"> {
-  let summary = "";
-  let constructor = "mlir::iree_compiler::createMaterializeEncodingIntoNopPass()";
+def MaterializeHostEncodingPass :
+    Pass<"iree-codegen-materialize-host-encoding", "mlir::ModuleOp"> {
+  let summary = "Materialize the encoding for tensor as specified by the backend.";
 }
 
-def MaterializeUserConfigs :
-    Pass<"iree-codegen-materialize-user-configs", "IREE::HAL::ExecutableVariantOp"> {
+def MaterializeDeviceEncodingPass :
+    InterfacePass<"iree-codegen-materialize-device-encoding", "mlir::FunctionOpInterface"> {
+  let summary = "Materialize the encoding for tensor as specified by the backend.";
+  let options = [
+    Option<"testCLGPUTarget", "test-cl-gpu-target", "bool", /*default=*/"false",
+           "Flag used for lit-testing GPU target only. Not for general usage">,
+  ];
+}
+
+// TODO(hanchung): Remove the pass after we deprecate MaterializeHomogeneousEncodingsPass.
+def MaterializeEncodingIntoNopPass :
+    InterfacePass<"iree-codegen-materialize-encoding-into-nop", "mlir::FunctionOpInterface"> {
+  let summary = "Drop the encodings from tensor types with encodings.";
+}
+
+def MaterializeTuningSpecsPass : Pass<"iree-codegen-materialize-tuning-specs", "ModuleOp"> {
+  let summary =
+      "Load tuning spec transform dialect libraries and encode them in the module";
+  let description = [{
+    Links all available tuning spec transform dialect modules into a single
+    tuning spec. Next, serializes this tuning spec to bytecode and attaches it
+    as a module attribute. We do this so that the full tuning spec is always
+    encoded in the program IR and can be checked with `--mlir-print-ir-after-all`
+    (or equivalent). The alternative would be to add the tuning spec as a
+    submodule in the compiled program, but this may result in the tuning spec
+    being inadvertently visited by other passes that attempt to `walk` the outer
+    module. Serialization makes the tuning specs opaque and prevents it from
+    happening.
+
+    This attribute is expected to be short-lived and removed by
+    `iree-codegen-materialize-user-configs`.
+  }];
+}
+
+def MaterializeUserConfigsPass : Pass<"iree-codegen-materialize-user-configs", "ModuleOp"> {
   let summary = "Sets the lowering configs and translation info from user configs";
-  let constructor = "mlir::iree_compiler::createMaterializeUserConfigsPass()";
   let dependentDialects = [
       "transform::TransformDialect"
   ];
 }
 
 def MemrefCopyToLinalgPass :
-    Pass<"iree-codegen-memrefcopy-to-linalg", "func::FuncOp"> {
+    InterfacePass<"iree-codegen-memrefcopy-to-linalg", "mlir::FunctionOpInterface"> {
   let summary = "Convert memref.copy to linalg op";
-  let constructor =
-      "mlir::iree_compiler::createMemrefCopyToLinalgPass()";
 }
 
-def OptimizeVectorTransfer :
-    Pass<"iree-codegen-optimize-vector-transfer", "func::FuncOp"> {
+def NormalizeLoopBoundsPass :
+    Pass<"iree-codegen-normalize-loop-bounds", ""> {
+  let summary = "Normalize the loop bounds of `scf.for` and `scf.forall`";
+  let description = [{
+    Normalizes the iteration range of `scf.for` and `scf.forall` loops to
+    [0, ub) += 1.
+  }];
+  let options = [
+    Option<"normalizeFor", "normalize-for", "bool", "true",
+           "Enable normalization for `scf.for` loops">,
+    Option<"normalizeForall", "normalize-forall", "bool", "true",
+           "Enable normalization for `scf.forall` loops">,
+  ];
+  let dependentDialects = [
+      "affine::AffineDialect",
+      "arith::ArithDialect"
+  ];
+}
+
+def OptimizeVectorTransferPass :
+    InterfacePass<"iree-codegen-optimize-vector-transfer", "mlir::FunctionOpInterface"> {
   let summary =
       "Run optimization transformations on vector transfer operations";
-  let constructor = "mlir::iree_compiler::createOptimizeVectorTransferPass()";
   let options = [
-    Option<"optionFlatten", "flatten", "bool", "false",
+    Option<"flatten", "flatten", "bool", "false",
            "Flatten the vector type of vector transfers where possible (contiguous row-major data).">,
-    Option<"optionDropUnitDims", "drop-unit-dims", "bool", /*default=*/"true",
-           "Drop unit dims in vector transfers where possible (might generate vector.shape_cast).">,
+    Option<"redundantHoisting", "redundant-hoisting", "bool", "true",
+           "Enables use of redundant vector transfer hoisting.">,
   ];
   let dependentDialects = [
       "memref::MemRefDialect"
   ];
 }
 
-def PadDynamicAlloc :
-    Pass<"iree-codegen-pad-dynamic-alloc", "func::FuncOp"> {
+def PadDynamicAllocPass :
+    InterfacePass<"iree-codegen-pad-dynamic-alloc", "mlir::FunctionOpInterface"> {
   let summary = "Pass to pad dynamic alloc into static one.";
-  let constructor = "mlir::iree_compiler::createPadDynamicAlloc()";
 }
 
 def PolynomialApproximationPass :
     Pass<"iree-codegen-polynomial-approximation", ""> {
   let summary = "Convert math operations to their polynomial approximation";
-  let constructor =
-      "mlir::iree_compiler::createPolynomialApproximationPass()";
 }
 
-def RematerializeParallelOps :
-    Pass<"iree-codegen-rematerialize-parallel-ops", "func::FuncOp"> {
+def PropagateDispatchSizeBoundsPass :
+    InterfacePass<"iree-codegen-propagate-dispatch-size-bounds", "mlir::FunctionOpInterface"> {
+  let summary = "Pass to annotate workitem and workgroup IDs with known bounds";
+  let dependentDialects = ["::mlir::arith::ArithDialect"];
+}
+
+def PropagateReshapesByExpansionPass :
+    Pass<"iree-codegen-propagate-reshapes-by-expansion", ""> {
+  let summary = "Propagates reshaping operations by expansion.";
+  let description = [{
+    Pass to propagate reshapes by expansion through all ops without explicit
+    lowering configurations.
+  }];
+}
+
+def RematerializeParallelOpsPass :
+    InterfacePass<"iree-codegen-rematerialize-parallel-ops", "mlir::FunctionOpInterface"> {
   let summary = "Pass to rematerialize and merge parallel ops into consumers.";
-  let constructor = "mlir::iree_compiler::createRematerializeParallelOpsPass()";
 }
 
-def RemoveSingleIterationLoop :
-    Pass<"iree-codegen-remove-single-iteration-loop", "func::FuncOp"> {
+def RemoveSingleIterationLoopPass :
+    InterfacePass<"iree-codegen-remove-single-iteration-loop", "mlir::FunctionOpInterface"> {
   let summary = "Remove distributed loop with single iteration.";
-  let constructor = "mlir::iree_compiler::createRemoveSingleIterationLoopPass()";
 }
 
-def SplitFullPartialTransfer :
-    Pass<"iree-codegen-split-full-partial-transfer", "func::FuncOp"> {
+def StripCompilationInfoPass :
+    Pass<"iree-codegen-strip-compilation-info", "">{
+   let summary = "Remove all the the lowering configuration and translation info attributes.";
+}
+
+// TODO: Replace with upstream: https://github.com/iree-org/iree/issues/18759
+def IREELoopInvariantCodeMotionPass :
+  Pass<"iree-loop-invariant-code-motion", ""> {
+  let summary = "Performs LICM on loops guaranteed to have >= 1 trip";
+  let description = [{
+    This is a mirror of the upstream LICM pass that restricts to loops that are
+    guaranteed to have at least one trip. This currently only supports loops
+    that expose a lower and upper bound as the generic loop-like interface does
+    not expose a way to query for trip count.
+
+    Additionally code motion of `scf.forall` ops with mappings is always unsafe
+    and is explicitly disabled.
+  }];
+}
+
+def SplitFullPartialTransferPass :
+    InterfacePass<"iree-codegen-split-full-partial-transfer", "mlir::FunctionOpInterface"> {
   let summary =
       "Split a vector.transfer operation into an in-bounds (i.e., no "
       "out-of-bounds masking) fastpath and a slowpath.";
-  let constructor = "mlir::iree_compiler::createSplitFullPartialTransferPass()";
   let options = [
     Option<"splitVectorTransfersTo", "split-transfers", "std::string",
       /*default=*/"",
@@ -423,45 +593,81 @@ def SplitFullPartialTransfer :
   ];
 }
 
-def TensorToVectorVectorizePad :
-    Pass<"iree-codegen-vectorize-tensor-pad", "func::FuncOp"> {
+def TensorToVectorVectorizePadPass :
+    InterfacePass<"iree-codegen-vectorize-tensor-pad", "mlir::FunctionOpInterface"> {
   let summary = "Vectorize a very specific form of tensor.pad with "
                 "control flows";
-  let constructor =
-      "mlir::iree_compiler::createVectorizePadPass()";
 }
 
-def TestExecutablePreprocessing :
+def TestExecutablePreprocessingPass :
     Pass<"iree-codegen-test-executable-preprocessing", ""> {
   let summary = "Tests iree-hal-preprocess-executables-with behavior.";
-  let constructor = "mlir::iree_compiler::createTestExecutablePreprocessingPass()";
 }
 
-def TestPartitionableLoopsInterface :
+def TestPartitionableLoopsInterfacePass :
     Pass<"iree-codegen-test-partitionable-loops-interface", ""> {
   let summary = "Test the PartitionableLoopsInterface";
-  let constructor = "mlir::iree_compiler::createTestPartitionableLoopsInterfacePass()";
 }
 
-def TileAndDistributeToWorkgroups :
-    Pass<"iree-codegen-tile-and-distribute-to-workgroups", "IREE::HAL::ExecutableVariantOp"> {
+def TileAndDistributeToWorkgroupsPass :
+    InterfacePass<"iree-codegen-tile-and-distribute-to-workgroups", "mlir::FunctionOpInterface"> {
   let summary = "Tile and distribute operations to workgroups";
-  let constructor = "mlir::iree_compiler::createTileAndDistributeToWorkgroupsPass()";
   let options = [
     Option<"maxWorkgroupParallelDims", "max-workgroup-parallel-dims", "int32_t",
-      /*default=*/ "",
+      /*default=*/ "kNumMaxParallelDims",
       "Maximum number of dims to distribute workgroups across.">,
-    Option<"distributionMethod", "distribution-method", "int32_t",
-      /*default=*/ "0",
-      "Pick the distribution method">
+    Option<"distributionMethod", "distribution-method", "linalg::DistributionMethod",
+      /*default=*/ "linalg::DistributionMethod::Cyclic",
+      "Pick the distribution method. See linalg::DistributionMethod for details",
+      [{::llvm::cl::values(
+            clEnumValN(linalg::DistributionMethod::Cyclic,
+                       "0", "Use Cyclic strategy"),
+            clEnumValN(linalg::DistributionMethod::CyclicNumProcsGeNumIters,
+                       "1", "Use CyclicNumProcGeNumIter strategy"),
+            clEnumValN(linalg::DistributionMethod::CyclicNumProcsEqNumIters,
+                       "2", "Use CyclicNumProcEqNumIter strategy"),
+            clEnumValN(linalg::DistributionMethod::None,
+                       "3", "Use None strategy")
+        )}]>,
   ];
 }
 
-def TransformDialectInterpreter :
+def TileAndDistributeToWorkgroupsUsingForallOpPass :
+    InterfacePass<"iree-codegen-tile-and-distribute-to-workgroups-using-forall-op",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Tile and distribute operation to workgroups (using scf.forall op)";
+  let dependentDialects = [
+    "affine::AffineDialect",
+    "IREE::Codegen::IREECodegenDialect",
+    "IREE::LinalgExt::IREELinalgExtDialect",
+    "scf::SCFDialect",
+    "tensor::TensorDialect",
+  ];
+  let options = [
+    Option<"transposeWorkgroup", "transpose-workgroup", "bool", /*default=*/"false",
+           "Swaps the workgroup mapping attribute x and y."
+            "Only swaps when the loop bounds are static.">,
+  ];
+}
+
+def TileLargeTensorsPass :
+    InterfacePass<"iree-codegen-tile-large-tensors", "mlir::FunctionOpInterface"> {
+  let summary = "Greedily tiles all linalg ops that are beyond a certain size";
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::affine::AffineDialect",
+    "::mlir::scf::SCFDialect",
+  ];
+  let options = [
+    Option<"maxVectorSize", "max-vector-size", "int64_t",
+           /*default=*/"64",
+           "Maximum static size to tile to (i.e. all remaining ops will be smaller)">,
+  ];
+}
+
+def TransformDialectInterpreterPass :
     Pass<"iree-transform-dialect-interpreter"> {
   let summary = "Pass to apply transform dialect operations.";
-  let constructor =
-    "mlir::iree_compiler::createTransformDialectInterpreterPass()";
   let description = [{
     This pass runs the transform dialect interpreter and applies the named
     sequence transformation specified by the provided name (defaults to
@@ -469,18 +675,48 @@ def TransformDialectInterpreter :
   }];
   let options = [
     Option<"entryPoint", "entry-point", "std::string",
-           /*default=*/[{"transform::TransformDialect::kTransformEntryPointSymbolName.str()"}],
+           /*default=*/"::mlir::transform::TransformDialect::kTransformEntryPointSymbolName.str()",
            "Entry point of the pass pipeline.">,
     Option<"libraryFileName", "library-file-name", "std::string",
-           /*default=*/[{""}], 
+           /*default=*/[{""}],
            "File path to load a library of transform dialect strategies from.">,
   ];
 }
 
-def TypePropagation :
-    Pass<"iree-codegen-type-propagation", "func::FuncOp"> {
+def TypePropagationPass :
+    InterfacePass<"iree-codegen-type-propagation", "mlir::FunctionOpInterface"> {
   let summary = "Propogate the type of tensor to avoid load/stores of illegal bit widths";
-  let constructor = "mlir::iree_compiler::createTypePropagationPass()";
+}
+
+def UnrollAnnotatedLoopsPass :
+    InterfacePass<"iree-codegen-unroll-annotated-loops", "mlir::FunctionOpInterface"> {
+  let summary = "Unrolls all scf.for loops marked with `unroll_loop`";
+}
+
+def VectorizeMemrefCopyPass :
+    Pass<"iree-codegen-vectorize-memref-copy", ""> {
+  let summary = "Vectorizes memref copy operations.";
+}
+
+def VectorTransferLoweringPass :
+    InterfacePass<"iree-codegen-vector-transfer-lowering", "mlir::FunctionOpInterface"> {
+  let summary = "Pass to lower transfer ops to simpler ops like `vector.load`, `vector.store`, `vector.broadcast`, and a set of scf ops.";
+  let options = [
+    Option<"enableScalableLowerings", "enable-scalable-lowerings", "bool",
+      /*default=*/"false",
+      "Enables scalable vector specific transfer lowerings">,
+  ];
+}
+
+def VerifyWorkgroupDistributionPass :
+    InterfacePass<"iree-codegen-verify-workgroup-distribution", "mlir::FunctionOpInterface"> {
+  let summary = "Pass to verify proper distribution to workgroups.";
+  let description = [{
+    Pass to verify that all writes to global memory are explicitly mapped to
+    workgroups. This means that in cases where we use loops (scf.forall) to
+    manage distribution to workgroups, we require that all ops with write
+    side effects are contained within a workgroup distributed loop.
+  }];
 }
 
 #endif // IREE_CODEGEN_COMMON_PASSES

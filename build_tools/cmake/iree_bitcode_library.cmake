@@ -31,6 +31,13 @@ function(iree_bitcode_library)
     set(_OUT "${_RULE_NAME}.bc")
   endif()
 
+  # Produce an empty file if the compiler wouldn't use bitcode for this arch anyway.
+  iree_compiler_targeting_iree_arch(_IREE_COMPILER_TARGETING_THIS_ARCH "${_RULE_ARCH}")
+  if (NOT _IREE_COMPILER_TARGETING_THIS_ARCH)
+    iree_make_empty_file("${_OUT}")
+    return()
+  endif()
+
   iree_arch_to_llvm_arch(_LLVM_ARCH "${_RULE_ARCH}")
 
   set(_COPTS
@@ -55,7 +62,7 @@ function(iree_bitcode_library)
     # Enable inline asm.
     "-fasm"
 
-    # Object file only in bitcode format:
+    # Object file only in bitcode format.
     "-c"
     "-emit-llvm"
 
@@ -68,6 +75,20 @@ function(iree_bitcode_library)
   list(APPEND _COPTS "-I" "${IREE_SOURCE_DIR}/runtime/src")
   list(APPEND _COPTS "-I" "${IREE_BINARY_DIR}/runtime/src")
   list(APPEND _COPTS "${_RULE_COPTS}")
+
+  if (_RULE_ARCH STREQUAL "arm_32")
+    # Silence "warning: unknown platform, assuming -mfloat-abi=soft"
+    list(APPEND _COPTS "-mfloat-abi=soft")
+  elseif(_RULE_ARCH STREQUAL "riscv_32")
+    # On RISC-V, linking LLVM modules requires matching target-abi.
+    # https://lists.llvm.org/pipermail/llvm-dev/2020-January/138450.html
+    # The choice of ilp32d is simply what we have in existing riscv_32 tests.
+    # Open question - how do we scale to supporting all RISC-V ABIs?
+    list(APPEND _COPTS "-mabi=ilp32d")
+  elseif(_RULE_ARCH STREQUAL "riscv_64")
+    # Same comments as above riscv_32 case.
+    list(APPEND _COPTS "-mabi=lp64d")
+  endif()
 
   set(_BITCODE_FILES)
   foreach(_SRC ${_RULE_SRCS})
@@ -154,7 +175,7 @@ function(iree_cuda_bitcode_library)
     # Optimized and unstamped.
     "-O3"
 
-    # Object file only in bitcode format:
+    # Object file only in bitcode format.
     "-c"
     "-emit-llvm"
   )
@@ -206,6 +227,97 @@ function(iree_cuda_bitcode_library)
   )
 endfunction()
 
+# iree_amdgpu_bitcode_library()
+#
+# Builds an AMDGPU LLVM bitcode library from an input file via clang.
+#
+# Parameters:
+# NAME: Name of the target.
+# GPU_ARCH: Target AMDGPU architecture, e.g. gfx942.
+# SRCS: Source files to pass to clang. Headers (*.h) are for dependency
+#       tracking only. Current limitation: only one non-header source is
+#       supported.
+# COPTS: Additional flags to pass to clang.
+# OUT: Output file name. Defaults to {source.c}.{gpu_arch}.bc.
+function(iree_amdgpu_bitcode_library)
+  cmake_parse_arguments(
+    _RULE
+    ""
+    "NAME;OUT;GPU_ARCH"
+    "SRCS;COPTS"
+    ${ARGN}
+  )
+
+  set(_SRC "")
+  foreach(_SRCS_ENTRY IN LISTS _RULE_SRCS)
+    if(_SRCS_ENTRY MATCHES "\.h$")
+      continue()
+    endif()
+    if (_SRC)
+      message(SEND_ERROR "Currently limitation: only one non-header file allowed in SRCS.")
+    endif()
+    set(_SRC "${_SRCS_ENTRY}")
+  endforeach()
+  if(NOT _SRC)
+    message(SEND_ERROR "Error: no non-header file found in SRCS=${_RULE_SRCS}.")
+  endif()
+
+  if(DEFINED _RULE_OUT)
+    set(_OUT "${_RULE_OUT}")
+  else()
+    set(_OUT "${_SRC}.${_RULE_GPU_ARCH}.bc")
+  endif()
+
+  set(_COPTS
+    # Language: C23
+    "-std=c23"
+
+    # Avoid dependencies.
+    "-nogpulib"
+
+    # Avoid ABI issues.
+    "-fno-short-wchar"  # Shouldn't matter to us, but doesn't hurt.
+
+    # Target architecture/machine.
+    "-target"
+    "amdgcn-amd-amdhsa"
+    "-march=${_RULE_GPU_ARCH}"
+    "-fgpu-rdc"  # NOTE: may not be required for all targets.
+
+    # Optimized.
+    "-O3"
+    "-fno-ident"
+    "-fvisibility=hidden"
+
+    # Object file only in bitcode format.
+    "-c"
+    "-emit-llvm"
+  )
+
+  add_custom_command(
+    OUTPUT
+      "${_OUT}"
+    COMMAND
+      "${IREE_CLANG_BINARY}"
+      ${_COPTS}
+      "-I" "${IREE_SOURCE_DIR}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/${_SRC}"
+      "-o" "${_OUT}"
+    DEPENDS
+      "${IREE_CLANG_BINARY}"
+      "${_RULE_SRCS}"
+    COMMENT
+      "Compiling ${_SRC} to ${_OUT}"
+    VERBATIM
+  )
+
+  # Only add iree_${NAME} as custom target doesn't support aliasing to
+  # iree::${NAME}.
+  iree_package_name(_PACKAGE_NAME)
+  add_custom_target("${_PACKAGE_NAME}_${_RULE_NAME}"
+    DEPENDS "${_OUT}"
+  )
+endfunction()
 
 # iree_link_bitcode()
 #

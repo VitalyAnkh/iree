@@ -10,17 +10,16 @@ icon: simple/pytorch
 # PyTorch + IREE = :octicons-heart-16:
 
 !!! caution "Caution - under development"
-    We are still validating and fixing specific models. Between bug fixes in
-    flight and releases running behind, we don't expect that you will be able
-    to do a lot of advanced things without using nightly releases or working
-    with us.
+
+    We are still validating and fixing specific models. We don't expect that
+    you will be able to do a lot of advanced things without working with us.
 
     Stay tuned and join the discussion in our
-    [Discord server](https://discord.gg/26P4xW4)'s `#pytorch` channel.
+    [Discord server](https://discord.gg/wEWh6Z9nMU)'s `#pytorch` channel.
 
 ## :octicons-book-16: Overview
 
-[SHARK-Turbine](https://github.com/nod-ai/SHARK-Turbine) offers a tight
+[iree-turbine](https://github.com/iree-org/iree-turbine) offers a tight
 integration between compatible versions of IREE,
 [torch-mlir](https://github.com/llvm/torch-mlir), and
 [PyTorch](https://pytorch.org/).
@@ -36,14 +35,14 @@ graph LR
   accTitle: PyTorch integration overview
   accDescr {
     PyTorch programs can be optimized within a Python session with
-    SHARK-Turbine's just-in-time tools.
+    iree-turbine's just-in-time tools.
     PyTorch programs can be exported out of Python to native binaries using
-    SHARK-Turbine's ahead-of-time export toolkit.
+    iree-turbine's ahead-of-time export toolkit.
   }
 
   subgraph Python
     pytorch(PyTorch)
-    subgraph turbine [SHARK-Turbine]
+    subgraph turbine [iree-turbine]
       jit("Eager execution (JIT)")
       aot("Export toolkit (AOT)")
     end
@@ -62,11 +61,56 @@ graph LR
 
 ## :octicons-download-16: Prerequisites
 
-Install Turbine and its requirements:
+1. First install a recent version of PyTorch by following
+   the [official instructions](https://pytorch.org/get-started/locally/):
 
-``` shell
-python -m pip install shark-turbine
-```
+    === ":fontawesome-brands-linux: Linux"
+
+        ``` shell
+        python -m pip install torch --index-url https://download.pytorch.org/whl/test/cpu
+        ```
+
+    === ":fontawesome-brands-apple: macOS"
+
+        ``` shell
+        python -m pip install torch
+        ```
+
+    === ":fontawesome-brands-windows: Windows"
+
+        ``` shell
+        python -m pip install torch
+        ```
+
+    !!! tip
+
+        IREE includes its own GPU support, so we recommend the CPU versions of
+        PyTorch. You can install CUDA or ROCm as you wish, but those packages
+        can be quite large.
+
+2. Then install iree-turbine:
+
+    === ":octicons-package-16: Stable releases"
+
+        Stable release packages are
+        [published to PyPI](https://pypi.org/project/iree-turbine/).
+
+        ``` shell
+        python -m pip install iree-turbine
+        ```
+
+    === ":octicons-beaker-16: Nightly pre-releases"
+
+        Nightly pre-releases are published on
+        [GitHub releases](https://github.com/iree-org/iree-turbine/releases/tag/dev-wheels).
+
+        ``` shell hl_lines="2-4"
+        python -m pip install \
+          --find-links https://iree.dev/pip-release-links.html \
+          --pre \
+          --upgrade \
+          iree-turbine
+        ```
 
 ## :octicons-flame-16: Just-in-time (JIT) execution
 
@@ -74,7 +118,7 @@ Just-in-time integration allows for Python code using TorchDynamo to optimize
 PyTorch models/functions using IREE, all within an interactive Python session.
 
 <!-- TODO(scotttodd): mention targets like AMD GPUs when supported
-                      https://github.com/nod-ai/SHARK-Turbine/issues/94 -->
+                      https://github.com/iree-org/iree-turbine/issues/78 -->
 
 ``` mermaid
 graph TD
@@ -91,7 +135,7 @@ graph TD
     subgraph compile ["torch.compile()"]
       direction LR
       dynamo{{TorchDynamo}}
-      turbine{{SHARK-Turbine}}
+      turbine{{iree-turbine}}
       iree{{IREE}}
       dynamo --> turbine --> iree
     end
@@ -101,12 +145,14 @@ graph TD
   end
 ```
 
-For deployment outside of Python, see the ahead-of-time sections below.
+For deployment outside of Python, see the
+[ahead-of-time sections below](#ahead-of-time-aot-export).
 
 ### :octicons-rocket-16: Quickstart
 
 Turbine integrates into PyTorch as a
-[custom backend](https://pytorch.org/docs/2.0/dynamo/custom-backends.html) for
+[custom backend](https://pytorch.org/docs/stable/torch.compiler_custom_backends.html)
+for
 [`torch.compile`](https://pytorch.org/docs/stable/generated/torch.compile.html).
 
 Behind the scenes, PyTorch captures the structure of the input model into a
@@ -142,8 +188,8 @@ turbine_output = opt_linear_module(args)
 
 | Code samples |  |
 | -- | -- |
-JIT compilation notebook | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openxla/iree/blob/main/samples/colab/pytorch_jit.ipynb)
-Simple MLP eager | [`examples/eager_mlp/mlp_eager_simple.py`](https://github.com/nod-ai/SHARK-Turbine/blob/main/examples/eager_mlp/mlp_eager_simple.py)
+JIT compilation notebook | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree/blob/main/samples/colab/pytorch_jit.ipynb)
+Simple MLP eager | [iree-turbine `core/examples/eager_mlp/mlp_eager_simple.py`](https://github.com/iree-org/iree-turbine/tree/main/examples/eager_mlp/mlp_eager_simple.py)
 
 ## :octicons-package-dependents-16: Ahead-of-time (AOT) export
 
@@ -181,7 +227,7 @@ graph LR
 ```python
 import iree.runtime as ireert
 import numpy as np
-import shark_turbine.aot as aot
+import iree.turbine.aot as aot
 import torch
 
 # Define the `nn.Module` to export.
@@ -206,7 +252,7 @@ binary = export_output.compile(save_to=None)
 # Use the IREE runtime API to test the compiled program.
 config = ireert.Config("local-task")
 vm_module = ireert.load_vm_module(
-    ireert.VmModule.wrap_buffer(config.vm_instance, binary.map_memory()),
+    ireert.VmModule.copy_buffer(config.vm_instance, binary.map_memory()),
     config,
 )
 input = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
@@ -218,8 +264,9 @@ print(result.to_host())
 
 | Code samples |  |
 | -- | -- |
-Simple AOT export notebook | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openxla/iree/blob/main/samples/colab/pytorch_aot_simple.ipynb)
-Simple MLP export | [`examples/aot_mlp/mlp_export_simple.py`](https://github.com/nod-ai/SHARK-Turbine/blob/main/examples/aot_mlp/mlp_export_simple.py)
+Simple AOT export notebook | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree/blob/main/samples/colab/pytorch_aot_simple.ipynb)
+Import [Whisper](https://huggingface.co/openai/whisper-small) from [:hugging: Hugging Face](https://huggingface.co/) notebook | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree/blob/main/samples/colab/pytorch_huggingface_whisper.ipynb)
+Simple MLP export | [iree-turbine `core/examples/aot_mlp/mlp_export_simple.py`](https://github.com/iree-org/iree-turbine/tree/main/examples/aot_mlp/mlp_export_simple.py)
 
 ### :octicons-tools-16: Advanced API
 
@@ -238,7 +285,7 @@ graph LR
   }
 
   subgraph Python
-    compiledmodule("aot.CompiledModule\n\n- extend nn.Module\n- export globals\n- set shapes/dtypes")
+    compiledmodule("aot.CompiledModule<br><br>- extend nn.Module<br>- export globals<br>- set shapes/dtypes")
     export(["ExportOutput (MLIR)"])
     compiledmodule -- "aot.export()" --> export
   end
@@ -251,15 +298,15 @@ graph LR
 ```
 
 Advanced export workflows can use the
-[`aot.CompiledModule`](https://github.com/nod-ai/SHARK-Turbine/blob/main/python/shark_turbine/aot/compiled_module.py)
+[`aot.CompiledModule`](https://github.com/iree-org/iree-turbine/blob/main/iree/turbine/aot/compiled_module.py)
 class to define and constrain the structure of a program prior to compiling it.
 
 <!-- TODO(scotttodd): API reference pages for aot.CompiledModule etc.?
-                      https://github.com/nod-ai/SHARK-Turbine/issues/106
+                      https://github.com/iree-org/iree-turbine/issues/77
 -->
 
 ```python
-import shark_turbine.aot as aot
+import iree.turbine.aot as aot
 
 # A minimal program, with no functions or variables.
 class BasicModule(aot.CompiledModule):
@@ -284,59 +331,6 @@ exported function (typically called "forward"), while more complex programs can
 have multiple computation functions, initialization functions, "backward"
 methods for training, state management functions, debugging functions, etc.
 
-* Each instance method on a `aot.CompiledModule`-derived class is exported.
-  These instance methods can include calls to other `aot` components, such as
-  `aot.jittable` compute functions:
-
-    ```python
-    class GetOnesModule(aot.CompiledModule):
-      @aot.jittable
-      def compute_ones():
-        return torch.ones(3)
-
-      def get_ones(self):
-        return self.compute_ones()
-    ```
-
-* Instance methods can use `aot.AbstractTensor` to specify data types:
-
-    ```python hl_lines="8-9"
-    class IntSumModule(aot.CompiledModule):
-      @aot.jittable
-      def compute_sum(a, b):
-        return a + b
-
-      def sum_int32(
-        self,
-        a=aot.AbstractTensor(2, dtype=torch.int32),
-        b=aot.AbstractTensor(2, dtype=torch.int32),
-      ):
-        return self.compute_sum(a, b)
-    ```
-
-* Shapes can be made dynamic using `aot.AbstractTensor` and `aot.jittable`
-  constraints:
-
-    ```python hl_lines="8-9 14-16"
-    class DynamicSumModule(aot.CompiledModule):
-      @aot.jittable
-      def compute_sum(a, b):
-        return a + b
-
-      def sum_dynamic(
-        self,
-        a=aot.AbstractTensor(None),
-        b=aot.AbstractTensor(None),
-      ):
-        return self.compute_sum(
-            a,
-            b,
-            constraints=[
-                a.dynamic_dim(0) == b.dynamic_dim(0),
-            ],
-        )
-    ```
-
 #### :material-variable: Global variables
 
 _Global variables_ are used to represent persistent state within a program
@@ -349,8 +343,7 @@ their values independently at runtime.
 * Individual globals can be exported using `aot.export_global()`:
 
     ```python
-    state_example = torch.tensor(0, dtype=torch.int32)
-    update_example = torch.tensor(0, dtype=torch.int32)
+    state_example = torch.zeros([1], dtype=torch.int32)
 
     class SampleModule(aot.CompiledModule):
       value = aot.export_global(state_example, mutable=True)
@@ -358,66 +351,140 @@ their values independently at runtime.
       def get_value(self):
         return self.value
 
-      def update_value(self, new_value=aot.abstractify(update_example)):
+      def update_value(self, new_value=aot.abstractify(value)):
         self.value = new_value
     ```
 
-* All named parameters on a `nn.Module` can be exported using
-  `export_parameters()`:
+#### :octicons-file-symlink-file-16: Using external parameters
 
-    ```python hl_lines="12 18-26"
-    class SimpleParams(torch.nn.Module):
-      def __init__(self):
+Model parameters can be stored in standalone files that can be efficiently
+stored and loaded separately from model compute graphs. See the
+[Parameters guide](../parameters.md) for more general information about
+parameters in IREE.
+
+When using iree-turbine, the `aot.externalize_module_parameters()` function
+separates parameters from program modules and encodes a symbolic relationship
+between them so they can be loaded at runtime.
+
+We use [Safetensors](https://huggingface.co/docs/safetensors/) here to store the
+models parameters on disk, so that they can be loaded later during runtime.
+
+```python
+import torch
+from safetensors.torch import save_file
+import numpy as np
+import iree.turbine.aot as aot
+
+class LinearModule(torch.nn.Module):
+    def __init__(self, in_features, out_features):
         super().__init__()
-        self.classifier = torch.nn.Linear(20, 30)
+        self.weight = torch.nn.Parameter(torch.randn(in_features, out_features))
+        self.bias = torch.nn.Parameter(torch.randn(out_features))
 
-      def forward(self, x):
-        return self.classifier(x)
+    def forward(self, input):
+        return (input @ self.weight) + self.bias
 
-    m = SimpleParams()
+linear_module = LinearModule(4,3)
 
-    class SimpleParamsModule(aot.CompiledModule):
-      params = aot.export_parameters(m)
-      compute = aot.jittable(m.forward)
+# Create a params dictionary. Note that the keys here match LinearModule's
+# attributes. We will use the saved safetensor file for use from the command
+# line.
+wt = linear_module.weight.data.contiguous()
+bias = linear_module.bias.data.contiguous()
+params = { "weight": wt, "bias": bias }
+save_file(params, "params.safetensors")
 
-      def run(self, x=aot.AbstractTensor(128, 20)):
-        return self.compute(x)
+# Externalize the model parameters. This removes weight tensors from the IR
+# module, allowing them to be loaded at runtime. Symbolic references to these
+# parameters are still retained in the IR.
+aot.externalize_module_parameters(linear_module)
 
-      # torch.nn.Linear has 'weight' and 'bias' variables:
-      #   https://pytorch.org/docs/stable/generated/torch.nn.Linear.html
-      # Add getters for both exported parameters.
+input = torch.randn(4)
+exported_module = aot.export(linear_module, input)
 
-      def get_weight(self):
-        return self.params["classifier.weight"]
+# Compile the exported module, to generate the binary. When `save_to` is
+# not None, the binary will be stored at the path passed in to `save_to`.
+# Here, we pass in None, so that the binary can stored in a variable.
+binary = exported_module.compile(save_to=None)
 
-      def get_bias(self):
-        return self.params["classifier.bias"]
+# Save the input as an npy tensor, so that it can be passed in through the
+# command line to `iree-run-module`.
+input_np = input.numpy()
+np.save("input.npy", input_np)
+```
+
+=== "Python runtime"
+
+    Runtime invocation now requires loading the parameters as a separate module.
+    To get the parameters as a module, iree.runtime provides a convenient method,
+    called `create_io_parameters_module()`.
+
+    ```python
+    import iree.runtime as ireert
+
+    # To load the parameters, we need to define ParameterIndex for each
+    # parameter class.
+    idx = ireert.ParameterIndex()
+    idx.add_buffer("weight", wt.detach().numpy().tobytes())
+    idx.add_buffer("bias", bias.detach().numpy().tobytes())
+
+
+    # Create the runtime instance, and load the runtime.
+    config = ireert.Config(driver_name="local-task")
+    instance = config.vm_instance
+
+    param_module = ireert.create_io_parameters_module(
+        instance, idx.create_provider(scope="model"),
+    )
+
+    # Load the runtime. There are essentially two modules to load, one for the
+    # weights, and one for the main module. Ensure that the VMFB file is not
+    # already open or deleted before use.
+    vm_modules = ireert.load_vm_modules(
+        param_module,
+        ireert.create_hal_module(instance, config.device),
+        ireert.VmModule.copy_buffer(instance, binary.map_memory()),
+        config=config,
+    )
+
+    # vm_modules is a list of modules. The last module in the list is the one
+    # generated from the binary, so we use that to generate an output.
+    result = vm_modules[-1].main(input)
+    print(result.to_host())
     ```
+
+=== "Command line tools"
+
+    It is also possible to save the VMFB binary to disk, then call `iree-run-module`
+    through the command line to generate outputs.
+
+    ```python
+    # When save_to is not None, the binary is saved to the given path,
+    # and a None value is returned.
+    binary = exported_module.compile(save_to="compiled_module.vmfb")
+    ```
+
+    The stored safetensors file, the input tensor, and the VMFB can now be passed
+    in to IREE through the command line.
+
+    ```bash
+    iree-run-module --module=compiled_module.vmfb --parameters=model=params.safetensors \
+                    --input=@input.npy
+    ```
+
+    Note here that the `--parameters` flag has `model=` following it immediately.
+    This simply specifies the scope of the parameters, and is reflected in the
+    compiled module.
 
 #### :octicons-code-16: Samples
 
 | Code samples |  |
 | -- | -- |
-Advanced AOT export notebook | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openxla/iree/blob/main/samples/colab/pytorch_aot_advanced.ipynb)
-PyTorch dynamic shapes notebook | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openxla/iree/blob/main/samples/dynamic_shapes/pytorch_dynamic_shapes.ipynb)
-AOT unit tests | [`tests/aot/`](https://github.com/nod-ai/SHARK-Turbine/tree/main/tests/aot)
-Dynamic MLP export | [`examples/aot_mlp/mlp_export_dynamic.py`](https://github.com/nod-ai/SHARK-Turbine/blob/main/examples/aot_mlp/mlp_export_dynamic.py)
-stateless llama2 | [`python/turbine_models/custom_models/stateless_llama.py`](https://github.com/nod-ai/SHARK-Turbine/blob/main/python/turbine_models/custom_models/stateless_llama.py)
+Advanced AOT export notebook | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree/blob/main/samples/colab/pytorch_aot_advanced.ipynb)
+PyTorch dynamic shapes notebook | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree/blob/main/samples/dynamic_shapes/pytorch_dynamic_shapes.ipynb)
+AOT unit tests | [iree-turbine `tests/aot/`](https://github.com/iree-org/iree-turbine/tree/main/tests/aot)
 
-## Alternate workflows
-
-!!! caution "Caution - These are due for migration to SHARK-Turbine."
-
-| Code samples |  |
-| -- | -- |
-(Deprecated) Inference on BERT | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iree-org/iree-torch/blob/main/examples/bert.ipynb)
-
-### Native / on-device training
-
-A small (~100-250KB), self-contained binary can be built for deploying to
-resource-constrained environments without a Python interpreter.
-
-| Example scripts |
-| -- |
-| [Basic Inference and Training Example](https://github.com/iree-org/iree-torch/blob/main/examples/regression.py) |
-| [Native On-device Training Example](https://github.com/iree-org/iree-torch/tree/main/examples/native_training) |
+The sharktank project hosted at
+<https://github.com/nod-ai/shark-ai/tree/main/sharktank> also uses
+`iree-turbine` heavily to provide inference-optimized ops, layers, and models
+for popular gen-ai applications.

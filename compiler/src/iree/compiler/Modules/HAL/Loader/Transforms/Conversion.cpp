@@ -15,7 +15,6 @@
 #include "iree/compiler/Modules/HAL/Inline/IR/HALInlineDialect.h"
 #include "iree/compiler/Modules/HAL/Loader/Conversion/StreamToHALLoader/Patterns.h"
 #include "iree/compiler/Modules/HAL/Loader/IR/HALLoaderDialect.h"
-#include "iree/compiler/Modules/HAL/Loader/Transforms/PassDetail.h"
 #include "iree/compiler/Modules/HAL/Loader/Transforms/Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -25,11 +24,15 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
-namespace mlir::iree_compiler::IREE::HAL {
-namespace Loader {
+namespace mlir::iree_compiler::IREE::HAL::Loader {
+
+#define GEN_PASS_DEF_CONVERSIONPASS
+#include "iree/compiler/Modules/HAL/Loader/Transforms/Passes.h.inc"
+
+namespace {
 
 // Runs conversion with registered input dialects.
-class ConversionPass : public ConversionBase<ConversionPass> {
+class ConversionPass final : public impl::ConversionPassBase<ConversionPass> {
 public:
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<IREE::Util::UtilDialect, IREE::HAL::HALDialect,
@@ -101,9 +104,5 @@ public:
   }
 };
 
-std::unique_ptr<OperationPass<mlir::ModuleOp>> createConversionPass() {
-  return std::make_unique<ConversionPass>();
-}
-
-} // namespace Loader
-} // namespace mlir::iree_compiler::IREE::HAL
+} // namespace
+} // namespace mlir::iree_compiler::IREE::HAL::Loader

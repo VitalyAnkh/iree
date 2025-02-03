@@ -23,6 +23,7 @@ iree_cc_library(
     ::check_ops_gen
     MLIRArithDialect
     MLIRFuncDialect
+    MLIRFunctionInterfaces
     MLIRIR
     iree::compiler::Dialect::HAL::IR
   PUBLIC
@@ -40,6 +41,7 @@ iree_cc_library(
     ::check_ops_gen
     MLIRIR
     MLIRParser
+    MLIRTransformUtils
     MLIRTransforms
     iree::compiler::Dialect::HAL::Conversion
     iree::compiler::Dialect::HAL::IR::HALDialect

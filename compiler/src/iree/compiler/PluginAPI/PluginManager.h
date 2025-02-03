@@ -102,14 +102,15 @@ public:
     }
   }
 
-  void populateCustomInputConversionTypes(StringSet<> &typeMnemonics) override {
+  void populateCustomInputConversionTypes(
+      llvm::StringSet<> &typeMnemonics) override {
     for (auto *s : initializedSessions) {
       s->populateCustomInputConversionTypes(typeMnemonics);
     }
   }
 
   void populateDetectedCustomInputConversionTypes(
-      ModuleOp &module, StringSet<> &typeMnemonics) override {
+      ModuleOp &module, llvm::StringSet<> &typeMnemonics) override {
     for (auto *s : initializedSessions) {
       s->populateDetectedCustomInputConversionTypes(module, typeMnemonics);
     }
@@ -132,6 +133,10 @@ public:
       s->extendPreprocessingPassPipeline(passManager);
     }
   }
+
+  // Populates the given list of HAL target devices for all initialized
+  // plugins.
+  void populateHALTargetDevices(IREE::HAL::TargetDeviceList &list);
 
   // Populates the given list of HAL target backends for all initialized
   // plugins.

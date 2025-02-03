@@ -12,7 +12,6 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Matchers.h"
@@ -26,6 +25,123 @@
 #include "mlir/Support/LogicalResult.h"
 
 namespace mlir::iree_compiler::IREE::Util {
+
+//===----------------------------------------------------------------------===//
+// util.assume.int
+//===----------------------------------------------------------------------===//
+
+LogicalResult AssumeIntOp::canonicalize(AssumeIntOp op,
+                                        PatternRewriter &rewriter) {
+  bool needsRewrite = false;
+  ArrayAttr assumptions = op.getAssumptions();
+
+  // We do a fast check for the canonical form here, making any in-place updates
+  // we can and signalling needsRewrite=true when the op needs to be updated
+  // to a new canonical form.
+  SmallPtrSet<Value, 4> seenOperands;
+  seenOperands.reserve(op.getNumOperands());
+  for (auto [idx, operand] : llvm::enumerate(op.getOperands())) {
+    // Match constant.
+    if (matchPattern(operand, m_Constant())) {
+      needsRewrite = true;
+      rewriter.replaceAllUsesWith(op.getResult(idx), operand);
+      continue;
+    }
+
+    // Check for a duplicate.
+    auto [foundIt, inserted] = seenOperands.insert(operand);
+    if (!inserted) {
+      // This should be the non-common path: find the original index number
+      // and rewrite.
+      for (auto [seenIdx, seenOperand] : llvm::enumerate(op.getOperands())) {
+        if (seenOperand == operand) {
+          needsRewrite = true;
+          rewriter.replaceAllUsesWith(op.getResult(idx), op.getResult(seenIdx));
+          break;
+        }
+      }
+      continue;
+    }
+
+    // Detect whether assumptions need to be normalized.
+    ArrayAttr assumptionRow = llvm::cast<ArrayAttr>(assumptions[idx]);
+    if (assumptionRow.size() > 1) {
+      bool allAssumptionsSame = true;
+      for (unsigned i = 1; i < assumptionRow.size(); ++i) {
+        if (assumptionRow[i] != assumptionRow[0]) {
+          allAssumptionsSame = false;
+          break;
+        }
+      }
+      if (allAssumptionsSame) {
+        needsRewrite = true;
+      }
+    }
+  }
+  if (!needsRewrite)
+    return failure();
+
+  // Need to rewrite the assumption.
+  auto normalizeAssumptions = [](Attribute row, bool &madeChange) {
+    auto rowArray = llvm::cast<ArrayAttr>(row);
+    if (rowArray.size() <= 1)
+      return rowArray;
+
+    bool allSame = true;
+    for (unsigned i = 1; i < rowArray.size(); ++i) {
+      if (rowArray[0] != rowArray[i]) {
+        allSame = false;
+        break;
+      }
+    }
+
+    if (!allSame)
+      return rowArray;
+
+    // All entries are the same: compress down to a single column.
+    madeChange = true;
+    return ArrayAttr::get(row.getContext(), {rowArray[0]});
+  };
+  SmallVector<ArrayAttr> newAssumptions;
+  SmallVector<Value> newOperands;
+  SmallVector<Value> retainedResults;
+  bool madeChange = false;
+  for (auto [idx, operand] : llvm::enumerate(op.getOperands())) {
+    // If the result has no uses, do not retain it.
+    if (op.getResult(idx).use_empty()) {
+      madeChange = true;
+      continue;
+    }
+
+    newAssumptions.push_back(
+        normalizeAssumptions(assumptions[idx], madeChange));
+    newOperands.push_back(operand);
+    retainedResults.push_back(op.getResult(idx));
+  }
+
+  // It is important to avoid canonicalizer looping that if we determined at
+  // the top that a rewrite was needed, that we actually made a change.
+  (void)madeChange;
+  assert(madeChange && "util.assume.int canonicalizer signaled a rewrite was "
+                       "needed but it produced the same op");
+
+  if (!newOperands.empty()) {
+    auto newOp =
+        rewriter.create<AssumeIntOp>(op.getLoc(), newOperands, newAssumptions);
+    rewriter.replaceAllUsesWith(retainedResults, newOp.getResults());
+  }
+
+  rewriter.eraseOp(op);
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// util.null
+//===----------------------------------------------------------------------===//
+
+OpFoldResult NullOp::fold(FoldAdaptor operands) {
+  return IREE::Util::NullAttr::get(getContext(), getType());
+}
 
 //===----------------------------------------------------------------------===//
 // util.cast
@@ -78,6 +194,27 @@ OpFoldResult CmpEQOp::fold(FoldAdaptor operands) {
              operands.getLhs() == operands.getRhs()) {
     // Folded attributes are equal but may come from separate ops.
     return makeBool(true);
+  }
+  // TODO(benvanik): we could add some interfaces for comparing, but this is
+  // likely good enough for now.
+  return {};
+}
+
+//===----------------------------------------------------------------------===//
+// util.cmp.ne
+//===----------------------------------------------------------------------===//
+
+OpFoldResult CmpNEOp::fold(FoldAdaptor operands) {
+  auto makeBool = [&](bool value) {
+    return IntegerAttr::get(IntegerType::get(getContext(), 1), value ? 1 : 0);
+  };
+  if (getLhs() == getRhs()) {
+    // SSA values are exactly the same.
+    return makeBool(false);
+  } else if (operands.getLhs() && operands.getRhs() &&
+             operands.getLhs() == operands.getRhs()) {
+    // Folded attributes are equal but may come from separate ops.
+    return makeBool(false);
   }
   // TODO(benvanik): we could add some interfaces for comparing, but this is
   // likely good enough for now.
@@ -368,7 +505,7 @@ static bool isAlignedTo(Value value, Value alignment) {
   APInt staticAlignment;
   bool hasStaticAlignment =
       matchPattern(alignment, m_ConstantInt(&staticAlignment));
-  if (hasStaticValue && hasStaticAlignment) {
+  if (hasStaticValue && hasStaticAlignment && !staticAlignment.isZero()) {
     // If this value is itself a multiple of the alignment then we can fold.
     if (staticValue.urem(staticAlignment).isZero()) {
       return true; // value % alignment == 0
@@ -538,7 +675,7 @@ struct DropEmptyInitializerOp : public OpRewritePattern<InitializerOp> {
     if (op.getBody().getBlocks().size() != 1)
       return failure();
     auto &block = op.getBody().front();
-    if (block.empty() || isa<InitializerReturnOp>(block.front())) {
+    if (block.empty() || isa<IREE::Util::ReturnOp>(block.front())) {
       rewriter.eraseOp(op);
       return success();
     }
@@ -565,7 +702,7 @@ struct InlineConstantGlobalInitializer
       auto globalOp =
           SymbolTable::lookupNearestSymbolFrom<IREE::Util::GlobalOpInterface>(
               storeOp->getParentOp(), storeOp.getGlobalAttr());
-      rewriter.updateRootInPlace(
+      rewriter.modifyOpInPlace(
           globalOp, [&]() { globalOp.setGlobalInitialValue(valueAttr); });
 
       deadOps.push_back(storeOp);
@@ -592,17 +729,16 @@ void GlobalOp::getCanonicalizationPatterns(RewritePatternSet &results,
 namespace {
 
 /// Turns util.global.address -> util.global.load.indirect into a direct load.
-class PropagateGlobalLoadAddress
-    : public OpRewritePattern<GlobalLoadIndirectOp> {
-  using OpRewritePattern::OpRewritePattern;
-
-public:
-  LogicalResult matchAndRewrite(GlobalLoadIndirectOp op,
+template <typename IndirectOpT, typename DirectOpT>
+struct PropagateGlobalLoadAddress : public OpRewritePattern<IndirectOpT> {
+  using OpRewritePattern<IndirectOpT>::OpRewritePattern;
+  LogicalResult matchAndRewrite(IndirectOpT op,
                                 PatternRewriter &rewriter) const override {
     if (auto addressOp = dyn_cast_or_null<GlobalAddressOpInterface>(
             op.getGlobal().getDefiningOp())) {
-      rewriter.replaceOpWithNewOp<GlobalLoadOp>(op, op.getResult().getType(),
-                                                addressOp.getGlobalAttr());
+      rewriter.replaceOpWithNewOp<DirectOpT>(
+          op, op.getResult().getType(), addressOp.getGlobalAttr(),
+          addressOp.isGlobalImmutable() ? rewriter.getUnitAttr() : UnitAttr{});
       return success();
     }
     return failure();
@@ -613,7 +749,8 @@ public:
 
 void GlobalLoadIndirectOp::getCanonicalizationPatterns(
     RewritePatternSet &results, MLIRContext *context) {
-  results.insert<PropagateGlobalLoadAddress>(context);
+  results.insert<PropagateGlobalLoadAddress<IREE::Util::GlobalLoadIndirectOp,
+                                            IREE::Util::GlobalLoadOp>>(context);
 }
 
 namespace {
@@ -744,7 +881,7 @@ struct FoldBufferSubspanOpsIntoConsumers
           fusedLoc, op.getSourceOffset(), oldRange.offset);
       auto newRange = SubrangeOperand{op.getSource(), op.getSourceSize(),
                                       newOffset, oldRange.length};
-      rewriter.updateRootInPlace(subrangeOp, [&]() {
+      rewriter.modifyOpInPlace(subrangeOp, [&]() {
         subrangeOp.setSubrangeOperand(use.getOperandNumber(), newRange);
       });
     }
@@ -893,7 +1030,7 @@ struct FoldSubspansIntoStorageOp : public OpRewritePattern<BufferStorageOp> {
     rewriter.setInsertionPointAfter(op);
     auto newOffset = rewriter.createOrFold<arith::AddIOp>(
         fusedLoc, subspanOp.getSourceOffset(), op.getOffset());
-    rewriter.updateRootInPlace(op, [&]() {
+    rewriter.modifyOpInPlace(op, [&]() {
       op.getOperandMutable().assign(subspanOp.getSource());
       op.getOperandSizeMutable().assign(subspanOp.getSourceSize());
       SmallPtrSet<Operation *, 2> exceptions;

@@ -1,17 +1,8 @@
 // RUN: iree-opt --split-input-file %s | iree-opt --split-input-file | FileCheck %s
 
-// CHECK-LABEL: @shared_device
-func.func @shared_device() -> !hal.device {
-  // CHECK: %device = hal.ex.shared_device : !hal.device
-  %device = hal.ex.shared_device : !hal.device
-  return %device : !hal.device
-}
-
-// -----
-
 // CHECK-LABEL: @file_from_memory
 // CHECK-SAME: (%[[DEVICE:.+]]: !hal.device, %[[BUFFER:.+]]: !util.buffer)
-func.func @file_from_memory(%device: !hal.device, %buffer: !util.buffer) -> !hal.file {
+util.func public @file_from_memory(%device: !hal.device, %buffer: !util.buffer) -> !hal.file {
   // CHECK-DAG: %[[AFFINITY:.+]] = arith.constant -1
   %affinity = arith.constant -1 : i64
   // CHECK-DAG: %[[OFFSET:.+]] = arith.constant 100
@@ -33,5 +24,5 @@ func.func @file_from_memory(%device: !hal.device, %buffer: !util.buffer) -> !hal
       access(Read)
       buffer(%buffer : !util.buffer)[%offset for %length]
       flags(%flags) : !hal.file
-  return %file : !hal.file
+  util.return %file : !hal.file
 }

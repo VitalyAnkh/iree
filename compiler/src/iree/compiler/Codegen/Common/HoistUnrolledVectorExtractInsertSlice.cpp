@@ -4,7 +4,6 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Codegen/Common/PassDetail.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/Patterns.h"
@@ -21,6 +20,9 @@
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_HOISTUNROLLEDVECTOREXTRACTINSERTSLICEPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
 
 /// Returns all the users of `srcTensor` if they are artifacts from vector
 /// unrolling. It is true only if
@@ -126,10 +128,10 @@ static scf::ForOp hoistVectorExtractInsertSlice(
     if (!forOp.isDefinedOutsideOfLoop(extractStridedSliceOp.getVector())) {
       assert(extractStridedSliceOp.getVector() == tensorBBArg &&
              "extractSlice source not defined above must be the tracked bbArg");
-      rewriter.startRootUpdate(extractStridedSliceOp);
+      rewriter.startOpModification(extractStridedSliceOp);
       extractStridedSliceOp.getVectorMutable().assign(
           forOp.getInitArgs()[initArgNumber]);
-      rewriter.finalizeRootUpdate(extractStridedSliceOp);
+      rewriter.finalizeOpModification(extractStridedSliceOp);
     }
   }
 
@@ -149,20 +151,20 @@ static scf::ForOp hoistVectorExtractInsertSlice(
   // 3. Update the yield. Invariant: initArgNumber is the destination tensor.
   auto yieldOp =
       cast<scf::YieldOp>(newForOp.getRegion().front().getTerminator());
-  rewriter.startRootUpdate(yieldOp);
+  rewriter.startOpModification(yieldOp);
   yieldOp->setOperand(initArgNumber, insertOps[0].getDest());
-  rewriter.finalizeRootUpdate(yieldOp);
+  rewriter.finalizeOpModification(yieldOp);
 
   // 4. Hoist all the write ops after and make uses of
   // newForOp.getResult(initArgNumber) flow through it.
   for (auto [idx, insertStridedSliceOp] : llvm::enumerate(insertOps)) {
     insertStridedSliceOp->moveAfter(newForOp);
-    rewriter.startRootUpdate(insertStridedSliceOp);
+    rewriter.startOpModification(insertStridedSliceOp);
     insertStridedSliceOp.getSourceMutable().assign(
         newForOp.getResults()[initArgNumber + idx + 1]);
     insertStridedSliceOp.getDestMutable().assign(
         newForOp.getResults()[initArgNumber]);
-    rewriter.finalizeRootUpdate(insertStridedSliceOp);
+    rewriter.finalizeOpModification(insertStridedSliceOp);
     rewriter.replaceAllUsesExcept(newForOp.getResult(initArgNumber),
                                   insertStridedSliceOp.getResult(),
                                   insertStridedSliceOp);
@@ -199,13 +201,10 @@ static scf::ForOp hoistUnrolledVectorExtractInsert(RewriterBase &rewriter,
 }
 
 namespace {
-class HoistUnrolledVectorExtractInsertSlicePass
-    : public HoistUnrolledVectorExtractInsertSliceBase<
+class HoistUnrolledVectorExtractInsertSlicePass final
+    : public impl::HoistUnrolledVectorExtractInsertSlicePassBase<
           HoistUnrolledVectorExtractInsertSlicePass> {
 public:
-  using HoistUnrolledVectorExtractInsertSliceBase::
-      HoistUnrolledVectorExtractInsertSliceBase;
-
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<scf::SCFDialect, vector::VectorDialect>();
   }
@@ -225,16 +224,10 @@ void HoistUnrolledVectorExtractInsertSlicePass::runOnOperation() {
   scf::ForOp::getCanonicalizationPatterns(patterns, ctx);
   vector::InsertStridedSliceOp::getCanonicalizationPatterns(patterns, ctx);
   vector::ExtractStridedSliceOp::getCanonicalizationPatterns(patterns, ctx);
-  if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+  if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
     LLVM_DEBUG(llvm::dbgs() << "----- cleanup failed -----\n");
     return signalPassFailure();
   }
 }
 } // namespace
-
-std::unique_ptr<OperationPass<func::FuncOp>>
-createHoistUnrolledVectorExtractInsertSlicePass() {
-  return std::make_unique<HoistUnrolledVectorExtractInsertSlicePass>();
-}
-
 } // namespace mlir::iree_compiler

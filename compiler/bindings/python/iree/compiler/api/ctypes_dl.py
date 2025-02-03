@@ -9,12 +9,12 @@
 from ctypes import *
 from enum import IntEnum
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Any, Sequence
 
 import ctypes
 import logging
-import os
 import platform
+import weakref
 
 __all__ = [
     "Invocation",
@@ -48,6 +48,8 @@ def _init_dylib():
         None,
         [c_int, POINTER(c_char_p), c_char_p, c_bool],
     )
+    _setsig(_dylib.ireeCompilerGlobalInitialize, None, [])
+    _setsig(_dylib.ireeCompilerGlobalShutdown, None, [])
 
     # Setup signatures.
     # Error
@@ -98,7 +100,7 @@ def _init_dylib():
         c_void_p,
         [c_void_p, c_int, c_void_p],
     )
-    # From MLIRInterop.h.
+    # From mlir_interop.h.
     _setsig(
         _dylib.ireeCompilerSessionStealContext,
         c_void_p,
@@ -177,6 +179,21 @@ def _initializeGlobalCL(*cl_args: str):
     _dylib.ireeCompilerSetupGlobalCL(len(cl_args), arg_pointers, b"ctypes", False)
 
 
+def _is_null_terminated(view: memoryview):
+    return view.nbytes > 0 and view[-1] == 0
+
+
+def _is_mlir_bytecode(view: memoryview):
+    """Compares the first 4 bytes of the view against the magic number 4d4cef52.
+    See https://mlir.llvm.org/docs/BytecodeFormat/#magic-number for more info."""
+    return len(view) >= 4 and view[:4].hex() == "4d4cef52"
+
+
+class SessionObject:
+    def close(self):
+        ...
+
+
 class Session:
     def __init__(self):
         self._global_init = _global_init
@@ -185,12 +202,27 @@ class Session:
         # its ownership of it, so we must cache the new Python-level MLIRContext
         # so its lifetime extends at least to our own.
         self._owned_context = None
+        self._dependents: set[SessionObject] = set()
 
     def __del__(self):
-        _dylib.ireeCompilerSessionDestroy(self._session_p)
+        self.close()
+
+    def close(self):
+        if self._session_p:
+            for dep in list(self._dependents):
+                dep.close()
+            _dylib.ireeCompilerSessionDestroy(self._session_p)
+            self._session_p = c_void_p()
+
+    def __enter__(self) -> "Session":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     @property
     def context(self):
+        assert self._session_p, "Session is closed"
         if self._owned_context is None:
             from .. import ir
 
@@ -206,9 +238,11 @@ class Session:
         return self._owned_context
 
     def invocation(self) -> "Invocation":
+        assert self._session_p, "Session is closed"
         return Invocation(self)
 
     def get_flags(self, non_default_only: bool = False) -> Sequence[str]:
+        assert self._session_p, "Session is closed"
         results = []
 
         @_GET_FLAG_CALLBACK
@@ -222,7 +256,8 @@ class Session:
         )
         return results
 
-    def set_flags(self, *flags: Sequence[str]):
+    def set_flags(self, *flags: str):
+        assert self._session_p, "Session is closed"
         argv_type = c_char_p * len(flags)
         argv = argv_type(*[flag.encode("UTF-8") for flag in flags])
         _handle_error(
@@ -245,6 +280,12 @@ class Output:
             self._local_dylib.ireeCompilerOutputDestroy(self._output_p)
             self._output_p = None
 
+    def __enter__(self) -> "Invocation":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     @staticmethod
     def open_file(file_path: str) -> "Output":
         output_p = c_void_p()
@@ -261,6 +302,7 @@ class Output:
 
     def keep(self) -> "Output":
         _dylib.ireeCompilerOutputKeep(self._output_p)
+        return self
 
     def write(self, buffer):
         _handle_error(
@@ -276,14 +318,23 @@ class Output:
             )
         )
         size = size.value
-        return memoryview((c_char * size).from_address(contents.value))
+        pointer = (c_char * size).from_address(contents.value)
+        # When the pointer is free'd, the no-op callback is invoked with
+        # the argument `self`. This implicitly keeps `self` alive until
+        # the callback is invoked, which keeps the compiler Output alive.
+        # The typical use of this pointer is to read it via the buffer
+        # protocol, and that will keep the pointer alive. Therefore, the
+        # chain is secure.
+        weakref.finalize(pointer, lambda x: ..., self)
+        return pointer
 
 
-class Source:
+class Source(SessionObject):
     """Wraps an iree_compiler_source_t."""
 
     def __init__(self, session: Session, source_p: c_void_p, backing_ref):
-        self._session: c_void_p = session  # Keeps ref alive.
+        self._session: Session | None = session  # Keeps ref alive.
+        self._session._dependents.add(self)
         self._source_p: c_void_p = source_p
         self._backing_ref = backing_ref
         self._local_dylib = _dylib
@@ -297,7 +348,14 @@ class Source:
             self._source_p = c_void_p()
             self._local_dylib.ireeCompilerSourceDestroy(s)
             self._backing_ref = None
-            self._session = c_void_p()
+            self._session._dependents.remove(self)
+            self._session = None
+
+    def __enter__(self) -> "Invocation":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     def __repr__(self):
         return f"<Source {self._source_p}>"
@@ -328,7 +386,7 @@ class Source:
                 buffer,
                 buffer_len,
                 # Detect if nul terminated.
-                True if buffer_len > 0 and view[-1] == 0 else False,
+                _is_null_terminated(view) and not _is_mlir_bytecode(view),
                 byref(source_p),
             )
         )
@@ -341,11 +399,12 @@ class PipelineType(IntEnum):
     IREE_COMPILER_PIPELINE_PRECOMPILE = 2
 
 
-class Invocation:
+class Invocation(SessionObject):
     def __init__(self, session: Session):
-        self._session = session
+        self._session: Session | None = session
+        self._session._dependents.add(self)
         self._inv_p = _dylib.ireeCompilerInvocationCreate(self._session._session_p)
-        self._sources: List[Source] = []
+        self._sources: list[Source] = []
         self._local_dylib = _dylib
         # If we are importing from a module, then the MLIR/Python Operation
         # will own the module, so we need to make sure that it outlives the
@@ -366,6 +425,14 @@ class Invocation:
             for s in self._sources:
                 s.close()
             self._sources.clear()
+            self._session._dependents.remove(self)
+            self._session = None
+
+    def __enter__(self) -> "Invocation":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     def enable_console_diagnostics(self):
         _dylib.ireeCompilerInvocationEnableConsoleDiagnostics(self._inv_p)
@@ -468,7 +535,7 @@ def _probe_iree_compiler_dylib() -> str:
     if not paths:
         paths = _mlir_libs.__path__
 
-    logging.debug("Found installed iree-compiler package %r", version_dict)
+    logging.debug("Found installed IREE compiler package %r", version_dict)
     dylib_basename = "libIREECompiler.so"
     system = platform.system()
     if system == "Darwin":

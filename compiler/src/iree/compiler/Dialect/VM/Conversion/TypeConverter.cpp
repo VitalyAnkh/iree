@@ -10,7 +10,6 @@
 #include "iree/compiler/Dialect/VM/IR/VMOps.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 
 #define DEBUG_TYPE "iree-vm"
@@ -67,7 +66,7 @@ TypeConverter::TypeConverter(TargetOptions targetOptions)
     if (floatType.getIntOrFloatBitWidth() < 32) {
       if (targetOptions_.f32Extension) {
         // Promote f16 -> f32.
-        return FloatType::getF32(floatType.getContext());
+        return Float32Type::get(floatType.getContext());
       } else {
         // f32 is not supported; can't compile.
         return std::nullopt;
@@ -87,7 +86,7 @@ TypeConverter::TypeConverter(TargetOptions targetOptions)
                  targetOptions_.truncateUnsupportedFloats) {
         // f64 is not supported and we still want to compile, so truncate to
         // f32 (unsafe if all bits are actually required!).
-        return FloatType::getF32(floatType.getContext());
+        return Float32Type::get(floatType.getContext());
       }
     }
     return std::nullopt;

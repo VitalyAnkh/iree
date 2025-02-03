@@ -4,8 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include "iree/compiler/Codegen/Common/PassUtils.h"
+#include "iree/compiler/Codegen/Common/Transforms.h"
 #include "iree/compiler/Codegen/LLVMCPU/DispatchABI.h"
-#include "iree/compiler/Codegen/LLVMCPU/PassDetail.h"
 #include "iree/compiler/Codegen/LLVMCPU/Passes.h"
 #include "iree/compiler/Codegen/LLVMCPU/Utils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
@@ -21,10 +22,12 @@
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ArmNeon2dToIntr/ArmNeon2dToIntr.h"
+#include "mlir/Conversion/ArmSMEToLLVM/ArmSMEToLLVM.h"
 #include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
+#include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/LoweringOptions.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
@@ -39,12 +42,15 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/ArmNeon/ArmNeonDialect.h"
+#include "mlir/Dialect/ArmSVE/IR/ArmSVEDialect.h"
+#include "mlir/Dialect/ArmSVE/Transforms/Transforms.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Transforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Math/Transforms/Passes.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -56,9 +62,13 @@
 #include "mlir/IR/Location.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_CONVERTTOLLVMPASS
+#include "iree/compiler/Codegen/LLVMCPU/Passes.h.inc"
 
 namespace {
 
@@ -152,8 +162,10 @@ struct ConvertHALEntryPointFuncOp
     // can use the attributes.
     // (%arg0: environment, %arg1: dispatch_state, %arg2: workgroup_state)
     for (unsigned i = 0; i <= 2; ++i) {
-      llvmFuncOp.setArgAttr(i, LLVM::LLVMDialect::getNoAliasAttrName(),
-                            rewriter.getUnitAttr());
+      Attribute unit = rewriter.getUnitAttr();
+      llvmFuncOp.setArgAttr(i, LLVM::LLVMDialect::getNoAliasAttrName(), unit);
+      llvmFuncOp.setArgAttr(i, LLVM::LLVMDialect::getNonNullAttrName(), unit);
+      llvmFuncOp.setArgAttr(i, LLVM::LLVMDialect::getNoUndefAttrName(), unit);
       llvmFuncOp.setArgAttr(i, LLVM::LLVMDialect::getAlignAttrName(),
                             rewriter.getI64IntegerAttr(16));
     }
@@ -173,7 +185,7 @@ struct ConvertHALEntryPointFuncOp
     // order to get any debug information (including just line tables) from MLIR
     // into LLVM IR.
     auto scopeAttr = HALDispatchABI::buildScopeAttr(
-        llvmFuncOp->getParentOfType<mlir::ModuleOp>(), llvmFuncOp.getName(),
+        llvmFuncOp->getParentOfType<mlir::ModuleOp>(), llvmFuncOp,
         getTypeConverter());
     llvmFuncOp->setLoc(FusedLoc::get(llvmFuncOp.getContext(),
                                      {llvmFuncOp->getLoc()}, scopeAttr));
@@ -273,7 +285,7 @@ struct ConvertHALInterfaceConstantLoadOp
   matchAndRewrite(IREE::HAL::InterfaceConstantLoadOp loadOp,
                   IREE::HAL::InterfaceConstantLoadOpAdaptor operands,
                   ConversionPatternRewriter &rewriter) const override {
-    int64_t index = loadOp.getIndex().getZExtValue();
+    int64_t index = loadOp.getOrdinal().getZExtValue();
     auto resultType =
         typeConverter->convertType(loadOp->getResult(0).getType());
     rewriter.replaceOp(
@@ -300,9 +312,10 @@ struct ConvertHALInterfaceBindingSubspanOp
           subspanOp,
           "failed to convert interface.binding.subspan result to memref type");
     }
-    auto memRefDesc = abi.loadBinding(
-        subspanOp, operands.getBindingAttr().getInt(), operands.getByteOffset(),
-        memRefType, operands.getDynamicDims(), rewriter);
+    auto memRefDesc =
+        abi.loadBinding(subspanOp, subspanOp.getBinding().getSExtValue(),
+                        operands.getByteOffset(), memRefType,
+                        operands.getDynamicDims(), rewriter);
     rewriter.replaceOp(subspanOp, {memRefDesc});
     return success();
   }
@@ -694,8 +707,7 @@ static IREE::HAL::CallingConvention getCallingConvention(Operation *forOp) {
 /// pattern.
 struct RewriteFuncOpABI : public OpRewritePattern<LLVM::LLVMFuncOp> {
   RewriteFuncOpABI(HALDispatchABI &abi, LLVMTypeConverter &typeConverter)
-      : OpRewritePattern(&typeConverter.getContext()), abi(abi),
-        typeConverter(typeConverter) {}
+      : OpRewritePattern(&typeConverter.getContext()), abi(abi) {}
 
   LogicalResult matchAndRewrite(LLVM::LLVMFuncOp funcOp,
                                 PatternRewriter &rewriter) const override {
@@ -741,7 +753,6 @@ struct RewriteFuncOpABI : public OpRewritePattern<LLVM::LLVMFuncOp> {
 
 private:
   HALDispatchABI &abi;
-  LLVMTypeConverter &typeConverter;
 };
 
 /// Lower call ops with specified ABI. The ABI to use is looked up from the
@@ -753,12 +764,11 @@ private:
 /// pattern.
 struct RewriteCallOpABI : public OpRewritePattern<LLVM::CallOp> {
   RewriteCallOpABI(HALDispatchABI &abi, LLVMTypeConverter &typeConverter)
-      : OpRewritePattern(&typeConverter.getContext()), abi(abi),
-        typeConverter(typeConverter) {}
+      : OpRewritePattern(&typeConverter.getContext()), abi(abi) {}
 
   LogicalResult matchAndRewrite(LLVM::CallOp callOp,
                                 PatternRewriter &rewriter) const override {
-    auto symbol = callOp.getCallableForCallee().dyn_cast<SymbolRefAttr>();
+    auto symbol = dyn_cast<SymbolRefAttr>(callOp.getCallableForCallee());
     auto flatSymbol = llvm::dyn_cast_if_present<FlatSymbolRefAttr>(symbol);
     if (!flatSymbol)
       return failure();
@@ -789,7 +799,6 @@ struct RewriteCallOpABI : public OpRewritePattern<LLVM::CallOp> {
 
 private:
   HALDispatchABI &abi;
-  LLVMTypeConverter &typeConverter;
 };
 
 /// Rewrites calls to extern functions to dynamic library import calls.
@@ -807,7 +816,7 @@ struct RewriteExternCallOpToDynamicImportCallOp
   LogicalResult matchAndRewrite(LLVM::CallOp callOp,
                                 PatternRewriter &rewriter) const override {
     // Ignore indirect calls (they're probably already converted imports).
-    auto symbol = callOp.getCallableForCallee().dyn_cast<SymbolRefAttr>();
+    auto symbol = dyn_cast<SymbolRefAttr>(callOp.getCallableForCallee());
     auto flatSymbol = llvm::dyn_cast_if_present<FlatSymbolRefAttr>(symbol);
     if (!flatSymbol)
       return failure();
@@ -912,30 +921,21 @@ public:
   }
 };
 
-class ConvertToLLVMPass : public ConvertToLLVMBase<ConvertToLLVMPass> {
+class ConvertToLLVMPass
+    : public impl::ConvertToLLVMPassBase<ConvertToLLVMPass> {
 public:
-  ConvertToLLVMPass(bool reassociateFpReductions) {
-    targetReassociateFpReductions.setValue(reassociateFpReductions);
+  using impl::ConvertToLLVMPassBase<ConvertToLLVMPass>::ConvertToLLVMPassBase;
+  explicit ConvertToLLVMPass(bool reassociateFpReductions) {
+    this->reassociateFpReductions = reassociateFpReductions;
   }
-  ConvertToLLVMPass(const ConvertToLLVMPass &pass) {}
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<LLVM::LLVMDialect, arm_neon::ArmNeonDialect>();
+    registry.insert<arith::ArithDialect, math::MathDialect, func::FuncDialect,
+                    memref::MemRefDialect, linalg::LinalgDialect,
+                    tosa::TosaDialect, scf::SCFDialect, vector::VectorDialect,
+                    arm_neon::ArmNeonDialect, arm_sve::ArmSVEDialect,
+                    LLVM::LLVMDialect>();
   }
-
   void runOnOperation() override;
-
-private:
-  Option<std::string> targetTriple{
-      *this, "target-triple", llvm::cl::desc("Code generation target triple."),
-      llvm::cl::init("")};
-  Option<std::string> targetDataLayout{
-      *this, "target-data-layout",
-      llvm::cl::desc("Code generation target data layout."),
-      llvm::cl::init("")};
-  Option<bool> targetReassociateFpReductions{
-      *this, "target-reassociate-fp-reductions",
-      llvm::cl::desc("Code generation target reassociate FP reductions."),
-      llvm::cl::init("false")};
 };
 
 } // namespace
@@ -949,15 +949,14 @@ static std::string getStringAttrFromTargetAttr(ModuleOp module,
 
 void ConvertToLLVMPass::runOnOperation() {
   auto module = getOperation();
-  std::string dataLayoutStr = targetDataLayout.getValue();
+  std::string dataLayoutStr = targetDataLayout;
   if (targetDataLayout.empty()) {
     dataLayoutStr = getStringAttrFromTargetAttr(module, "data_layout");
   }
-  std::string targetTripleStr = targetTriple.getValue();
+  std::string targetTripleStr = targetTriple;
   if (targetTripleStr.empty()) {
     targetTripleStr = getStringAttrFromTargetAttr(module, "target_triple");
   }
-
   // Add required attributes to the module so that the lowering knows how to
   // handle structs and data layouts.
   module->setAttr(LLVM::LLVMDialect::getTargetTripleAttrName(),
@@ -969,7 +968,9 @@ void ConvertToLLVMPass::runOnOperation() {
   {
     RewritePatternSet patterns(&getContext());
     vector::populateVectorToVectorCanonicalizationPatterns(patterns);
+    vector::populateBubbleVectorBitCastOpPatterns(patterns);
     vector::populateVectorBroadcastLoweringPatterns(patterns);
+    vector::populateVectorInterleaveLoweringPatterns(patterns);
     // TODO: doubtful that the "default" does what one want here, it is likely
     // better to use outerproduct.
     vector::populateVectorContractLoweringPatterns(
@@ -983,8 +984,7 @@ void ConvertToLLVMPass::runOnOperation() {
     vector::populateVectorTransposeLoweringPatterns(
         patterns, vector::VectorTransformsOptions());
     populateConvertArmNeon2dToIntrPatterns(patterns);
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
   }
@@ -992,8 +992,8 @@ void ConvertToLLVMPass::runOnOperation() {
     RewritePatternSet vectorToLoopsPatterns(&getContext());
     populateVectorToSCFConversionPatterns(
         vectorToLoopsPatterns, VectorTransferToSCFOptions().enableFullUnroll());
-    if (failed(applyPatternsAndFoldGreedily(
-            getOperation(), std::move(vectorToLoopsPatterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(),
+                                     std::move(vectorToLoopsPatterns)))) {
       return signalPassFailure();
     }
   }
@@ -1032,6 +1032,7 @@ void ConvertToLLVMPass::runOnOperation() {
     patterns.add<ExpandMulSIExtended>(patterns.getContext(), /*benefit=*/1024);
   }
 
+  LLVMConversionTarget target(getContext());
   populateAffineToStdConversionPatterns(patterns);
   populateSCFToControlFlowConversionPatterns(patterns);
   cf::populateControlFlowToLLVMConversionPatterns(typeConverter, patterns);
@@ -1039,16 +1040,32 @@ void ConvertToLLVMPass::runOnOperation() {
 
   populateComplexToLLVMConversionPatterns(typeConverter, patterns);
   populateMathToLLVMConversionPatterns(typeConverter, patterns);
+  // Note: workaround needed due to `memref.subview` returnd from an `if`.
   memref::populateExpandStridedMetadataPatterns(patterns);
+  iree_compiler::populateIREEResolveExtractStridedMetadataPatterns(patterns);
   populateFinalizeMemRefToLLVMConversionPatterns(typeConverter, patterns);
   populateFuncToLLVMConversionPatterns(typeConverter, patterns);
   arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
   arith::populateExpandBFloat16Patterns(patterns);
+  index::populateIndexToLLVMConversionPatterns(typeConverter, patterns);
   populateVectorToSCFConversionPatterns(patterns);
+  // Some n-D vectors are generated by EmulateNarrowType pass, so we need to
+  // unroll them to 1-D before converting to the LLVM dialect.
+  vector::populateVectorBitCastLoweringPatterns(patterns);
   populateVectorToLLVMMatrixConversionPatterns(typeConverter, patterns);
-  populateVectorToLLVMConversionPatterns(
-      typeConverter, patterns, targetReassociateFpReductions.getValue());
-  populateReconcileUnrealizedCastsPatterns(patterns);
+  vector::populateVectorRankReducingFMAPattern(patterns);
+  vector::populateVectorInsertExtractStridedSliceTransforms(patterns);
+  vector::populateVectorStepLoweringPatterns(patterns);
+  populateVectorToLLVMConversionPatterns(typeConverter, patterns,
+                                         reassociateFpReductions);
+  vector::populateVectorTransferLoweringPatterns(patterns,
+                                                 /*maxTransferRank=*/1);
+
+  if (isAArch64(targetAttr) &&
+      (hasAnySVEFeature(targetAttr) || hasSMEFeature(targetAttr))) {
+    populateArmSVELegalizeForLLVMExportPatterns(typeConverter, patterns);
+    configureArmSVELegalizeForExportTarget(target);
+  }
 
   HALDispatchABI abi(&typeConverter);
   // clang-format off
@@ -1067,16 +1084,20 @@ void ConvertToLLVMPass::runOnOperation() {
   >(abi, typeConverter);
   // clang-format on
 
-  LLVMConversionTarget target(getContext());
   target.addLegalOp<ModuleOp>();
   target.addIllegalDialect<func::FuncDialect, mlir::arith::ArithDialect,
                            IREE::Util::UtilDialect, IREE::HAL::HALDialect,
                            math::MathDialect, tosa::TosaDialect>();
-  target.addIllegalOp<UnrealizedConversionCastOp>();
 
   if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
     signalPassFailure();
     return;
+  }
+
+  OpPassManager passManager(module.getOperationName());
+  FunctionLikeNest(passManager).addPass(createReconcileUnrealizedCastsPass);
+  if (failed(runPipeline(passManager, module))) {
+    return signalPassFailure();
   }
 
   // Rewrite any extern calls emitted to dynamic library imports.
@@ -1084,7 +1105,7 @@ void ConvertToLLVMPass::runOnOperation() {
     RewritePatternSet patterns(&getContext());
     patterns.insert<RewriteExternCallOpToDynamicImportCallOp, RewriteCallOpABI,
                     RewriteFuncOpABI>(abi, typeConverter);
-    if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns))))
+    if (failed(applyPatternsGreedily(module, std::move(patterns))))
       return signalPassFailure();
   }
 
@@ -1095,10 +1116,9 @@ void ConvertToLLVMPass::runOnOperation() {
     llvm::Triple triple(targetTripleStr);
     if (triple.isWasm()) {
       populateUnfusedFMAOpsPassPatterns(&getContext(), postPatterns);
-      if (failed(
-              applyPatternsAndFoldGreedily(module, std::move(postPatterns)))) {
-        return signalPassFailure();
-      }
+    }
+    if (failed(applyPatternsGreedily(module, std::move(postPatterns)))) {
+      return signalPassFailure();
     }
   }
 }
