@@ -646,6 +646,21 @@ void transform_dialect::HoistStaticAllocOp::getEffects(
 }
 
 //===---------------------------------------------------------------------===//
+// MatchHasNoLoweringConfigOp
+//===---------------------------------------------------------------------===//
+
+DiagnosedSilenceableFailure
+IREE::transform_dialect::MatchHasNoLoweringConfigOp::matchOperation(
+    Operation *current, transform::TransformResults &results,
+    transform::TransformState &state) {
+  if (getLoweringConfig(current) || getCompilationInfo(current)) {
+    return emitSilenceableError()
+           << "payload has a lowering config or compilation info.";
+  }
+  return DiagnosedSilenceableFailure::success();
+}
+
+//===---------------------------------------------------------------------===//
 // PopulateWorkgroupCountRegionUsingNumThreadsSliceOp
 //===---------------------------------------------------------------------===//
 
@@ -925,7 +940,7 @@ DiagnosedSilenceableFailure transform_dialect::IREEBufferizeOp::apply(
     RewritePatternSet patterns(getContext());
     patterns.add<EmptyTensorLoweringPattern>(patterns.getContext());
     GreedyRewriteConfig config;
-    config.listener = &listener;
+    config.setListener(&listener);
     // Manually gather list of ops because the other GreedyPatternRewriteDriver
     // overloads only accepts ops that are isolated from above.
     LogicalResult result =

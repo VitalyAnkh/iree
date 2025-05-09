@@ -29,6 +29,12 @@
 
 #define DEBUG_TYPE "iree-dispatch-creation-bubble-up-expand-shapes"
 
+static llvm::cl::opt<bool> clPropagateCollapseAcrossExpands(
+    "iree-dispatch-creation-propagate-collapse-across-expands",
+    llvm::cl::desc("Enables change to propagate collapse shapes across expand "
+                   "shapes. This flag is meant as a stop-gap solution before "
+                   "making this default due to codegen issues."),
+    llvm::cl::init(false));
 namespace mlir::iree_compiler::DispatchCreation {
 
 #define GEN_PASS_DEF_BUBBLEUPEXPANDSHAPESPASS
@@ -212,8 +218,12 @@ void BubbleUpExpandShapesPass::runOnOperation() {
   memref::populateResolveRankedShapedTypeResultDimsPatterns(
       bubbleExpandShapePatterns);
 
+  if (clPropagateCollapseAcrossExpands) {
+    tensor::populateBubbleUpExpandShapePatterns(bubbleExpandShapePatterns);
+  }
+
   GreedyRewriteConfig rewriteConfig;
-  rewriteConfig.maxIterations = GreedyRewriteConfig::kNoLimit;
+  rewriteConfig.setMaxIterations(GreedyRewriteConfig::kNoLimit);
   if (failed(applyPatternsGreedily(getOperation(),
                                    std::move(bubbleExpandShapePatterns),
                                    rewriteConfig))) {
