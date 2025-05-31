@@ -63,7 +63,9 @@ static SliceAndDynamicDims cloneOffsetsSizesAndStridesImpl(
     return sliceFilter(op, nonIndexComputationOperands, baseOp);
   };
   SetVector<Operation *> slice;
-  getBackwardSlice(baseOp, &slice, options);
+  [[maybe_unused]] LogicalResult ret =
+      getBackwardSlice(baseOp, &slice, options);
+  assert(ret.succeeded());
   IRMapping bvm;
   for (auto origOp : slice) {
     builder.clone(*origOp, bvm);
@@ -364,7 +366,9 @@ LogicalResult lowerWorkgroupCountFromSliceOp(
   llvm::SetVector<Operation *> slice;
   for (auto ofr : workgroupCount) {
     if (auto val = dyn_cast<Value>(ofr)) {
-      mlir::getBackwardSlice(val, &slice, options);
+      [[maybe_unused]] LogicalResult result =
+          getBackwardSlice(val, &slice, options);
+      assert(result.succeeded());
     }
   }
   // Since there are more than one slices, sort the operations again.
@@ -1101,9 +1105,7 @@ struct FoldCollapseShapeIntoInterfaceTensorStore
   LogicalResult matchAndRewrite(IREE::TensorExt::DispatchTensorStoreOp storeOp,
                                 PatternRewriter &rewriter) const override {
     // Bail out if the strides aren't unit.
-    if (!llvm::all_of(storeOp.getMixedStrides(), [](OpFoldResult s) {
-          return isConstantIntValue(s, 1);
-        })) {
+    if (!llvm::all_of(storeOp.getMixedStrides(), isOneInteger)) {
       return failure();
     }
 
@@ -1396,6 +1398,8 @@ struct FoldExpandShapeIntoLoadFromBuffer
     rewriter.modifyOpInPlace(loadOp, [&]() {
       loadOp->getOpResult(0).setType(expandOp.getResultType());
     });
+    DominanceInfo domInfo;
+    moveOpAfterLastOperand(rewriter, domInfo, loadOp);
     rewriter.replaceOp(expandOp, loadOp);
     return success();
   }
@@ -1416,20 +1420,10 @@ void populateFoldTensorReshapeIntoBufferPatterns(RewritePatternSet &patterns) {
 
 namespace {
 
-// Erases the operation if its only users are memref.assume_alignment ops.
 static LogicalResult eraseAlignmentOnlyDeadOp(PatternRewriter &rewriter,
                                               Operation *op) {
-  SmallVector<Operation *> deadUsers;
-  for (OpOperand &use : op->getUses()) {
-    if (auto user = dyn_cast<memref::AssumeAlignmentOp>(use.getOwner())) {
-      deadUsers.push_back(user);
-      continue;
-    }
-    // For any other use, return failure;
+  if (!op->use_empty()) {
     return failure();
-  }
-  for (auto user : deadUsers) {
-    rewriter.eraseOp(user);
   }
   rewriter.eraseOp(op);
   return success();
@@ -1462,11 +1456,47 @@ struct RemoveDeadInterfaceBindings
     return eraseAlignmentOnlyDeadOp(rewriter, op);
   }
 };
+
+struct RemoveDeadAssumeAlighment : OpRewritePattern<memref::AssumeAlignmentOp> {
+  RemoveDeadAssumeAlighment(MLIRContext *context, PatternBenefit benefit = 1)
+      : OpRewritePattern<memref::AssumeAlignmentOp>(context, benefit) {}
+
+  LogicalResult matchAndRewrite(memref::AssumeAlignmentOp op,
+                                PatternRewriter &rewriter) const override {
+    return eraseAlignmentOnlyDeadOp(rewriter, op);
+  }
+};
 } // namespace
 
 void populateRemoveDeadMemAllocPatterns(RewritePatternSet &patterns) {
   patterns.insert<RemoveDeadMemAllocs>(patterns.getContext());
-  patterns.insert<RemoveDeadInterfaceBindings>(patterns.getContext());
+  patterns.insert<RemoveDeadInterfaceBindings, RemoveDeadAssumeAlighment>(
+      patterns.getContext());
+}
+
+//===--------------------------------------------------------------------====//
+// Pattern to reduce dependencies from memref::AssumeAlignmentOp
+//===--------------------------------------------------------------------====//
+
+namespace {
+struct RemoveDimOpDep : OpRewritePattern<memref::DimOp> {
+  using OpRewritePattern<memref::DimOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(memref::DimOp op,
+                                PatternRewriter &rewriter) const override {
+    auto assumeOp = op.getSource().getDefiningOp<memref::AssumeAlignmentOp>();
+    if (!assumeOp) {
+      return failure();
+    }
+    rewriter.modifyOpInPlace(
+        op, [&]() { op.getSourceMutable().assign(assumeOp.getMemref()); });
+    return success();
+  }
+};
+} // namespace
+
+void populateCleanMemRefAssumeAlignmentPatterns(RewritePatternSet &patterns) {
+  patterns.insert<RemoveDimOpDep>(patterns.getContext());
 }
 
 void analyseAllocsForPacking(mlir::FunctionOpInterface funcOp,
@@ -1822,7 +1852,9 @@ struct HoistForallFromFor : public OpRewritePattern<scf::ForOp> {
           }
         }
         SetVector<Operation *> tmpBackwardSlice;
-        getBackwardSlice(operand, &tmpBackwardSlice, backwardOptions);
+        [[maybe_unused]] LogicalResult result =
+            getBackwardSlice(operand, &tmpBackwardSlice, backwardOptions);
+        assert(result.succeeded());
         slice.set_union(tmpBackwardSlice);
       }
     }

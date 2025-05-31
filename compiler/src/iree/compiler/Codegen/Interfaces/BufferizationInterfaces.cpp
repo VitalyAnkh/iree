@@ -38,6 +38,7 @@ using mlir::bufferization::AliasingValue;
 using mlir::bufferization::AnalysisState;
 using mlir::bufferization::BufferizableOpInterface;
 using mlir::bufferization::BufferizationOptions;
+using mlir::bufferization::BufferizationState;
 using mlir::bufferization::BufferRelation;
 using mlir::bufferization::eliminateEmptyTensors;
 using mlir::bufferization::OneShotAnalysisState;
@@ -66,7 +67,8 @@ struct DispatchTensorLoadOpInterface
   }
 
   LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
-                          const BufferizationOptions &options) const {
+                          const BufferizationOptions &options,
+                          bufferization::BufferizationState &state) const {
     auto loadOp = cast<IREE::TensorExt::DispatchTensorLoadOp>(op);
     auto tensorSubspanOp =
         loadOp.getSource()
@@ -118,7 +120,8 @@ struct DispatchTensorStoreOpInterface
   }
 
   LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
-                          const BufferizationOptions &options) const {
+                          const BufferizationOptions &options,
+                          bufferization::BufferizationState &state) const {
     auto storeOp = cast<IREE::TensorExt::DispatchTensorStoreOp>(op);
     auto tensorSubspanOp =
         storeOp.getTarget()
@@ -146,7 +149,7 @@ struct DispatchTensorStoreOpInterface
     } // else: Writing the entire tensor, no subview required.
 
     auto maybeBuffer =
-        getBuffer(rewriter, storeOp->getOpOperand(0).get(), options);
+        getBuffer(rewriter, storeOp->getOpOperand(0).get(), options, state);
     if (failed(maybeBuffer))
       return failure();
     Value srcMemref = *maybeBuffer;
@@ -200,7 +203,8 @@ struct LoadFromBufferOpInterface
   }
 
   LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
-                          const BufferizationOptions &options) const {
+                          const BufferizationOptions &options,
+                          bufferization::BufferizationState &state) const {
     auto loadOp = cast<IREE::Codegen::LoadFromBufferOp>(op);
     replaceOpWithBufferizedValues(rewriter, op, loadOp.getBuffer());
     return success();
@@ -227,10 +231,11 @@ struct StoreToBufferOpInterface
   }
 
   LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
-                          const BufferizationOptions &options) const {
+                          const BufferizationOptions &options,
+                          bufferization::BufferizationState &state) const {
     auto storeOp = cast<IREE::Codegen::StoreToBufferOp>(op);
     FailureOr<Value> maybeBuffer =
-        getBuffer(rewriter, storeOp.getTensor(), options);
+        getBuffer(rewriter, storeOp.getTensor(), options, state);
     if (failed(maybeBuffer))
       return failure();
     Value srcMemref = *maybeBuffer;
@@ -250,7 +255,8 @@ struct StoreToBufferOpInterface
 /// Generic conversion for any LinalgExtOp on tensors.
 static LogicalResult bufferizeLinalgExtOp(RewriterBase &rewriter,
                                           IREE::LinalgExt::LinalgExtOp op,
-                                          const BufferizationOptions &options) {
+                                          const BufferizationOptions &options,
+                                          const BufferizationState &state) {
   auto dspOp = cast<DestinationStyleOpInterface>(op.getOperation());
 
   // Take a guard before anything else.
@@ -277,7 +283,7 @@ static LogicalResult bufferizeLinalgExtOp(RewriterBase &rewriter,
       continue;
     }
     if (!dspOp.isDpsInit(&opOperand)) {
-      auto maybeBuffer = getBuffer(rewriter, opOperand.get(), options);
+      auto maybeBuffer = getBuffer(rewriter, opOperand.get(), options, state);
       if (failed(maybeBuffer))
         return failure();
       // Input operands are never written to.
@@ -291,7 +297,7 @@ static LogicalResult bufferizeLinalgExtOp(RewriterBase &rewriter,
     assert(aliasingOpOperands.getNumAliases() == 1 && "expected 1 OpOperand");
     FailureOr<Value> resultBuffer = getBuffer(
         rewriter, aliasingOpOperands.getAliases().front().opOperand->get(),
-        options);
+        options, state);
     if (failed(resultBuffer))
       return failure();
     newOperands.push_back(*resultBuffer);
@@ -332,9 +338,10 @@ struct LinalgExtOpInterface
   }
 
   LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
-                          const BufferizationOptions &options) const {
+                          const BufferizationOptions &options,
+                          bufferization::BufferizationState &state) const {
     return bufferizeLinalgExtOp(
-        rewriter, cast<IREE::LinalgExt::LinalgExtOp>(op), options);
+        rewriter, cast<IREE::LinalgExt::LinalgExtOp>(op), options, state);
   }
 };
 
@@ -343,10 +350,11 @@ struct LinalgExtOpInterface
 template <typename OpTy>
 static FailureOr<std::pair<Value, Value>>
 getSourceAndDestFromPackUnPackOp(RewriterBase &rewriter, OpTy op,
-                                 const BufferizationOptions &options) {
+                                 const BufferizationOptions &options,
+                                 const BufferizationState &state) {
   static_assert(llvm::is_one_of<OpTy, linalg::PackOp, linalg::UnPackOp>::value);
   Value source;
-  auto maybeBuffer = getBuffer(rewriter, op.getSource(), options);
+  auto maybeBuffer = getBuffer(rewriter, op.getSource(), options, state);
   if (failed(maybeBuffer))
     return failure();
   source = *maybeBuffer;
@@ -358,7 +366,7 @@ getSourceAndDestFromPackUnPackOp(RewriterBase &rewriter, OpTy op,
   assert(aliasingOpOperands.getNumAliases() == 1 && "expected 1 OpOperand");
   FailureOr<Value> resultBuffer = getBuffer(
       rewriter, aliasingOpOperands.getAliases().front().opOperand->get(),
-      options);
+      options, state);
   if (failed(resultBuffer))
     return failure();
   dest = *resultBuffer;
@@ -366,13 +374,14 @@ getSourceAndDestFromPackUnPackOp(RewriterBase &rewriter, OpTy op,
 }
 
 static LogicalResult bufferizePackOp(RewriterBase &rewriter, linalg::PackOp op,
-                                     const BufferizationOptions &options) {
+                                     const BufferizationOptions &options,
+                                     const BufferizationState &state) {
   // Take a guard before anything else.
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPoint(op);
 
   auto maybeSrcAndDest =
-      getSourceAndDestFromPackUnPackOp(rewriter, op, options);
+      getSourceAndDestFromPackUnPackOp(rewriter, op, options, state);
   if (failed(maybeSrcAndDest))
     return failure();
   auto [source, dest] = *maybeSrcAndDest;
@@ -391,13 +400,14 @@ static LogicalResult bufferizePackOp(RewriterBase &rewriter, linalg::PackOp op,
 
 static LogicalResult bufferizeUnPackOp(RewriterBase &rewriter,
                                        linalg::UnPackOp op,
-                                       const BufferizationOptions &options) {
+                                       const BufferizationOptions &options,
+                                       const BufferizationState &state) {
   // Take a guard before anything else.
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPoint(op);
 
   auto maybeSrcAndDest =
-      getSourceAndDestFromPackUnPackOp(rewriter, op, options);
+      getSourceAndDestFromPackUnPackOp(rewriter, op, options, state);
   if (failed(maybeSrcAndDest))
     return failure();
   auto [source, dest] = *maybeSrcAndDest;
@@ -467,12 +477,14 @@ struct PackUnPackOpInterface
   }
 
   LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
-                          const BufferizationOptions &options) const {
+                          const BufferizationOptions &options,
+                          bufferization::BufferizationState &state) const {
     return TypeSwitch<Operation *, LogicalResult>(op)
-        .template Case<linalg::PackOp>(
-            [&](auto pack) { return bufferizePackOp(rewriter, pack, options); })
+        .template Case<linalg::PackOp>([&](auto pack) {
+          return bufferizePackOp(rewriter, pack, options, state);
+        })
         .template Case<linalg::UnPackOp>([&](auto unpack) {
-          return bufferizeUnPackOp(rewriter, unpack, options);
+          return bufferizeUnPackOp(rewriter, unpack, options, state);
         })
         .Default([](auto) { return failure(); });
   }
