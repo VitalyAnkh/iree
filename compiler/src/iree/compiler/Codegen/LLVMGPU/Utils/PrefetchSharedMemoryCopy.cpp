@@ -5,8 +5,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/LLVMGPU/Utils/LLVMGPUUtils.h"
+#include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
-
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/STLExtras.h"
@@ -100,7 +100,8 @@ public:
     Location loc = forOp.getLoc();
     Value indVar = newForOp.getInductionVar();
     Value increment = rewriter.create<arith::ConstantIndexOp>(loc, step);
-    Value iPlusOne = rewriter.create<arith::AddIOp>(loc, indVar, increment);
+    Value iPlusOne = rewriter.create<arith::AddIOp>(
+        loc, indVar, increment, arith::IntegerOverflowFlags::nsw);
 
     for (int i = 0; i < 3; ++i) {
       for (auto [idx, arg] : llvm::enumerate(forOp.getRegionIterArgs())) {
@@ -159,10 +160,6 @@ private:
       return;
     }
 
-    if (noTransferReads && isa<vector::TransferReadOp>(op)) {
-      return;
-    }
-
     if (!forOp->isProperAncestor(op)) {
       return;
     }
@@ -176,9 +173,57 @@ private:
     });
   }
 
+  void getValueDependenciesForIf(scf::IfOp ifOp,
+                                 DenseSet<Operation *> &readDependencies,
+                                 DenseSet<Operation *> &writeDependencies) {
+    // scf.if with results should be supported directly through the usual
+    // handling so bail-out here in that case
+    if (ifOp->getNumResults() != 0)
+      return;
+    bool hasGlobalRead = false;
+    bool hasSharedWrite = false;
+    // Else region not yet supported.
+    if (!ifOp.getElseRegion().empty()) {
+      return;
+    }
+    ifOp->walk([&](Operation *op) {
+      if (auto readOp = dyn_cast<vector::TransferReadOp>(op)) {
+        auto sourceType = dyn_cast<MemRefType>(readOp.getBase().getType());
+        if (hasGlobalMemoryAddressSpace(sourceType)) {
+          hasGlobalRead = true;
+        }
+      }
+      if (auto writeOp = dyn_cast<vector::TransferWriteOp>(op)) {
+        auto dstType = dyn_cast<MemRefType>(writeOp.getBase().getType());
+        if (hasSharedMemoryAddressSpace(dstType)) {
+          hasSharedWrite = true;
+        }
+      }
+    });
+    // if op has both read and write stages and hence we cannot do prefetching.
+    if (hasGlobalRead && hasSharedWrite) {
+      return;
+    }
+    if (hasSharedWrite) {
+      getValueDependencies(ifOp, writeDependencies);
+      return;
+    }
+    if (hasGlobalRead) {
+      getValueDependencies(ifOp, readDependencies);
+      return;
+    }
+    // If we dont know what kind of read/write the if is doing then we bail-out.
+    // TODO (nirvedhmeshram) : Add handling for private memory allocations. e.g
+    // write to private memory could go in write stage. But the analysis
+    // in `getValueDependencies` also needs to be aware of private memory for
+    // this so that needs to be added at the same time.
+  }
+
   // We only support loops whose bodies can be divided into 3 stages (read,
   // write, compute). If there are any remaining ops with side effects (except
-  // for gpu.barrier), the loop is not supported.
+  // for gpu.barrier and certain scf.if ops), the loop is not supported.
+  // For scf.if we only support them if we can analyze the region and
+  // identify which stage the if op should belong to.
   LogicalResult initializeStages() {
     DenseSet<Operation *> readDependencies;
     DenseSet<Operation *> writeDependencies;
@@ -188,10 +233,11 @@ private:
       if (auto read = dyn_cast<vector::TransferReadOp>(op)) {
         getValueDependencies(read, readDependencies);
       } else if (auto write = dyn_cast<vector::TransferWriteOp>(op)) {
-        getValueDependencies(write, writeDependencies,
-                             /*noTransferReads=*/true);
+        getValueDependencies(write, writeDependencies);
       } else if (auto compute = dyn_cast<scf::YieldOp>(op)) {
         getValueDependencies(compute, computeDependencies);
+      } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+        getValueDependenciesForIf(ifOp, readDependencies, writeDependencies);
       }
     }
     // If `scf.yeild` is the only compute op then there is no value in doing
@@ -208,7 +254,9 @@ private:
         readStage.push_back(&op);
         hasStage = true;
       }
-      if (writeDependencies.contains(&op)) {
+      // We do not need to de-duplicate read stage ops in write stage as the
+      // iteration count of both stages is always same.
+      if (writeDependencies.contains(&op) && !hasStage) {
         writeStage.push_back(&op);
         hasStage = true;
       }

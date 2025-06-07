@@ -375,6 +375,15 @@ def FoldTensorExtractOpPass :
   }];
 }
 
+def ForallToForPass :
+  InterfacePass<"iree-codegen-forall-to-for", "mlir::FunctionOpInterface"> {
+  let summary = "Convert scf.forall to nested scf.for loops";
+  let description = [{
+    Converts scf.forall operations (without workgroup mapping) to nested
+    scf.for loops.
+  }];
+}
+
 def ForOpCanonicalizationPass :
   InterfacePass<"iree-codegen-canonicalize-scf-for", "mlir::FunctionOpInterface"> {
   let summary =
@@ -475,6 +484,13 @@ def IREEExpandStridedMetadataPass :
            "Enables expansion of memref.subview ops">,
     Option<"allowUnresolved", "allow-unresolved", "bool", /*default=*/"false",
            "Allow unresolved strided metadata op (for testing)">,
+  ];
+}
+def IREEInjectAssumeAlignmentPass :
+    InterfacePass<"iree-codegen-inject-assume-alignment", "mlir::FunctionOpInterface"> {
+  let summary = "Insert memref.assume_alignment ops right after hal.interface.binding.subspan ops, if alignment is present in bindings.";
+  let dependentDialects = [
+      "memref::MemRefDialect"
   ];
 }
 

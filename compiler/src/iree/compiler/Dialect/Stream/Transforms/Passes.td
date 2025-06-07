@@ -229,6 +229,7 @@ def EmplaceAllocationsPass :
     tensor concatenation.
   }];
   let dependentDialects = [
+    "mlir::arith::ArithDialect",
     "IREE::Stream::StreamDialect",
   ];
 }
@@ -542,8 +543,7 @@ def SpecializeEncodingsPass :
     - The binding types have to implement IREE::Encoding::EncodingTypeInterface,
       so it can updates the types without accessing any other dialects.
     - All the encodings attached on the types have to implement
-      SerializableEncodingAttrInterface. Because the pass updates the encodings
-      using interfaces.
+      SerializableAttr. Because the pass updates the encodings using interfaces.
   }];
   let dependentDialects = [
     "IREE::Encoding::IREEEncodingDialect"
