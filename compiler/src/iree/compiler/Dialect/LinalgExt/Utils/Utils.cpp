@@ -384,7 +384,9 @@ bool isGatherlikeOp(Operation *op) {
     }
     return currOp->getBlock() == genericOp.getBody();
   };
-  mlir::getBackwardSlice(yieldOp.getOperand(0), &sliceOps, options);
+  [[maybe_unused]] LogicalResult result =
+      getBackwardSlice(yieldOp.getOperand(0), &sliceOps, options);
+  assert(result.succeeded());
   return hasTensorExtract;
 }
 
@@ -425,13 +427,6 @@ getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
   if (!filterType.hasStaticShape() || !inputType.hasStaticShape()) {
     LDBG("[unimplemented] expected 'filterType' and 'inputType' to have static "
          "shapes.");
-    return failure();
-  }
-
-  // TODO: Support dilation.
-  if (!hasAllOneValues(convDims.dilations)) {
-    LDBG("[unimplemented] expected no dilations (expected dilations to all be "
-         "one).");
     return failure();
   }
 
@@ -889,6 +884,15 @@ bool isArgmaxOp(linalg::GenericOp genericOp) {
     if (!matchPattern(producer, m_Op<arith::SelectOp>())) {
       return false;
     }
+    auto selectOp = cast<arith::SelectOp>(producerOutput.getDefiningOp());
+    Value trueVal = selectOp.getTrueValue();
+    if (auto castOp = trueVal.getDefiningOp<arith::IndexCastOp>())
+      trueVal = castOp.getIn();
+
+    // Ensure the true value is directly produced by linalg.index.
+    auto indexOp = trueVal.getDefiningOp<linalg::IndexOp>();
+    if (!indexOp)
+      return false;
   }
 
   // Producer of arith.select op is arith.cmpf

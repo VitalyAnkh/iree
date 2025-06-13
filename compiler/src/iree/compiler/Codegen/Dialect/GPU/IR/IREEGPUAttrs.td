@@ -17,17 +17,6 @@ include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/EnumAttr.td"
 include "mlir/IR/OpBase.td"
 
-/// TODO: Iterator type arrays are duplicated across dialects upstream and here.
-/// These should be unified somewhere as a common iterator type array attr.
-def IREEGPU_IteratorTypeEnum
-    : EnumAttr<IREEGPU_Dialect, IteratorType, "iterator_type"> {
-    let assemblyFormat = "`<` $value `>`";
-}
-
-def IREEGPU_IteratorTypeArrayAttr
-    : TypedArrayAttrBase<IREEGPU_IteratorTypeEnum,
-                         "Iterator type should be an enum.">;
-
 //===----------------------------------------------------------------------===//
 // GPU Specific Lowering Config Attributes
 //===----------------------------------------------------------------------===//
@@ -148,13 +137,18 @@ def IREEGPU_MMAIntrinsicAttr
 
 def IREEGPU_MMAAttr : AttrDef<IREEGPU_Dialect, "MMA", [
   DeclareAttrInterfaceMethods<IREEGPU_MmaInterfaceAttr, [
-    "getABCElementTypes",
-    "getABCVectorTypes",
-    "getMNKShape",
     "getSubgroupSize",
-    "getMmaScope",
-    "buildMmaOperation",
+  ]>,
+  DeclareAttrInterfaceMethods<IREECodegen_InnerTileDescAttrInterface, [
+    "getExpectedNumInputs",
+    "getExpectedNumOutputs",
+    "verifyIndexingMaps",
+    "getUndistributedTileTypes",
+    "getDistributedTileTypes",
     "populateOperandOffsetsSizesStrides",
+    "getDistributionMappingKind",
+    "getDistributionWorkerCount",
+    "buildUnderlyingOperations",
   ]>
 ]> {
   let mnemonic = "mma_layout";
@@ -202,13 +196,18 @@ def IREEGPU_MMAAttr : AttrDef<IREEGPU_Dialect, "MMA", [
 def IREEGPU_DataTiledMMAAttr :
     AttrDef<IREEGPU_Dialect, "DataTiledMMA", [
   DeclareAttrInterfaceMethods<IREEGPU_MmaInterfaceAttr, [
-    "getABCElementTypes",
-    "getABCVectorTypes",
-    "getMNKShape",
     "getSubgroupSize",
-    "getMmaScope",
+  ]>,
+  DeclareAttrInterfaceMethods<IREECodegen_InnerTileDescAttrInterface, [
+    "getExpectedNumInputs",
+    "getExpectedNumOutputs",
+    "verifyIndexingMaps",
+    "getUndistributedTileTypes",
+    "getDistributedTileTypes",
     "populateOperandOffsetsSizesStrides",
-    "buildMmaOperation",
+    "getDistributionMappingKind",
+    "getDistributionWorkerCount",
+    "buildUnderlyingOperations",
   ]>
 ]> {
   let mnemonic = "data_tiled_mma_layout";
@@ -244,13 +243,18 @@ def IREEGPU_VirtualMMAIntrinsicAttr
 def IREEGPU_VirtualMMAAttr :
     AttrDef<IREEGPU_Dialect, "VirtualMMA", [
   DeclareAttrInterfaceMethods<IREEGPU_MmaInterfaceAttr, [
-    "getABCElementTypes",
-    "getABCVectorTypes",
-    "getMNKShape",
     "getSubgroupSize",
-    "getMmaScope",
+  ]>,
+  DeclareAttrInterfaceMethods<IREECodegen_InnerTileDescAttrInterface, [
+    "getExpectedNumInputs",
+    "getExpectedNumOutputs",
+    "verifyIndexingMaps",
+    "getUndistributedTileTypes",
+    "getDistributedTileTypes",
     "populateOperandOffsetsSizesStrides",
-    "buildMmaOperation",
+    "getDistributionMappingKind",
+    "getDistributionWorkerCount",
+    "buildUnderlyingOperations",
   ]>
 ]> {
   let mnemonic = "virtual_mma_layout";
@@ -319,12 +323,11 @@ def IREEGPU_GPUEncodingLayoutAttr :
   let summary = [{The encoding layout attribute for GPU backend.}];
   let description = [{
     This attribute can implement any layout interface methods for encoding
-    serialization and or materialization, e.g., Encoding::LayoutAttrInterface,
-    Codegen::PackedLayoutAttrInterface, etc. They should be implemented
-    through external model mechanism because we do not want to relocate
-    domain-specific logic to the dialect implementation, and we can have better
-    code structure. See the implementation in
-    compiler/Codegen/ExternalInterfaces/*.
+    serialization and or materialization, e.g., Encoding::LayoutMaterializerAttr,
+    Codegen::PackedLayoutMaterializerAttr, etc. They should be implemented through external
+    model mechanism because we do not want to relocate domain-specific logic to
+    the dialect implementation, and we can have better code structure. See the
+    implementation in compiler/Codegen/ExternalInterfaces/*.
   }];
 
   let assemblyFormat = "`<` struct(params) `>`";
@@ -347,11 +350,10 @@ def IREEGPU_GPUPadLayoutAttr : AttrDef<IREEGPU_Dialect, "GPUPadLayout"> {
   let description = [{
     Describes padding preferences for a given GPU target.
     This attribute can implement any encoding interface for data-tiling,
-    e.g., Encoding::EncodingLayoutResolverAttrInterface, etc. They should be
-    implemented through external model mechanism because we do not want to
-    relocate domain-specific logic to the dialect implementation, and we can
-    have better code structure. See the implementation in
-    compiler/Codegen/ExternalInterfaces/*.
+    e.g., Encoding::LayoutResolverAttr, etc. They should be implemented through
+    external model mechanism because we do not want to relocate domain-specific
+    logic to the dialect implementation, and we can have better code structure.
+    See the implementation in compiler/Codegen/ExternalInterfaces/*.
   }];
 
   let parameters = (ins

@@ -349,6 +349,19 @@ def ExtractAddressComputationPass : Pass<"iree-codegen-extract-address-computati
   ];
 }
 
+def FissionTransferOpsInControlFlowPass : InterfacePass<"iree-codegen-fission-transfer-ops-in-control-flow", "mlir::FunctionOpInterface"> {
+  let summary =
+      "Fission transfer read and write ops in control flow to allow prefetching.";
+  let dependentDialects = [
+      "memref::MemRefDialect"
+  ];
+  let options = [
+    Option<"FissionMultiTrip", "fission-multi-trip",
+           "bool", /*default=*/"false",
+           "Allow fission in presence of loops with greater than one trip count.">
+  ];
+}
+
 def FlattenMemRefSubspanPass : Pass<"iree-codegen-flatten-memref-subspan", "ModuleOp"> {
   let summary =
       "Flatten n-D MemRef subspan ops to 1-D ones and fold byte offsets";
@@ -372,6 +385,15 @@ def FoldTensorExtractOpPass :
     tensor_loads introduced for use only in tensor_extract. These can be
     folded to use a load of the created memref object that holds the constant
     values.
+  }];
+}
+
+def ForallToForPass :
+  InterfacePass<"iree-codegen-forall-to-for", "mlir::FunctionOpInterface"> {
+  let summary = "Convert scf.forall to nested scf.for loops";
+  let description = [{
+    Converts scf.forall operations (without workgroup mapping) to nested
+    scf.for loops.
   }];
 }
 
@@ -475,6 +497,13 @@ def IREEExpandStridedMetadataPass :
            "Enables expansion of memref.subview ops">,
     Option<"allowUnresolved", "allow-unresolved", "bool", /*default=*/"false",
            "Allow unresolved strided metadata op (for testing)">,
+  ];
+}
+def IREEInjectAssumeAlignmentPass :
+    InterfacePass<"iree-codegen-inject-assume-alignment", "mlir::FunctionOpInterface"> {
+  let summary = "Insert memref.assume_alignment ops right after hal.interface.binding.subspan ops, if alignment is present in bindings.";
+  let dependentDialects = [
+      "memref::MemRefDialect"
   ];
 }
 

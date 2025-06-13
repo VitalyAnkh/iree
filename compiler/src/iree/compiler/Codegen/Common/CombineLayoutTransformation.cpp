@@ -6,6 +6,7 @@
 
 #include "iree/compiler/Codegen/Common/CombineLayoutTransformation.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
+#include "iree/compiler/Codegen/Common/Transforms.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Transforms.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
@@ -107,43 +108,6 @@ static MapScatterOp foldTransposeIntoMapScatter(RewriterBase &rewriter,
     mapScatterOp.insertTransformationAtStart(rewriter, indexTransformBuilder,
                                              perm.size());
     mapScatterOp.getInputMutable().assign(transposeOp.getInput());
-  });
-  return mapScatterOp;
-}
-
-/// Fold a tensor::ExpandShapeOp or tensor::CollapseShapeOp into a consumer
-/// `mapScatterOp`, by linearizing and then delinearizing the source indices
-/// of the `mapScatterOp`s index transformation.
-template <typename ReshapeOpTy>
-static MapScatterOp foldReshapeIntoMapScatter(RewriterBase &rewriter,
-                                              ReshapeOpTy reshapeOp,
-                                              MapScatterOp mapScatterOp) {
-  assert(mapScatterOp.getInput() == reshapeOp->getResult(0) &&
-         "expected reshapeOp to be the producer of mapScatterOp");
-  Location loc = reshapeOp->getLoc();
-  OpBuilder::InsertionGuard g(rewriter);
-  rewriter.setInsertionPointAfter(reshapeOp);
-  SmallVector<OpFoldResult> srcDims =
-      tensor::getMixedSizes(rewriter, loc, reshapeOp.getSrc());
-  // There can be leftover tensor.dim ops consuming the result of the reshape,
-  // but they will be folded into some affine.apply ops on the source sizes by
-  // later cleanup patterns.
-  SmallVector<OpFoldResult> resultDims =
-      tensor::getMixedSizes(rewriter, loc, reshapeOp.getResult());
-
-  auto indexTransformBuilder =
-      [&](ArrayRef<BlockArgument> srcIndices) -> SmallVector<Value> {
-    auto linearizeIndexOp = rewriter.create<affine::AffineLinearizeIndexOp>(
-        mapScatterOp->getLoc(), srcIndices, srcDims, /*disjoint=*/true);
-    auto delinearizeIndexOp = rewriter.create<affine::AffineDelinearizeIndexOp>(
-        mapScatterOp->getLoc(), linearizeIndexOp.getResult(), resultDims,
-        /*hasOuterBound=*/true);
-    return delinearizeIndexOp->getResults();
-  };
-  rewriter.modifyOpInPlace(mapScatterOp, [&]() {
-    mapScatterOp.insertTransformationAtStart(rewriter, indexTransformBuilder,
-                                             srcDims.size());
-    mapScatterOp.getInputMutable().assign(reshapeOp->getOperand(0));
   });
   return mapScatterOp;
 }
@@ -368,10 +332,11 @@ foldIntoMapScatter(RewriterBase &rewriter, Operation *op,
         return foldTransposeIntoMapScatter(rewriter, transposeOp, mapScatterOp);
       })
       .Case<tensor::ExpandShapeOp>([&](tensor::ExpandShapeOp expandOp) {
-        return foldReshapeIntoMapScatter(rewriter, expandOp, mapScatterOp);
+        return foldExpandShapeIntoMapScatter(rewriter, expandOp, mapScatterOp);
       })
       .Case<tensor::CollapseShapeOp>([&](tensor::CollapseShapeOp collapseOp) {
-        return foldReshapeIntoMapScatter(rewriter, collapseOp, mapScatterOp);
+        return foldCollapseShapeIntoMapScatter(rewriter, collapseOp,
+                                               mapScatterOp);
       })
       .Case<tensor::ExtractSliceOp>([&](tensor::ExtractSliceOp extractSliceOp) {
         return foldExtractSliceIntoMapScatter(rewriter, extractSliceOp,
@@ -442,6 +407,59 @@ insertIdentityMapScatter(RewriterBase &rewriter,
 LogicalResult
 combineLayoutTransformation(MLIRContext *ctx, FunctionOpInterface funcOp,
                             PadDistributionConfigFn padDistributionConfigFn) {
+  // Sink relayout operations to the end of the funcOp.
+  RewritePatternSet propagationPatterns(ctx);
+  tensor::populateFoldTensorEmptyPatterns(propagationPatterns);
+  tensor::ExpandShapeOp::getCanonicalizationPatterns(propagationPatterns, ctx);
+  tensor::CollapseShapeOp::getCanonicalizationPatterns(propagationPatterns,
+                                                       ctx);
+  // Only sink reshape ops, so bail if the consumer operation is a reshape.
+  auto controlSinkReshapesFn = [](OpOperand *operand) -> bool {
+    Operation *consumer = operand->getOwner();
+    return !llvm::isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp>(consumer);
+  };
+  linalg::populateFoldReshapeOpsByExpansionPatterns(propagationPatterns,
+                                                    controlSinkReshapesFn);
+  // Only sink unpack ops, so bail if the producer operation is not an unpack.
+  // Also only sink unpack ops when new pack operations will not be created.
+  // This means the consumer op must have at most one additional destination
+  // operand, and it must come from an empty tensor.
+  auto controlPropagationFn = [](OpOperand *operand) -> bool {
+    Operation *producer = operand->get().getDefiningOp();
+    Operation *consumer = operand->getOwner();
+    if (!isa_and_nonnull<linalg::UnPackOp>(producer)) {
+      return false;
+    }
+    // Pads and reshapes will not produce extra pack ops.
+    if (isa<tensor::PadOp, tensor::ExpandShapeOp>(consumer)) {
+      return true;
+    }
+    // Otherwise, the consumer must be a GenericOp with all of its `outs`
+    // operands coming from tensor.empty ops, and the `operand` must be the
+    // sole `ins` operand of the generic op. This ensures that no additional
+    // linalg.pack ops will be created on other inputs of the generic op.
+    // TODO(Max191): Remove the restriction of not creating new pack ops once
+    // codegen can handle it.
+    auto genericConsumer = dyn_cast<linalg::GenericOp>(consumer);
+    if (!genericConsumer || genericConsumer.getNumDpsInputs() != 1 ||
+        *genericConsumer.getDpsInputOperand(0) != *operand) {
+      return false;
+    }
+    return llvm::all_of(
+        genericConsumer.getDpsInits(), [&](Value consumerOperand) -> bool {
+          return consumerOperand.getDefiningOp<tensor::EmptyOp>();
+        });
+  };
+  linalg::populateDataLayoutPropagationPatterns(propagationPatterns,
+                                                controlPropagationFn);
+  // TODO(Max191): The propagation patterns could be applied at the same time as
+  // relayout ops are folded into the map_scatter, which may enable even more
+  // folding. This requires the relayout op folding to be done as pattern
+  // rewrites, and also direct foldings for pack and unpack ops.
+  if (failed(applyPatternsGreedily(funcOp, std::move(propagationPatterns)))) {
+    return failure();
+  }
+
   // Apply some preprocessing to convert complex layout transformation
   // ops like pack and unpack into simpler supported ops.
   IRRewriter rewriter(ctx);

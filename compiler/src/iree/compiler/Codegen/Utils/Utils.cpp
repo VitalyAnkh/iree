@@ -1232,8 +1232,6 @@ Value findOrCreateSubspanBuffer(
         /*cacheSwizzleStride=*/Value{}, /*boundsCheck=*/true,
         /*resetOffset=*/true);
   }
-  rewriter.create<memref::AssumeAlignmentOp>(
-      subspanOp->getLoc(), buffer, subspanOp.calculateAlignment().value());
   return buffer;
 }
 
@@ -1283,6 +1281,28 @@ setInsertionPointAfterLastNeededValue(OpBuilder &builder,
                                       SubsetInsertionOpInterface subsetOp) {
   return setInsertionPointAfterLastValue(
       builder, subsetOp.getValuesNeededToBuildSubsetExtraction());
+}
+
+void moveOpAfterLastOperand(RewriterBase &rewriter, DominanceInfo &domInfo,
+                            Operation *op) {
+  auto getDefiningOrContainingOp = [](Value v) -> Operation * {
+    return isa<BlockArgument>(v)
+               ? cast<BlockArgument>(v).getOwner()->getParentOp()
+               : v.getDefiningOp();
+  };
+  Value lastOperand = op->getOperand(0);
+  for (Value operand : op->getOperands()) {
+    Operation *operandDefiningOp = getDefiningOrContainingOp(operand);
+    Operation *lastValueDefiningOp = getDefiningOrContainingOp(lastOperand);
+    if (domInfo.dominates(lastValueDefiningOp, operandDefiningOp)) {
+      lastOperand = operand;
+    }
+  }
+  if (auto blockArg = dyn_cast<BlockArgument>(lastOperand)) {
+    rewriter.moveOpBefore(op, &blockArg.getOwner()->front());
+    return;
+  }
+  rewriter.moveOpAfter(op, lastOperand.getDefiningOp());
 }
 
 bool equalTensorShape(RankedTensorType tensorType, ValueRange tensorDynSizes,
@@ -1584,7 +1604,9 @@ bool hasFusedLeadingOp(linalg::LinalgOp rootOp) {
   SetVector<Operation *> backwardSlice;
   for (OpOperand *operand : rootOp.getDpsInputOperands()) {
     SetVector<Operation *> tmpBackwardSlice;
-    getBackwardSlice(operand->get(), &tmpBackwardSlice, options);
+    [[maybe_unused]] LogicalResult result =
+        getBackwardSlice(operand->get(), &tmpBackwardSlice, options);
+    assert(result.succeeded());
     backwardSlice.set_union(tmpBackwardSlice);
   }
 
@@ -1879,6 +1901,32 @@ std::optional<int64_t> getConstantIndex(Value value) {
     return std::nullopt;
 
   return val.getSExtValue();
+}
+
+bool alwaysRunsFirstIteration(scf::ForOp op) {
+  // Can't perform the analysis if the loops's bounds aren't index-typed.
+  if (!op.getInductionVar().getType().isIndex())
+    return false;
+  FailureOr<bool> isLb = ValueBoundsConstraintSet::compare(
+      getAsOpFoldResult(op.getLowerBound()), ValueBoundsConstraintSet::LT,
+      getAsOpFoldResult(op.getUpperBound()));
+  return isLb.value_or(false);
+}
+
+bool neverRunsSecondIteration(scf::ForOp op) {
+  // Can't perform the analysis if the loops's bounds aren't index-typed.
+  if (!op.getInductionVar().getType().isIndex())
+    return false;
+  // If the upper bound (ub) is less than or equal to the loop step, then
+  // lower bound  + step must be greater than the upper bound, assuming the
+  // lower bound is non-negative.
+  FailureOr<bool> isUbUnderStep = ValueBoundsConstraintSet::compare(
+      getAsOpFoldResult(op.getUpperBound()), ValueBoundsConstraintSet::LE,
+      getAsOpFoldResult(op.getStep()));
+  FailureOr<bool> isLbNonNegative = ValueBoundsConstraintSet::compare(
+      getAsOpFoldResult(op.getLowerBound()), ValueBoundsConstraintSet::GE,
+      getAsIndexOpFoldResult(op.getContext(), 0));
+  return isUbUnderStep.value_or(false) && isLbNonNegative.value_or(false);
 }
 
 } // namespace mlir::iree_compiler

@@ -226,6 +226,11 @@ Operation *
 setInsertionPointAfterLastNeededValue(OpBuilder &builder,
                                       SubsetInsertionOpInterface subsetOp);
 
+/// Moves the op to right after its last (most dominant) operand. If the operand
+/// is a block argument, then the op is moved to the start of the block.
+void moveOpAfterLastOperand(RewriterBase &rewriter, DominanceInfo &domInfo,
+                            Operation *op);
+
 /// Check if the two tensor types (with their respective dynamic dimension
 /// values) have the same shape.
 bool equalTensorShape(RankedTensorType tensorType, ValueRange tensorDynSizes,
@@ -316,6 +321,14 @@ inferSizesFromIR(linalg::LinalgOp linalgOp, std::optional<OpResult> opResult);
 
 /// Returns the underlying index if the given value is a constant index.
 std::optional<int64_t> getConstantIndex(Value value);
+
+/// Return true if we can prove that the we always run at least the first
+/// iteration of the ForOp.
+bool alwaysRunsFirstIteration(scf::ForOp op);
+
+/// Return true if we can prove that the we never run more than one iteration of
+/// the ForOp.
+bool neverRunsSecondIteration(scf::ForOp op);
 
 } // namespace mlir::iree_compiler
 

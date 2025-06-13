@@ -32,6 +32,8 @@ def BubbleUpExpandShapesPass :
   ];
   let dependentDialects = [
     "mlir::affine::AffineDialect",
+    "mlir::linalg::LinalgDialect",
+    "IREE::LinalgExt::IREELinalgExtDialect",
   ];
 }
 
@@ -182,13 +184,6 @@ def TransposeGenericOpsPass :
   let summary = "Transpose generic op loops.";
   let dependentDialects = [
     "mlir::linalg::LinalgDialect",
-  ];
-}
-
-def BubbleUpExtractSlicesPass : Pass<"iree-dispatch-creation-bubble-up-extract-slices"> {
-  let summary = "Bubble up `extract_slice` ops through Linalg-like ops";
-  let dependentDialects = [
-    "mlir::affine::AffineDialect",
   ];
 }
 

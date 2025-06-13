@@ -116,6 +116,12 @@ static llvm::cl::opt<bool>
     clLLVMGPUUseIgemm("iree-codegen-llvmgpu-use-igemm",
                       llvm::cl::desc("Enable implicit gemm for convolutions."),
                       llvm::cl::init(true));
+
+static llvm::cl::opt<bool>
+    clUseDirectLoad("iree-llvmgpu-use-direct-load",
+                    llvm::cl::desc("Use global load DMA for direct load ops."),
+                    llvm::cl::Hidden, llvm::cl::init(false));
+
 namespace {
 
 using CodeGenPipeline = IREE::Codegen::DispatchLoweringPassPipeline;
@@ -144,8 +150,7 @@ static bool needsLoweringConfigPropagation(
   using Pipeline = IREE::Codegen::DispatchLoweringPassPipeline;
   // Pipelines that do not need propagation of lowering config.
   Pipeline supportedPipelines[] = {Pipeline::LLVMGPUTileAndFuse,
-                                   Pipeline::LLVMGPUVectorDistribute,
-                                   Pipeline::LLVMGPUPadAndVectorDistribute};
+                                   Pipeline::LLVMGPUVectorDistribute};
   return !llvm::is_contained(supportedPipelines, pipeline);
 }
 
@@ -521,7 +526,6 @@ populateConfigInfo(const llvm::SetVector<linalg::LinalgOp> &computeOps,
   op.getParallelDims(sharedParallelDims);
   llvm::SmallDenseSet<unsigned> sharedParallelSet(sharedParallelDims.begin(),
                                                   sharedParallelDims.end());
-
   for (linalg::LinalgOp linalgOp : computeOps) {
     SmallVector<unsigned> currParallelDims;
     linalgOp.getParallelDims(currParallelDims);
@@ -536,28 +540,48 @@ populateConfigInfo(const llvm::SetVector<linalg::LinalgOp> &computeOps,
     sharedWgpTiles[i] = 1;
   }
 
-  for (linalg::LinalgOp linalgOp : computeOps) {
-    // Check whether it's a reduction op.
-    bool reductionOp = hasReductionIterator(linalgOp);
+  // Determines if a lowering configuration should be attached to the given
+  // LinalgOp with only parallel dims. This is needed if the op cannot be fused
+  // with a reduction or introduces new loop dimensions.
+  auto shouldAttachLoweringConfig = [&](linalg::LinalgOp linalgOp) -> bool {
+    // If some of the users are in computeOps and some are outside of
+    // computeOps; attach lowering config, since the op can't be fused.
+    if (llvm::any_of(linalgOp->getUsers(),
+                     [&](Operation *user) {
+                       auto linalgUser = dyn_cast<linalg::LinalgOp>(user);
+                       return linalgUser && computeOps.contains(linalgUser);
+                     }) &&
+        llvm::any_of(linalgOp->getUsers(), [&](Operation *user) {
+          auto linalgUser = dyn_cast<linalg::LinalgOp>(user);
+          return !linalgUser;
+        })) {
+      return true;
+    }
+
+    // If the indexing map introduces new dimensions (more inputs than results),
+    // attach a lowering config.
     for (OpOperand *operand : linalgOp.getDpsInputOperands()) {
       int64_t operandIdx = linalgOp.getIndexingMapIndex(operand);
       AffineMap indexingMap = linalgOp.getIndexingMapsArray()[operandIdx];
-      // Set the lowering config if there's a new dim or it's a reduction op.
-      // Also, skip if there's a scalar load.
-      if (reductionOp ||
-          (indexingMap.getNumResults() > 0 &&
-           (indexingMap.getNumInputs() > indexingMap.getNumResults()))) {
-        auto loweringConfig = getVectorDistributeReductionConfig(
-            linalgOp, target, sharedWgpTiles, workgroupSize, subgroupSize,
-            threadLoads);
-        if (failed(loweringConfig)) {
-          return failure();
-        }
-        setLoweringConfig(linalgOp, *loweringConfig);
-        // If the config is set on the op, no need to iterate
-        // over other operands.
-        break;
+      if (indexingMap.getNumResults() > 0 &&
+          indexingMap.getNumInputs() > indexingMap.getNumResults()) {
+        return true;
       }
+    }
+
+    return false;
+  };
+
+  for (linalg::LinalgOp linalgOp : computeOps) {
+    if (hasReductionIterator(linalgOp) ||
+        shouldAttachLoweringConfig(linalgOp)) {
+      auto loweringConfig = getVectorDistributeReductionConfig(
+          linalgOp, target, sharedWgpTiles, workgroupSize, subgroupSize,
+          threadLoads);
+      if (failed(loweringConfig)) {
+        return failure();
+      }
+      setLoweringConfig(linalgOp, *loweringConfig);
     }
   }
   return success();
@@ -585,7 +609,9 @@ checkDispatchForVectorDistribution(mlir::FunctionOpInterface entryPoint) {
   SetVector<Operation *> slice;
 
   for (Operation *op : storeOps) {
-    getBackwardSlice(op, &slice, sliceOptions);
+    [[maybe_unused]] LogicalResult result =
+        getBackwardSlice(op, &slice, sliceOptions);
+    assert(result.succeeded());
   }
 
   SetVector<linalg::LinalgOp> computeOps;
@@ -1170,26 +1196,6 @@ setMatmulVectorDistributionConfig(IREE::GPU::TargetAttr target,
                           /*canUpcastAcc=*/true);
   }
 
-  // Only batch_matmul is supported in the LLVMGPUPadAndVectorDistribute
-  // pipeline.
-  // TODO(hanchung): Support cases that there are fused producers.
-  if (!schedule && !contractionDims->batch.empty() && !hasFusedLeadingOp(op) &&
-      clGPUUnalignedGEMMVectorDistribution) {
-    LDBG("Matmul Pad and Vector Distribute");
-    pipeline = CodeGenPipeline::LLVMGPUPadAndVectorDistribute;
-    bool mustBeAligned = false;
-    schedule =
-        deduceMMASchedule(problem, intrinsics, seeds, maxSharedMemoryBytes,
-                          targetSubgroupSize, transposedLhs, transposedRhs,
-                          /*canUpcastAcc=*/false, mustBeAligned);
-    if (!schedule) {
-      // Then try again by allowing upcasting accumulator.
-      schedule =
-          deduceMMASchedule(problem, intrinsics, seeds, maxSharedMemoryBytes,
-                            targetSubgroupSize, transposedLhs, transposedRhs,
-                            /*canUpcastAcc=*/true, mustBeAligned);
-    }
-  }
   if (!schedule) {
     LDBG("Failed to deduce MMA schedule");
     return failure();
@@ -2479,6 +2485,20 @@ setWarpReductionConfig(IREE::GPU::TargetAttr target,
 
   SmallVector<int64_t> workgroupTileSizes(op.getNumParallelLoops(), 1);
 
+  int64_t reductionSize = 1;
+  for (int64_t dim : reductionDims)
+    reductionSize *= bounds[dim];
+
+  int64_t subgroupSize = 0;
+  for (int s : target.getWgp().getSubgroupSizeChoices().asArrayRef()) {
+    if (reductionSize % s == 0) {
+      subgroupSize = s;
+      break;
+    }
+  }
+  if (subgroupSize == 0)
+    return failure();
+
   // Without any bounds on dynamic dims, we need specialization to
   // get peak performance. For now, just use the warp size.
   if (numDynamicDims > 0) {
@@ -2510,20 +2530,6 @@ setWarpReductionConfig(IREE::GPU::TargetAttr target,
     }
     return success();
   }
-
-  int64_t reductionSize = 1;
-  for (int64_t dim : reductionDims)
-    reductionSize *= bounds[dim];
-
-  int64_t subgroupSize = 0;
-  for (int s : target.getWgp().getSubgroupSizeChoices().asArrayRef()) {
-    if (reductionSize % s == 0) {
-      subgroupSize = s;
-      break;
-    }
-  }
-  if (subgroupSize == 0)
-    return failure();
 
   const Type elementType =
       llvm::cast<ShapedType>(op.getDpsInitOperand(0)->get().getType())
@@ -2954,19 +2960,19 @@ static LogicalResult setRootConfig(IREE::GPU::TargetAttr target,
   });
   if (succeeded(setDataTiledMultiMmaLoweringConfig(target, entryPointFn,
                                                    computeOp, ukernelConfig))) {
-    LDBG("Tile and fuse data tiled multi_mma config");
+    LDBG("Tile and fuse data tiled MMA inner_tiled config");
     return success();
   }
   if (clGPUEarlyTileAndFuseMatmul) {
-    if (succeeded(IREE::GPU::setMatmulLoweringConfig(target, entryPointFn,
-                                                     computeOp))) {
+    if (succeeded(IREE::GPU::setMatmulLoweringConfig(
+            target, entryPointFn, computeOp, clUseDirectLoad))) {
       LDBG("Tile and fuse matmul config");
       return success();
     }
   }
   if (clLLVMGPUUseIgemm) {
     if (succeeded(IREE::GPU::setIGEMMConvolutionLoweringConfig(
-            target, entryPointFn, computeOp))) {
+            target, entryPointFn, computeOp, clUseDirectLoad))) {
       LDBG("Tile and fuse IGEMM config");
       return success();
     }
@@ -3008,14 +3014,20 @@ static LogicalResult setRootConfig(IREE::GPU::TargetAttr target,
       return success();
     }
     auto genericOp = dyn_cast<linalg::GenericOp>(computeOp);
-    if (genericOp && succeeded(setTransposeConfig(entryPointFn, genericOp))) {
-      LDBG("Transpose Config");
-      return success();
-    } else if (genericOp && ukernelConfig &&
-               succeeded(setArgmaxUkernelConfig(target, entryPointFn, genericOp,
-                                                ukernelConfig))) {
-      LDBG("Argmax Ukernel Config");
-      return success();
+    if (genericOp) {
+      if (succeeded(setTransposeConfig(entryPointFn, genericOp))) {
+        LDBG("Transpose Config");
+        return success();
+      } else if (ukernelConfig &&
+                 succeeded(setArgmaxUkernelConfig(target, entryPointFn,
+                                                  genericOp, ukernelConfig))) {
+        LDBG("Argmax Ukernel Config");
+        return success();
+      } else if (succeeded(IREE::GPU::setTileAndFuseLoweringConfig(
+                     target, entryPointFn, linalgOp))) {
+        LDBG("Tile and Fuse Config");
+        return success();
+      }
     }
   }
   return TypeSwitch<Operation *, LogicalResult>(computeOp)
@@ -3136,7 +3148,8 @@ LogicalResult initGPULaunchConfig(FunctionOpInterface funcOp) {
   llvm::SmallDenseSet<Operation *, 4> genericToSkip;
   for (Operation *op : llvm::reverse(computeOps)) {
     if (!isa<linalg::GenericOp, linalg::FillOp, IREE::LinalgExt::ScatterOp,
-             linalg::PackOp, linalg::UnPackOp>(op)) {
+             IREE::LinalgExt::MapScatterOp, linalg::PackOp, linalg::UnPackOp>(
+            op)) {
       rootOperation = op;
       break;
     }
@@ -3158,7 +3171,9 @@ LogicalResult initGPULaunchConfig(FunctionOpInterface funcOp) {
       BackwardSliceOptions options;
       options.inclusive = true;
       SetVector<Operation *> slices;
-      getBackwardSlice(indices, &slices, options);
+      [[maybe_unused]] LogicalResult result =
+          getBackwardSlice(indices, &slices, options);
+      assert(result.succeeded());
       genericToSkip.insert(slices.begin(), slices.end());
     }
   }
@@ -3186,7 +3201,8 @@ LogicalResult initGPULaunchConfig(FunctionOpInterface funcOp) {
 
   if (!rootOperation) {
     for (Operation *op : llvm::reverse(computeOps)) {
-      if (isa<IREE::LinalgExt::ScatterOp, linalg::FillOp>(op)) {
+      if (isa<IREE::LinalgExt::ScatterOp, IREE::LinalgExt::MapScatterOp,
+              linalg::FillOp>(op)) {
         rootOperation = op;
         break;
       }
