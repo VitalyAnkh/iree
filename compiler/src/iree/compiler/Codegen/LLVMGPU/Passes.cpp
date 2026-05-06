@@ -851,6 +851,9 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
 
   // Vector SIMD -> Vector SIMT
   funcPassManager.addPass(createLLVMGPUVectorDistributePass());
+  if (forROCDL) {
+    funcPassManager.addPass(createAMDGPULowerAsyncDMAPass());
+  }
   funcPassManager.addPass(IREE::LinalgExt::createDecomposeMapStorePass());
   funcPassManager.addPass(createHoistInnerTiledAccReshapesPass());
   funcPassManager.addPass(IREE::GPU::createUnrollToIntrinsicsPass());
